@@ -1,8 +1,16 @@
 # xvenue-arb 設計メモ
 
-Cross-venue statistical arbitrage between Lighter and Extended (BTC-USD / ETH-USD perp). 対応 issue: [bot-strategy#166](https://github.com/shigeo-nakamura/bot-strategy/issues/166)。
+Cross-venue statistical arbitrage between Lighter and Extended. 対応 issue: [bot-strategy#166](https://github.com/shigeo-nakamura/bot-strategy/issues/166)。
 
 このドキュメントは Phase 0 (データ feasibility) 着手前の **設計ドラフト** であり、Phase 0 GO 後に確定させる。
+
+## 0. 確定事項 (2026-04-23 レビューで合意)
+
+- **初期 symbol**: **BTC-USD のみ**。ETH は Phase 3 probe で安定したら追加検討
+- **両脚発注方式**: **hybrid** — entry は serialized (Extended post-only → fill 後に Lighter)、exit は parallel (両 venue 同時に reduce-only)。Entry の single-leg-filled リスクが exit より金額大きいため
+- **Extended アカウント**: 新規サブアカウント (既存 `debot-pair-btceth-extended` との分離のため。position / funding の相殺を避ける)
+- **Capital sizing**: **account equity の %** で指定 (`trade_size_pct: 0.05` = equity の 5%)。固定 USD でなく equity 追従にすることで PnL 蓄積に比例して size 増、資本効率を保つ
+- **`src/pairtrade/` 撤去**: scaffold の initial commit (`b7cf98b`) で git 履歴に残るため、次コミットで即削除。以降は `src/xvenue/` に一本化
 
 ## 1. 戦略サマリ
 
@@ -93,13 +101,17 @@ struct VenueHub {
 
 この serialized leg 方式は **inventory skew の発生を制御しやすい**が、spread 消滅までの時間との競争になる。Phase 0 の half-life 測定で許容レイテンシ上限を見積もる。
 
-### 4.2 Exit (通常時)
+### 4.2 Exit (通常時) — parallel
+
+Entry は serialized だが exit は **両 venue 並列発注** (決定事項 §0)。早く flat を取る方が残存リスクを減らせる。
 
 1. |z| < exit_z で exit signal
 2. 両 venue 同時に reduce-only order 発行
    - Lighter: market で即時
    - Extended: post-only limit → 短 chase → 必要なら taker
 3. 両脚 flat 確認で 1 サイクル完了
+
+parallel exit で片脚先 fill → 反対脚未 fill が起きた場合は emergency flatten (§4.3) に落ちて taker clean-up。
 
 ### 4.3 Emergency flatten
 
@@ -113,8 +125,10 @@ Extended 側 taker 手数料 (2.5 bp) はこの時だけは許容する。
 
 ### 4.4 Position sizing
 
-- entry_notional (USD) を config で定義、両 venue で揃える (delta-neutral のため)
+- **account equity の %** で指定 (`trade_size_pct`、決定事項 §0)。固定 USD でなく equity 追従
+- entry 時に `notional = equity_usd * trade_size_pct` を両 venue で揃える (delta-neutral)
 - Tick 粒度差で size が完全一致しないため、Extended 側を基準に Lighter size を算出 (Lighter 0.1 tick は十分細かい)
+- equity 取得は各 venue の `DexConnector::get_account` 相当。両 venue で separate に管理するのでなく、**全体 equity は Extended + Lighter の合計残高**として扱う
 - max concurrent position = 1 ペアのみから開始 (Phase 1 BT で複数同時可否を検討)
 
 ## 5. Signal & statistics
@@ -144,7 +158,7 @@ Extended / Lighter で funding が 1h cadence で独立発生。保有中に fun
 
 ```yaml
 strategy:
-  symbol_ext: BTC-USD          # Extended 側シンボル
+  symbol_ext: BTC-USD          # Extended 側シンボル (Phase 0-3 は BTC のみ)
   symbol_lt:  BTC-USD          # Lighter 側シンボル
   entry_z: 1.5
   exit_z:  0.3
@@ -153,10 +167,13 @@ strategy:
   spread_bucket_ms: 1000
 
 sizing:
-  entry_notional_usd: 100
+  trade_size_pct: 0.05         # 全 equity (Ext + Lt 合計) の 5%
+  min_notional_usd: 20         # 下限 (dust order 防止)
+  max_notional_usd: 5000       # 上限 (equity 急増時の暴走防止)
   max_concurrent: 1
 
 execution:
+  # entry = serialized (Extended 先 → Lighter 後)、exit = parallel
   extended:
     order_type: limit          # limit | taker
     chase_ticks: 1
@@ -174,8 +191,9 @@ risk:
 
 venues:
   extended:
-    account_id: <env: EXTENDED_ACCOUNT_ID>
-    # ... credentials via env
+    # 新規サブアカウント (既存 debot-pair-btceth-extended と分離)
+    account_id: <env: EXTENDED_XVENUE_ACCOUNT_ID>
+    # ... credentials via env (EXTENDED_XVENUE_* プレフィックスで分離)
   lighter:
     account_id: <env: LIGHTER_ACCOUNT_ID>
     # ...
@@ -236,13 +254,13 @@ Phase 0 の結論が NG の場合は **実装着手せず issue をクローズ*
 
 既存コードを大きく変えずに済む公算あり。Phase 1 着手時に詳細化。
 
-## 10. Open questions (Phase 0 GO 時に確定させる)
+## 10. Open questions
 
-1. **rolling_window 最適値** — Phase 0 の ACF 結果から決定
-2. **Extended maker 化の成立率** — live paper で測定。BTC Extended は tick 1.0 なので post-only 成立しやすいはずだが未確認
-3. **Funding 織り込みの要否** — Phase 1 BT で on/off 比較
-4. **複数 symbol 同時運用** — BTC で安定したら ETH を後から追加 (capital 余力次第)
-5. **order coordination の粒度** — Extended 先 → Lighter 後の serialized 方式が serve the purpose なのか、両 venue 並列発注 (inventory skew 許容) の方が edge 捕捉率高いのか
+§0 で確定した Q4-Q8 以外で残っているもの:
+
+1. **rolling_window 最適値** — Phase 0 の ACF 結果から決定 (仮 1800 秒)
+2. **Extended maker 化の成立率** — live paper (Phase 2) で測定。BTC Extended は tick 1.0 なので post-only 成立しやすいはずだが未確認
+3. **Funding 織り込みの要否** — Phase 1 BT で on/off 比較 (仮 config flag `funding_adjustment: false` default)
 
 ## 11. 参考
 
