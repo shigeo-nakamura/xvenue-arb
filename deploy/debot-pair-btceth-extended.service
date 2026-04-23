@@ -1,0 +1,15 @@
+[Unit]
+Description="debot-pair-btceth-extended (Tokyo, bot-strategy#123)"
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/debot
+ExecStart=/bin/bash /opt/debot/scripts/debot-pair-btceth-extended.sh
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

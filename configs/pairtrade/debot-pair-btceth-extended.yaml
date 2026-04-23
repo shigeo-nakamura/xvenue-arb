@@ -1,0 +1,100 @@
+# Tokyo-hosted Extended Exchange single-bot pairtrade.
+# Bootstrap config for bot-strategy#123 Phase 3: run Strategy A's champion
+# params (from debot-pair-btceth.yaml) against Extended instead of Lighter,
+# with fee_bps bumped to 2.5 for Extended's taker fee. Once 1 week of live
+# dump is in hand, Phase 4 grid-searches for Extended-specific A/B/C.
+
+dex_name: extended
+# Leave endpoints unset → dex-connector picks Extended mainnet defaults.
+rest_endpoint: ""
+web_socket_endpoint: ""
+dry_run: false
+agent_name: debot-pair-btceth-ext
+
+# Data dump — different path from Frankfurt Lighter bot so the two streams
+# don't collide if they're ever co-located during migration.
+enable_data_dump: true
+data_dump_file: /opt/debot/market_data_btceth_extended.jsonl
+observe_only: false
+
+history_archive_dir: /opt/debot/history_archive
+history_archive_retention_days: 360
+
+universe_pairs:
+- BTC/ETH
+max_active_pairs: 1
+
+interval_secs: 5
+trading_period_secs: 60
+
+pair_selection_lookback_hours_short: 1
+pair_selection_lookback_hours_long: 2
+adf_p_threshold: 0.15
+half_life_max_hours: 2.0
+metrics_window_length: 240
+warm_start_mode: relaxed
+warm_start_min_bars: 60
+
+# Strategy A champion params (exit_z=0.2, sl_z=4, mlr=1) — see
+# debot-pair-btceth.yaml strategies[0]. Flat (no A/B/C split) because Phase 3
+# runs a single bot to collect Extended-specific data.
+entry_z_score_base: 1.5
+entry_z_score_min: 1.0
+entry_z_score_max: 2.0
+exit_z_score: 0.2
+stop_loss_z_score: 4.0
+force_close_time_secs: 3600  # Halved from 7200 to raise trade frequency during the Extended experiment
+shutdown_grace_secs: 3660
+
+# Phase 3 is a monitor-and-collect run on a tiny Extended balance (~$106 at
+# deploy). equity_usd_fallback stays close to reality so that a transient
+# balance-query failure can't trigger an oversized order the account
+# can't cover.
+risk_pct_per_trade: 0.40
+equity_usd_fallback: 100
+max_leverage: 1
+max_loss_r_mult: 1.0
+max_dd_pct: 0.10
+
+# Execution — fee_bps bumped from 0 to 2.5 for Extended's taker.
+cooldown_secs: 60
+slippage_bps: 0
+fee_bps: 2.5
+# Extended BTC tick size is 10 vs Lighter's 1, so the price grid is ~10x
+# coarser and post-only limits take proportionally longer to be crossed.
+# Raised from 30s to 120s (conservative 4x of tick-ratio) to reduce taker
+# fallbacks while keeping the entry signal fresh. See bot-strategy#165.
+entry_post_only_timeout_secs: 120
+
+spread_velocity_max_sigma_per_min: 0.15
+spread_trend_max_slope_sigma: 1.0
+beta_divergence_max: 0.30
+beta_min: 0.30
+hedge_ratio_max_deviation: 0.20
+entry_vol_lookback_hours: 2
+vol_spike_mult: 3.0
+net_funding_min_per_hour: -0.01
+reeval_jump_z_mult: 1.5
+
+entry_velocity_block_sigma_per_min: 0.0
+funding_entry_z_scale: 0.0
+beta_gap_entry_z_scale: 3.0
+
+# Std collapse guard — observe-only (same as Frankfurt config).
+std_collapse_window_bars: 60
+std_collapse_min_ratio: 0.2
+std_collapse_observe_only: true
+
+# Circuit breaker
+circuit_breaker_tier1_losses: 5
+circuit_breaker_tier1_cooldown_secs: 600
+circuit_breaker_tier2_losses: 8
+circuit_breaker_tier2_cooldown_secs: 3600
+
+# MTF (A/B/C round 2 legacy from Lighter Strategy A)
+mtf_windows: [15]
+mtf_z_min: 0.5
+
+# No multi-strategy split for Phase 3. When Phase 5 runs, a follow-up config
+# will reintroduce `strategies:` with Extended-optimized params from the
+# Phase 4 grid-search.

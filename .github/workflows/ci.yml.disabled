@@ -1,0 +1,548 @@
+name: Rust CI
+
+on:
+  push:
+    paths:
+      - "src/**"
+      - "configs/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch:
+    inputs:
+      dex_connector_ref:
+        description: "Dex-connector ref/tag (optional)"
+        required: false
+        type: string
+
+concurrency:
+  group: debot-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-central-1
+  INSTALL_DIR: /opt/debot
+  DEX_CONNECTOR_REF: v4.2.73
+  LIGHTER_GO_REF: v1.0.2
+  AL2023_IMAGE: public.ecr.aws/amazonlinux/amazonlinux:2023
+
+jobs:
+  resolve-ref:
+    runs-on: ubuntu-latest
+    outputs:
+      dex_connector_ref: ${{ steps.resolve.outputs.dex_connector_ref }}
+      should_deploy: ${{ steps.resolve.outputs.should_deploy }}
+    steps:
+      - name: Resolve dex-connector ref
+        id: resolve
+        env:
+          DEFAULT_REF: ${{ env.DEX_CONNECTOR_REF }}
+          INPUT_REF: ${{ github.event.inputs.dex_connector_ref }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+
+          default_ref = os.environ.get("DEFAULT_REF", "").strip()
+          input_ref = (os.environ.get("INPUT_REF") or "").strip()
+          token = os.environ.get("GH_TOKEN", "")
+
+          ref = input_ref or default_ref
+          if not input_ref:
+              try:
+                  req = urllib.request.Request(
+                      "https://api.github.com/repos/shigeo-nakamura/dex-connector/tags?per_page=1",
+                      headers={
+                          "Accept": "application/vnd.github+json",
+                          "Authorization": f"Bearer {token}",
+                      },
+                  )
+                  with urllib.request.urlopen(req, timeout=10) as resp:
+                      data = json.load(resp)
+                  if data and "name" in data[0]:
+                      ref = data[0]["name"]
+              except Exception:
+                  pass
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"dex_connector_ref={ref}\n")
+              f.write(f"should_deploy=true\n")
+          PY
+
+  build-test:
+    needs: resolve-ref
+    if: needs.resolve-ref.outputs.should_deploy == 'true'
+    runs-on: ubuntu-latest
+    env:
+      DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.dex_connector_ref }}
+      LIGHTER_GO_PATH: ${{ github.workspace }}/lighter-go
+      LD_LIBRARY_PATH: ${{ github.workspace }}/lighter-go
+    defaults:
+      run:
+        working-directory: debot
+    steps:
+      - name: Checkout debot
+        uses: actions/checkout@v4
+        with:
+          path: debot
+
+      - name: Checkout dex-connector
+        uses: actions/checkout@v4
+        with:
+          repository: shigeo-nakamura/dex-connector
+          ref: ${{ env.DEX_CONNECTOR_REF }}
+          path: dex-connector
+          token: ${{ secrets.DEX_CONNECTOR_PAT || github.token }}
+
+      - name: Checkout lighter-go
+        uses: actions/checkout@v4
+        with:
+          repository: elliottech/lighter-go
+          ref: ${{ env.LIGHTER_GO_REF }}
+          path: lighter-go
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21.x"
+          cache: true
+          cache-dependency-path: lighter-go/go.sum
+
+      - name: Build libsigner
+        run: go build -buildmode=c-shared -trimpath -o libsigner.so ./sharedlib
+        working-directory: ${{ github.workspace }}/lighter-go
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            debot -> target
+
+      - name: Cargo check
+        run: cargo check --all-targets --locked
+
+      - name: Cargo test
+        run: cargo test --all-targets --locked
+
+  deploy:
+    runs-on: ubuntu-latest
+    # CI ships new binary + configs but no longer restarts the service
+    # (pairtrade#9). Operators restart debot-pair-btceth manually when
+    # convenient, so the SSM step finishes in seconds and does not need
+    # to cover the 2h graceful-shutdown window.
+    timeout-minutes: 60
+    needs: [resolve-ref, build-test]
+    if: needs.resolve-ref.outputs.should_deploy == 'true' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+    environment: debot
+    env:
+      DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.dex_connector_ref }}
+    steps:
+      - name: Checkout debot
+        uses: actions/checkout@v4
+        with:
+          path: debot
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Checkout dex-connector
+        uses: actions/checkout@v4
+        with:
+          repository: shigeo-nakamura/dex-connector
+          ref: ${{ env.DEX_CONNECTOR_REF }}
+          path: dex-connector
+          token: ${{ secrets.DEX_CONNECTOR_PAT || github.token }}
+
+      - name: Checkout lighter-go
+        uses: actions/checkout@v4
+        with:
+          repository: elliottech/lighter-go
+          ref: ${{ env.LIGHTER_GO_REF }}
+          path: lighter-go
+
+      - name: Cache libsigner (linux/arm64)
+        id: cache_libsigner
+        uses: actions/cache@v4
+        with:
+          path: lighter-go/build/libsigner.so
+          key: ${{ runner.os }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ hashFiles('lighter-go/go.sum') }}
+
+      - name: Build libsigner (linux/arm64)
+        if: steps.cache_libsigner.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p lighter-go/build
+          docker run --rm --platform linux/arm64 \
+            -v "${{ github.workspace }}/lighter-go:/go/src/sdk" \
+            -w /go/src/sdk \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            ${AL2023_IMAGE} \
+            /bin/bash -lc "dnf -y install golang gcc && CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -buildvcs=false -buildmode=c-shared -trimpath -o ./build/libsigner.so ./sharedlib && chown -R ${HOST_UID}:${HOST_GID} /go/src/sdk/build"
+
+      - name: Save libsigner cache (linux/arm64)
+        if: steps.cache_libsigner.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: lighter-go/build/libsigner.so
+          key: ${{ runner.os }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ hashFiles('lighter-go/go.sum') }}
+
+      - name: Cache cargo (linux/arm64)
+        id: cache_cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/cargo/registry
+            .cache/cargo/git
+            .cache/cargo/bin
+            .cache/rustup
+            debot/target
+          key: ${{ runner.os }}-cargo-arm64-${{ hashFiles('debot/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-arm64-
+
+      - name: Build debot (linux/arm64)
+        id: build_debot
+        run: |
+          mkdir -p .cache/cargo/registry .cache/cargo/git .cache/cargo/bin .cache/rustup debot/target
+          docker run --rm --platform linux/arm64 \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            -e CARGO_HOME=/workspace/.cache/cargo \
+            -e RUSTUP_HOME=/workspace/.cache/rustup \
+            -e CARGO_INCREMENTAL=0 \
+            -e LIGHTER_GO_PATH=/workspace/lighter-go/build \
+            -e LD_LIBRARY_PATH=/workspace/lighter-go/build \
+            ${AL2023_IMAGE} \
+            /bin/bash -lc "set -euo pipefail; dnf -y install gcc gcc-c++ make openssl-devel pkgconf-pkg-config git curl-minimal tar gzip; if [ ! -x /workspace/.cache/cargo/bin/rustup ]; then curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable; fi; export PATH=/workspace/.cache/cargo/bin:\$PATH; rustc -V; cargo -V; cd debot && cargo build --release --locked; chown -R ${HOST_UID}:${HOST_GID} /workspace/debot/target /workspace/.cache/cargo /workspace/.cache/rustup"
+
+      - name: Fix cargo cache permissions
+        if: steps.build_debot.outcome == 'success'
+        run: |
+          if command -v sudo >/dev/null 2>&1; then
+            sudo chown -R "$(id -u):$(id -g)" .cache/cargo .cache/rustup debot/target
+            sudo chmod -R u+rwX,go+rX .cache/cargo .cache/rustup debot/target
+          else
+            chown -R "$(id -u):$(id -g)" .cache/cargo .cache/rustup debot/target
+            chmod -R u+rwX,go+rX .cache/cargo .cache/rustup debot/target
+          fi
+
+      - name: Save cargo cache (linux/arm64)
+        if: steps.build_debot.outcome == 'success' && steps.cache_cargo.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .cache/cargo/registry
+            .cache/cargo/git
+            .cache/cargo/bin
+            .cache/rustup
+            debot/target
+          key: ${{ runner.os }}-cargo-arm64-${{ hashFiles('debot/Cargo.lock') }}
+
+      - name: Package artifacts
+        run: |
+          mkdir -p dist/bin dist/lib dist/scripts dist/configs
+          cp debot/target/release/debot dist/bin/debot
+          cp lighter-go/build/libsigner.so dist/lib/libsigner.so
+          rsync -a \
+            --exclude "venv/" \
+            --exclude "__pycache__/" \
+            --exclude "*.log" \
+            --exclude "*.pyc" \
+            debot/scripts/ dist/scripts/
+          rsync -a debot/configs/ dist/configs/
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload artifacts to S3
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
+        run: |
+          aws s3 cp dist/bin/debot "s3://${S3_BUCKET}/debot/debot"
+          aws s3 cp dist/lib/libsigner.so "s3://${S3_BUCKET}/debot/libsigner.so"
+          aws s3 sync dist/scripts/ "s3://${S3_BUCKET}/debot/scripts/" \
+            --exclude "venv/*" \
+            --exclude "venv/**" \
+            --exclude "__pycache__/*" \
+            --exclude "__pycache__/**" \
+            --exclude "*.log" \
+            --exclude "*.pyc"
+          aws s3 sync dist/configs/ "s3://${S3_BUCKET}/debot/configs/"
+          aws s3 cp debot/deploy/debot-pair-btceth.service "s3://${S3_BUCKET}/deploy/debot-pair-btceth.service"
+          # Tokyo service unit is packaged alongside Frankfurt's so the
+          # deploy-tokyo job can reuse the same `debot/` prefix for configs
+          # + scripts and only override the binary under `debot-extended/`.
+          aws s3 cp debot/deploy/debot-pair-btceth-extended.service "s3://${S3_BUCKET}/deploy/debot-pair-btceth-extended.service"
+
+      - name: Deploy via SSM (no restart)
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
+          INSTANCE_ID: ${{ secrets.INSTANCE_ID || vars.INSTANCE_ID }}
+        run: |
+          cat > /tmp/ssm-params.json <<'JSON'
+          {
+            "commands": [
+              "sudo mkdir -p __INSTALL_DIR__/bin __INSTALL_DIR__/lib __INSTALL_DIR__/scripts __INSTALL_DIR__/configs",
+              "aws s3 cp s3://__S3_BUCKET__/debot/debot __INSTALL_DIR__/bin/debot",
+              "sudo chmod 755 __INSTALL_DIR__/bin/debot",
+              "aws s3 cp s3://__S3_BUCKET__/debot/libsigner.so __INSTALL_DIR__/lib/libsigner.so",
+              "sudo chmod 644 __INSTALL_DIR__/lib/libsigner.so",
+              "aws s3 sync s3://__S3_BUCKET__/debot/scripts __INSTALL_DIR__/scripts",
+              "aws s3 sync s3://__S3_BUCKET__/debot/configs __INSTALL_DIR__/configs",
+              "sudo chmod 755 __INSTALL_DIR__/scripts/*.sh",
+              "/bin/bash -lc 'set -e; UPDATED=0; for svc in debot-pair-btceth; do aws s3 cp s3://__S3_BUCKET__/deploy/$svc.service /tmp/$svc.service; if [ ! -f /etc/systemd/system/$svc.service ] || ! cmp -s /etc/systemd/system/$svc.service /tmp/$svc.service; then sudo mv /tmp/$svc.service /etc/systemd/system/$svc.service; UPDATED=1; else rm /tmp/$svc.service; fi; done; if [ $UPDATED -eq 1 ]; then sudo systemctl daemon-reload; fi'"
+            ]
+          }
+          JSON
+          sed -i "s|__INSTALL_DIR__|${INSTALL_DIR}|g; s|__S3_BUCKET__|${S3_BUCKET}|g" /tmp/ssm-params.json
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${INSTANCE_ID}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy debot" \
+            --parameters file:///tmp/ssm-params.json \
+            --query "Command.CommandId" \
+            --output text)
+
+          # No service restart in the SSM commands above, so the command
+          # finishes as soon as the S3 pulls + daemon-reload complete.
+          # 30 minutes is ample for S3 transfers + SSM scheduling latency.
+          SSM_DEPLOY_TIMEOUT_SECS=${SSM_DEPLOY_TIMEOUT_SECS:-1800}
+          POLL_INTERVAL_SECS=30
+          deadline=$(( $(date +%s) + SSM_DEPLOY_TIMEOUT_SECS ))
+          while :; do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "${COMMAND_ID}" \
+              --instance-id "${INSTANCE_ID}" \
+              --query "Status" --output text 2>/dev/null || echo "Pending")
+            case "${STATUS}" in
+              Success)
+                aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}" --output text
+                exit 0 ;;
+              Cancelled|TimedOut|Failed)
+                aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}" --output text
+                echo "##[error]SSM command finished with status ${STATUS}"
+                exit 1 ;;
+              Pending|InProgress|Delayed)
+                : ;;
+              *)
+                echo "Unexpected SSM status: ${STATUS}" ;;
+            esac
+            if [ $(date +%s) -ge ${deadline} ]; then
+              aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}" --output text || true
+              echo "##[error]Deploy polling timed out after ${SSM_DEPLOY_TIMEOUT_SECS}s (last status: ${STATUS})"
+              exit 1
+            fi
+            echo "deploy in progress (status=${STATUS}), sleeping ${POLL_INTERVAL_SECS}s..."
+            sleep ${POLL_INTERVAL_SECS}
+          done
+
+  # Separate deploy pipeline for the Tokyo instance running pairtrade against
+  # Extended Exchange (bot-strategy#123). No libsigner / Go dep since
+  # extended-sdk is pure Rust. Binary lives under `debot-extended/` prefix on
+  # the same eu-central-1 S3 bucket; Tokyo SSM pulls it cross-region (20MB,
+  # negligible transfer cost). Uses a separate service unit
+  # `debot-pair-btceth-extended.service` so the Frankfurt Lighter bot is
+  # unaffected even if both regions run simultaneously.
+  # CI ships new binary + configs but does not restart the service (symmetric
+  # with the Frankfurt `deploy` job, pairtrade#9). Operators restart
+  # debot-pair-btceth-extended manually once positions are flat.
+  deploy-tokyo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    needs: [resolve-ref, build-test]
+    if: needs.resolve-ref.outputs.should_deploy == 'true' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+    environment: debot
+    env:
+      DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.dex_connector_ref }}
+      # Build + S3 upload happen against eu-central-1 (same bucket as the
+      # Frankfurt job). The SSM step below flips region to ap-northeast-1
+      # for the Tokyo instance.
+      AWS_REGION: eu-central-1
+      TOKYO_REGION: ap-northeast-1
+    steps:
+      - name: Checkout debot
+        uses: actions/checkout@v4
+        with:
+          path: debot
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Checkout dex-connector
+        uses: actions/checkout@v4
+        with:
+          repository: shigeo-nakamura/dex-connector
+          ref: ${{ env.DEX_CONNECTOR_REF }}
+          path: dex-connector
+          token: ${{ secrets.DEX_CONNECTOR_PAT || github.token }}
+
+      - name: Cache cargo extended (linux/arm64)
+        id: cache_cargo_ext
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/cargo/registry
+            .cache/cargo/git
+            .cache/cargo/bin
+            .cache/rustup
+            debot/target
+          key: ${{ runner.os }}-cargo-arm64-ext-${{ hashFiles('debot/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-arm64-ext-
+            ${{ runner.os }}-cargo-arm64-
+
+      - name: Build debot extended-sdk (linux/arm64)
+        id: build_debot_ext
+        run: |
+          mkdir -p .cache/cargo/registry .cache/cargo/git .cache/cargo/bin .cache/rustup debot/target
+          docker run --rm --platform linux/arm64 \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            -e CARGO_HOME=/workspace/.cache/cargo \
+            -e RUSTUP_HOME=/workspace/.cache/rustup \
+            -e CARGO_INCREMENTAL=0 \
+            ${AL2023_IMAGE} \
+            /bin/bash -lc "set -euo pipefail; dnf -y install gcc gcc-c++ make openssl-devel pkgconf-pkg-config git curl-minimal tar gzip; if [ ! -x /workspace/.cache/cargo/bin/rustup ]; then curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable; fi; export PATH=/workspace/.cache/cargo/bin:\$PATH; rustc -V; cargo -V; cd debot && cargo build --release --locked --no-default-features --features extended-sdk; chown -R ${HOST_UID}:${HOST_GID} /workspace/debot/target /workspace/.cache/cargo /workspace/.cache/rustup"
+
+      - name: Fix cargo cache permissions
+        if: steps.build_debot_ext.outcome == 'success'
+        run: |
+          if command -v sudo >/dev/null 2>&1; then
+            sudo chown -R "$(id -u):$(id -g)" .cache/cargo .cache/rustup debot/target
+            sudo chmod -R u+rwX,go+rX .cache/cargo .cache/rustup debot/target
+          else
+            chown -R "$(id -u):$(id -g)" .cache/cargo .cache/rustup debot/target
+            chmod -R u+rwX,go+rX .cache/cargo .cache/rustup debot/target
+          fi
+
+      - name: Save cargo cache extended (linux/arm64)
+        if: steps.build_debot_ext.outcome == 'success' && steps.cache_cargo_ext.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .cache/cargo/registry
+            .cache/cargo/git
+            .cache/cargo/bin
+            .cache/rustup
+            debot/target
+          key: ${{ runner.os }}-cargo-arm64-ext-${{ hashFiles('debot/Cargo.lock') }}
+
+      - name: Package artifacts
+        run: |
+          mkdir -p dist/bin dist/scripts dist/configs
+          cp debot/target/release/debot dist/bin/debot
+          rsync -a \
+            --exclude "venv/" \
+            --exclude "__pycache__/" \
+            --exclude "*.log" \
+            --exclude "*.pyc" \
+            debot/scripts/ dist/scripts/
+          rsync -a debot/configs/ dist/configs/
+
+      - name: Configure AWS credentials (eu-central-1 for upload)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload Tokyo artifacts to S3
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
+        run: |
+          aws s3 cp dist/bin/debot "s3://${S3_BUCKET}/debot-extended/debot"
+          aws s3 sync dist/scripts/ "s3://${S3_BUCKET}/debot-extended/scripts/" \
+            --exclude "venv/*" \
+            --exclude "venv/**" \
+            --exclude "__pycache__/*" \
+            --exclude "__pycache__/**" \
+            --exclude "*.log" \
+            --exclude "*.pyc"
+          aws s3 sync dist/configs/ "s3://${S3_BUCKET}/debot-extended/configs/"
+          aws s3 cp debot/deploy/debot-pair-btceth-extended.service "s3://${S3_BUCKET}/deploy/debot-pair-btceth-extended.service"
+
+      - name: Configure AWS credentials (ap-northeast-1 for SSM)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.TOKYO_REGION }}
+
+      - name: Deploy to Tokyo via SSM (no restart)
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
+          TOKYO_INSTANCE_ID: ${{ secrets.TOKYO_INSTANCE_ID || vars.TOKYO_INSTANCE_ID }}
+        run: |
+          cat > /tmp/ssm-tokyo-params.json <<'JSON'
+          {
+            "commands": [
+              "sudo mkdir -p __INSTALL_DIR__/bin __INSTALL_DIR__/scripts __INSTALL_DIR__/configs",
+              "aws s3 cp --region eu-central-1 s3://__S3_BUCKET__/debot-extended/debot __INSTALL_DIR__/bin/debot",
+              "sudo chmod 755 __INSTALL_DIR__/bin/debot",
+              "aws s3 sync --region eu-central-1 s3://__S3_BUCKET__/debot-extended/scripts __INSTALL_DIR__/scripts",
+              "aws s3 sync --region eu-central-1 s3://__S3_BUCKET__/debot-extended/configs __INSTALL_DIR__/configs",
+              "sudo chmod 755 __INSTALL_DIR__/scripts/*.sh",
+              "/bin/bash -lc 'set -e; aws s3 cp --region eu-central-1 s3://__S3_BUCKET__/deploy/debot-pair-btceth-extended.service /tmp/debot-pair-btceth-extended.service; if [ ! -f /etc/systemd/system/debot-pair-btceth-extended.service ] || ! cmp -s /etc/systemd/system/debot-pair-btceth-extended.service /tmp/debot-pair-btceth-extended.service; then sudo mv /tmp/debot-pair-btceth-extended.service /etc/systemd/system/debot-pair-btceth-extended.service; sudo systemctl daemon-reload; else rm /tmp/debot-pair-btceth-extended.service; fi'"
+            ]
+          }
+          JSON
+          sed -i "s|__INSTALL_DIR__|${INSTALL_DIR}|g; s|__S3_BUCKET__|${S3_BUCKET}|g" /tmp/ssm-tokyo-params.json
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${TOKYO_INSTANCE_ID}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy debot-extended (Tokyo)" \
+            --parameters file:///tmp/ssm-tokyo-params.json \
+            --query "Command.CommandId" \
+            --output text)
+
+          # No service restart in the SSM commands above (symmetric with the
+          # Frankfurt deploy job, pairtrade#9). Operators restart
+          # debot-pair-btceth-extended manually when positions are flat.
+          SSM_DEPLOY_TIMEOUT_SECS=${SSM_DEPLOY_TIMEOUT_SECS:-1800}
+          POLL_INTERVAL_SECS=15
+          deadline=$(( $(date +%s) + SSM_DEPLOY_TIMEOUT_SECS ))
+          while :; do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "${COMMAND_ID}" \
+              --instance-id "${TOKYO_INSTANCE_ID}" \
+              --query "Status" --output text 2>/dev/null || echo "Pending")
+            case "${STATUS}" in
+              Success)
+                aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${TOKYO_INSTANCE_ID}" --output text
+                exit 0 ;;
+              Cancelled|TimedOut|Failed)
+                aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${TOKYO_INSTANCE_ID}" --output text
+                echo "##[error]Tokyo SSM command finished with status ${STATUS}"
+                exit 1 ;;
+              Pending|InProgress|Delayed)
+                : ;;
+              *)
+                echo "Unexpected SSM status: ${STATUS}" ;;
+            esac
+            if [ $(date +%s) -ge ${deadline} ]; then
+              aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${TOKYO_INSTANCE_ID}" --output text || true
+              echo "##[error]Tokyo deploy polling timed out after ${SSM_DEPLOY_TIMEOUT_SECS}s (last status: ${STATUS})"
+              exit 1
+            fi
+            echo "tokyo deploy in progress (status=${STATUS}), sleeping ${POLL_INTERVAL_SECS}s..."
+            sleep ${POLL_INTERVAL_SECS}
+          done

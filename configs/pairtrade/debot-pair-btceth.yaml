@@ -1,0 +1,120 @@
+dex_name: lighter
+rest_endpoint: https://mainnet.zklighter.elliot.ai/
+web_socket_endpoint: wss://mainnet.zklighter.elliot.ai/stream
+dry_run: false
+agent_name: debot-pair-btceth
+
+# Data dump for BT (independent of trading; observe_only must be set explicitly)
+enable_data_dump: true
+data_dump_file: /opt/debot/market_data_btceth.jsonl
+observe_only: false
+
+# Hourly snapshot archive for BT replay warm-start (#69)
+# 360 days retention ≈ 168 MB / 8640 files — covers year-long replays and
+# ad-hoc historical analysis at trivial disk cost.
+history_archive_dir: /opt/debot/history_archive
+history_archive_retention_days: 360
+
+# Fixed pair: BTC/ETH only
+universe_pairs:
+- BTC/ETH
+max_active_pairs: 1
+
+# Timing
+interval_secs: 5
+trading_period_secs: 60
+
+# Pair diagnostics (simplified: relaxed thresholds)
+pair_selection_lookback_hours_short: 1
+pair_selection_lookback_hours_long: 2
+adf_p_threshold: 0.15
+half_life_max_hours: 2.0
+metrics_window_length: 240
+warm_start_mode: relaxed
+warm_start_min_bars: 60
+
+# Core MR params (Bot C champion params, swapped in 2026-04-07: was exit_z=0.3, sl_z=6.0)
+entry_z_score_base: 1.5
+entry_z_score_min: 1.0
+entry_z_score_max: 2.0
+exit_z_score: 0.2
+stop_loss_z_score: 4.0
+force_close_time_secs: 3600
+shutdown_grace_secs: 7260  # max(force_close_time_secs across strategies) + 60s buffer. Strategy A overrides to 7200 (see `strategies` below), so grace must cover 7200 + 60. See bot-strategy#50.
+
+# Risk
+risk_pct_per_trade: 0.40
+equity_usd_fallback: 1000
+max_leverage: 1
+max_loss_r_mult: 1.0    # Bot C champion value (was 3.0). Swapped 2026-04-07.
+max_dd_pct: 0.10                      # Max drawdown tolerance for auto-sizing
+
+# Execution
+cooldown_secs: 60
+slippage_bps: 0
+fee_bps: 0
+entry_post_only_timeout_secs: 30
+
+# Filters (relaxed: let z-score do the work)
+spread_velocity_max_sigma_per_min: 0.15
+spread_trend_max_slope_sigma: 1.0
+beta_divergence_max: 0.30
+beta_min: 0.30
+hedge_ratio_max_deviation: 0.20
+entry_vol_lookback_hours: 2
+vol_spike_mult: 3.0
+net_funding_min_per_hour: -0.01
+reeval_jump_z_mult: 1.5
+
+# Phase 2 filters (BT 2026-04-05: beta_gap=3.0 best, +$0.84 vs baseline +$0.20)
+entry_velocity_block_sigma_per_min: 0.0
+funding_entry_z_scale: 0.0
+beta_gap_entry_z_scale: 3.0
+
+# Std collapse guard (bot-strategy#62). On 2026-04-15 the full-window std
+# collapsed 1.018 → 0.0016 within 2 bars; the resulting z ≈ -15 wiped all 3
+# bots. Observe-only during the #41 A/B/C test window (ends 2026-04-26) so the
+# comparison is not disturbed — guard logs `[STD_COLLAPSE_OBSERVE]` whenever it
+# *would* block (std < 20% of the rolling median of the last 60 bar stds) but
+# lets the entry through. Flip observe_only to false after 4/26 review.
+std_collapse_window_bars: 60
+std_collapse_min_ratio: 0.2
+std_collapse_observe_only: true
+
+# Circuit breaker
+circuit_breaker_tier1_losses: 5
+circuit_breaker_tier1_cooldown_secs: 600
+circuit_breaker_tier2_losses: 8
+circuit_breaker_tier2_cooldown_secs: 3600
+
+# Multi-strategy A/B/C variants for the single-process architecture
+# (shigeo-nakamura/bot-strategy#25). The single `debot-pair-btceth`
+# process spawns one StrategyInstance per entry, sharing the WS feed,
+# BarBuilder and spread_history above and only branching on the
+# per-strategy overrides below. Each instance loads its sub-account
+# credentials via LIGHTER_*_{A,B,C} env vars set up by
+# /opt/debot/scripts/debot-pair-btceth.sh from the legacy per-bot
+# env files.
+strategies:
+  - id: a
+    agent_name: debot-pair-btceth-a
+    exit_z_score: 0.2
+    stop_loss_z_score: 4.0
+    max_loss_r_mult: 1.0
+    equity_usd_fallback: 1000
+    # A/B/C round 2 (2026-04-12): MTF + extended force_close (#20/#40)
+    mtf_windows: [15]
+    mtf_z_min: 0.5
+    force_close_time_secs: 7200
+  - id: b
+    agent_name: debot-pair-btceth-b
+    exit_z_score: 0.2
+    stop_loss_z_score: 6.0
+    max_loss_r_mult: 3.0
+    equity_usd_fallback: 500
+  - id: c
+    agent_name: debot-pair-btceth-c
+    exit_z_score: 0.3
+    stop_loss_z_score: 6.0
+    max_loss_r_mult: 3.0
+    equity_usd_fallback: 500

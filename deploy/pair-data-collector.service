@@ -1,0 +1,17 @@
+[Unit]
+Description=Pair Trade Candidate Data Collector (bot-strategy#169)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/opt/debot/scripts
+ExecStart=/usr/bin/python3 /opt/debot/scripts/pair_data_collector.py
+Environment=PAIR_INTERVAL_SECS=10
+Environment=PAIR_DATA_DIR=/home/ec2-user
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
