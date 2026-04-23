@@ -25,6 +25,17 @@ Usage:
       --exit-z       0.3 \\
       --roundtrip-bps 2.5
 
+With Binance cross-check (bot-strategy#166 smoke test found Lighter-side
+stale quotes; the reference anchors which venue is mis-quoting and lets
+us drop those buckets cleanly):
+
+  scripts/phase0/fetch_reference.sh 1776870000000 1776956400000
+  python3 scripts/phase0/spread_analysis.py \\
+      --lighter-dir  /tmp/xvenue-phase0/lighter \\
+      --extended-dir /tmp/xvenue-phase0/extended \\
+      --reference-jsonl /tmp/xvenue-phase0/reference/binance_btcusdt_1m.jsonl \\
+      --drop-ref-deviation-bps 50
+
 Requires: numpy, pandas (no scipy / statsmodels — we keep deps light).
 """
 
@@ -93,6 +104,60 @@ def load_venue(dir_: str, symbol: str = "BTC") -> pd.DataFrame:
         print(f"  loaded {len(df):>8d} rows from {os.path.basename(f)}", file=sys.stderr)
     df = pd.concat(frames, ignore_index=True).sort_values("ts_ms").drop_duplicates("ts_ms")
     return df
+
+
+def load_reference(path: str) -> pd.DataFrame:
+    """Load Binance 1m klines written by fetch_reference.sh.
+
+    Returns a DataFrame indexed by bar open timestamp (ms) with column
+    `mid_ref` = (high + low) / 2. Using mid-of-range instead of close
+    gives us a value that straddles whatever intra-minute volatility
+    happened, which is closer to a tradeable mid than the last-print
+    close. The venue quotes are still fine-grained (tick) — we are only
+    sanity-checking that they live within the minute's band.
+    """
+    rows = []
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            try:
+                high = float(rec["high"])
+                low = float(rec["low"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if high <= 0 or low <= 0 or high < low:
+                continue
+            rows.append((int(rec["ts_ms"]), 0.5 * (high + low)))
+    df = pd.DataFrame(rows, columns=["ts_ms", "mid_ref"]).sort_values("ts_ms")
+    df = df.drop_duplicates("ts_ms").set_index("ts_ms")
+    return df
+
+
+def attach_reference(aligned: pd.DataFrame, ref: pd.DataFrame, bucket_sec: int) -> pd.DataFrame:
+    """Annotate `aligned` (bucket-indexed DataFrame) with a `mid_ref`
+    column by forward-filling the 1m reference onto each bucket.
+
+    A bucket at ts gets the reference bar whose open is the greatest
+    minute-open <= ts, i.e. the bar that the bucket lies inside. Buckets
+    that fall before the first reference bar become NaN and are left
+    as-is (so the caller can see coverage explicitly).
+    """
+    # Floor each bucket to the enclosing 1m bar; then ffill-fetch that
+    # minute's reference mid. `reindex(method='ffill')` handles both the
+    # enclosing-bar lookup and any gap in the kline series (rare for
+    # Binance but safe against a missing minute).
+    minute_keys = (aligned.index // 60_000) * 60_000
+    ref_sorted = ref.sort_index()
+    # reindex the reference directly at the minute keys we need; ffill
+    # fills in any minute that fell into a gap in the upstream kline
+    # data. Output length equals len(minute_keys), which matches aligned.
+    ref_series = ref_sorted["mid_ref"].reindex(minute_keys, method="ffill").to_numpy()
+    out = aligned.copy()
+    out["mid_ref"] = ref_series
+    return out
 
 
 def align_buckets(lt: pd.DataFrame, ext: pd.DataFrame, bucket_sec: int) -> pd.DataFrame:
@@ -220,6 +285,15 @@ def main() -> int:
                     help="Round-trip cost floor (Ext maker 0 + Lt 0 + slippage).")
     ap.add_argument("--max-abs-bps", type=float, default=100.0,
                     help="Trim spreads with |s| > this for distribution stats (feed-stall guard).")
+    ap.add_argument("--reference-jsonl", default=None,
+                    help="Optional Binance 1m klines JSONL (see fetch_reference.sh). "
+                         "When supplied, each venue's mid is cross-checked against the "
+                         "reference and a data-quality section is printed.")
+    ap.add_argument("--drop-ref-deviation-bps", type=float, default=None,
+                    help="When a reference is loaded, drop buckets where either venue "
+                         "deviates more than this many bps from the reference. "
+                         "Typical values: 30-50 bps. If unset, reference is used for "
+                         "diagnostics only and no rows are filtered.")
     ap.add_argument("--out-csv", default=None,
                     help="Optional: write aligned (ts, spread_bps, z) CSV for plotting.")
     args = ap.parse_args()
@@ -234,8 +308,48 @@ def main() -> int:
     if aligned.empty:
         raise SystemExit("No overlapping buckets between venues.")
 
+    ref_loaded = False
+    if args.reference_jsonl:
+        print(f"[ref] loading {args.reference_jsonl}", file=sys.stderr)
+        ref_df = load_reference(args.reference_jsonl)
+        if ref_df.empty:
+            print("[ref] WARN: reference file produced zero rows — ignoring", file=sys.stderr)
+        else:
+            aligned = attach_reference(aligned, ref_df, args.bucket_sec)
+            # Per-venue deviation from the external reference, in bps.
+            aligned["dev_lt_bps"] = (
+                (aligned["mid_lt"] - aligned["mid_ref"]) / aligned["mid_ref"] * 10_000.0
+            )
+            aligned["dev_ext_bps"] = (
+                (aligned["mid_ext"] - aligned["mid_ref"]) / aligned["mid_ref"] * 10_000.0
+            )
+            ref_loaded = True
+
     spread = compute_spread_bps(aligned)
     aligned["spread_bps"] = spread
+
+    # Optional reference-based pre-filter: if the caller gave us a
+    # --drop-ref-deviation-bps threshold, drop any bucket where either
+    # venue's mid deviates from the Binance 1m reference by more than
+    # that many bps *before* any other stat is computed. This is the
+    # strongest stale-quote guard we have: it removes the whole row
+    # rather than just trimming the cross-venue spread, and keeps the
+    # rolling μ/σ / OU half-life / threshold trade count honest.
+    ref_prefilter_dropped = 0
+    if ref_loaded and args.drop_ref_deviation_bps is not None:
+        thr = args.drop_ref_deviation_bps
+        dev_mask = (
+            aligned["dev_lt_bps"].abs().fillna(np.inf).le(thr)
+            & aligned["dev_ext_bps"].abs().fillna(np.inf).le(thr)
+        )
+        ref_prefilter_dropped = int((~dev_mask).sum())
+        aligned = aligned[dev_mask]
+        if aligned.empty:
+            raise SystemExit(
+                f"Reference pre-filter at {thr} bps dropped every bucket — "
+                "widen the threshold or inspect the reference vs venue dumps."
+            )
+        spread = aligned["spread_bps"]
 
     # Robust outlier trim. Cross-venue spreads of hundreds of bps come
     # from feed stalls (one venue's quote frozen while the other moves
@@ -288,6 +402,9 @@ def main() -> int:
         print(f"  p{int(q*100):02d}               : {np.quantile(s, q):+.3f}")
     print()
     # Show top-5 outliers so the user can see what the filter cut.
+    # When a reference is loaded we also print per-venue deviation, which
+    # tells us *which* side was stale — the prior version only showed the
+    # cross-venue delta, leaving root-cause attribution to manual lookup.
     outlier_rows = aligned_raw[~trim_mask.reindex(aligned_raw.index).fillna(True)]
     if len(outlier_rows) > 0:
         print(f"top outliers (|s| > {cutoff:.0f} bps, max 5 shown):")
@@ -295,9 +412,58 @@ def main() -> int:
             outlier_rows["spread_bps"].abs().sort_values(ascending=False).index
         ).head(5)
         for ts_ms, row in top.iterrows():
-            print(f"  ts={pd.Timestamp(int(ts_ms), unit='ms', tz='UTC')}  "
-                  f"spread={row['spread_bps']:+.1f} bps  "
-                  f"lt={row['mid_lt']:.2f}  ext={row['mid_ext']:.2f}")
+            base = (
+                f"  ts={pd.Timestamp(int(ts_ms), unit='ms', tz='UTC')}  "
+                f"spread={row['spread_bps']:+.1f} bps  "
+                f"lt={row['mid_lt']:.2f}  ext={row['mid_ext']:.2f}"
+            )
+            if ref_loaded and "mid_ref" in row and pd.notna(row["mid_ref"]):
+                dev_lt = row.get("dev_lt_bps", float("nan"))
+                dev_ext = row.get("dev_ext_bps", float("nan"))
+                culprit = "lt" if abs(dev_lt) > abs(dev_ext) else "ext"
+                print(
+                    f"{base}  "
+                    f"ref={row['mid_ref']:.2f}  "
+                    f"dev_lt={dev_lt:+.1f}bps  dev_ext={dev_ext:+.1f}bps  "
+                    f"[stale={culprit}]"
+                )
+            else:
+                print(base)
+        print()
+
+    if ref_loaded:
+        # Data-quality snapshot: how often each venue strays from the
+        # external reference, and by how much. A healthy venue lives
+        # within a few bps of Binance spot for BTC; persistent excursions
+        # are stale-quote evidence. Thresholds below are diagnostic, not
+        # used for filtering unless --drop-ref-deviation-bps is set.
+        dev_lt = aligned["dev_lt_bps"].dropna()
+        dev_ext = aligned["dev_ext_bps"].dropna()
+        # Count rows where reference itself is missing (buckets before
+        # the first reference bar, or if the ref file didn't cover the
+        # window) so we can warn about low coverage.
+        ref_missing = int(aligned["mid_ref"].isna().sum())
+        print("data quality vs Binance 1m reference:")
+        print(f"  reference coverage : {len(aligned) - ref_missing:>8d} / {len(aligned)} buckets"
+              f"  (missing {ref_missing})")
+        for label, series in (("Lighter ", dev_lt), ("Extended", dev_ext)):
+            if series.empty:
+                print(f"  {label} deviation  : (no data)")
+                continue
+            abs_s = series.abs()
+            print(f"  {label} deviation  : "
+                  f"mean={series.mean():+.2f} bps  "
+                  f"median={series.median():+.2f}  "
+                  f"p95|dev|={abs_s.quantile(0.95):.2f}  "
+                  f"p99|dev|={abs_s.quantile(0.99):.2f}  "
+                  f"max|dev|={abs_s.max():.2f}")
+            for thr in (10.0, 30.0, 100.0):
+                pct = (abs_s > thr).mean() * 100.0
+                print(f"    |dev| > {thr:>5.0f} bps    : {pct:>6.3f}%"
+                      f"   ({int((abs_s > thr).sum())} buckets)")
+        if args.drop_ref_deviation_bps is not None:
+            print(f"  pre-filter @ {args.drop_ref_deviation_bps:.0f} bps: "
+                  f"dropped {ref_prefilter_dropped} buckets before stats.")
         print()
     print("autocorrelation (trimmed, de-meaned spread):")
     for lag_sec in [1, 5, 30, 60, 300, 1800, 3600]:
