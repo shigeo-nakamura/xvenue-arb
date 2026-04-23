@@ -1,5 +1,14 @@
 name: Rust CI
 
+# NOTE: This workflow is kept as `.yml.disabled` until Phase 0 data
+# feasibility GO (bot-strategy#166). Once the data analysis confirms a
+# tradeable edge, rename to `.yml` and configure the following secrets:
+#   - AWS_ROLE_ARN, S3_BUCKET (shared with pairtrade — same eu-central-1
+#     bucket, different key prefix `debot-xvenue-arb/`)
+#   - TOKYO_INSTANCE_ID (ap-northeast-1 EC2 instance)
+#   - DEX_CONNECTOR_PAT (optional, only if dex-connector becomes private)
+# See docs/DESIGN.md §8.2 for the transition checklist.
+
 on:
   push:
     paths:
@@ -17,7 +26,7 @@ on:
         type: string
 
 concurrency:
-  group: debot-ci-${{ github.ref }}
+  group: xvenue-arb-ci-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -74,6 +83,9 @@ jobs:
               f.write(f"should_deploy=true\n")
           PY
 
+  # x86 sanity check — cargo check + tests with both SDKs enabled. Uses
+  # native Go on the runner to build libsigner.so (simpler than Docker
+  # QEMU; the Tokyo deploy job below does the real arm64 build).
   build-test:
     needs: resolve-ref
     if: needs.resolve-ref.outputs.should_deploy == 'true'
@@ -132,18 +144,22 @@ jobs:
       - name: Cargo test
         run: cargo test --all-targets --locked
 
-  deploy:
+  # Tokyo-only deploy. arm64 cross-build via Docker QEMU for both
+  # libsigner.so (Go cgo) and the debot binary (Rust, default features =
+  # lighter-sdk + extended-sdk, both linked into a single binary that
+  # drives two DexConnectors from one process). S3 upload hits the
+  # eu-central-1 bucket; SSM then flips to ap-northeast-1 for the Tokyo
+  # instance.
+  deploy-tokyo:
     runs-on: ubuntu-latest
-    # CI ships new binary + configs but no longer restarts the service
-    # (pairtrade#9). Operators restart debot-pair-btceth manually when
-    # convenient, so the SSM step finishes in seconds and does not need
-    # to cover the 2h graceful-shutdown window.
-    timeout-minutes: 60
+    timeout-minutes: 120
     needs: [resolve-ref, build-test]
     if: needs.resolve-ref.outputs.should_deploy == 'true' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
     environment: debot
     env:
       DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.dex_connector_ref }}
+      AWS_REGION: eu-central-1
+      TOKYO_REGION: ap-northeast-1
     steps:
       - name: Checkout debot
         uses: actions/checkout@v4
@@ -206,8 +222,9 @@ jobs:
             .cache/cargo/bin
             .cache/rustup
             debot/target
-          key: ${{ runner.os }}-cargo-arm64-${{ hashFiles('debot/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-arm64-xvenue-${{ hashFiles('debot/Cargo.lock') }}
           restore-keys: |
+            ${{ runner.os }}-cargo-arm64-xvenue-
             ${{ runner.os }}-cargo-arm64-
 
       - name: Build debot (linux/arm64)
@@ -248,7 +265,7 @@ jobs:
             .cache/cargo/bin
             .cache/rustup
             debot/target
-          key: ${{ runner.os }}-cargo-arm64-${{ hashFiles('debot/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-arm64-xvenue-${{ hashFiles('debot/Cargo.lock') }}
 
       - name: Package artifacts
         run: |
@@ -263,7 +280,7 @@ jobs:
             debot/scripts/ dist/scripts/
           rsync -a debot/configs/ dist/configs/
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (eu-central-1 for upload)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
@@ -273,212 +290,17 @@ jobs:
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
         run: |
-          aws s3 cp dist/bin/debot "s3://${S3_BUCKET}/debot/debot"
-          aws s3 cp dist/lib/libsigner.so "s3://${S3_BUCKET}/debot/libsigner.so"
-          aws s3 sync dist/scripts/ "s3://${S3_BUCKET}/debot/scripts/" \
+          aws s3 cp dist/bin/debot "s3://${S3_BUCKET}/debot-xvenue-arb/debot"
+          aws s3 cp dist/lib/libsigner.so "s3://${S3_BUCKET}/debot-xvenue-arb/libsigner.so"
+          aws s3 sync dist/scripts/ "s3://${S3_BUCKET}/debot-xvenue-arb/scripts/" \
             --exclude "venv/*" \
             --exclude "venv/**" \
             --exclude "__pycache__/*" \
             --exclude "__pycache__/**" \
             --exclude "*.log" \
             --exclude "*.pyc"
-          aws s3 sync dist/configs/ "s3://${S3_BUCKET}/debot/configs/"
-          aws s3 cp debot/deploy/debot-pair-btceth.service "s3://${S3_BUCKET}/deploy/debot-pair-btceth.service"
-          # Tokyo service unit is packaged alongside Frankfurt's so the
-          # deploy-tokyo job can reuse the same `debot/` prefix for configs
-          # + scripts and only override the binary under `debot-extended/`.
-          aws s3 cp debot/deploy/debot-pair-btceth-extended.service "s3://${S3_BUCKET}/deploy/debot-pair-btceth-extended.service"
-
-      - name: Deploy via SSM (no restart)
-        env:
-          S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
-          INSTANCE_ID: ${{ secrets.INSTANCE_ID || vars.INSTANCE_ID }}
-        run: |
-          cat > /tmp/ssm-params.json <<'JSON'
-          {
-            "commands": [
-              "sudo mkdir -p __INSTALL_DIR__/bin __INSTALL_DIR__/lib __INSTALL_DIR__/scripts __INSTALL_DIR__/configs",
-              "aws s3 cp s3://__S3_BUCKET__/debot/debot __INSTALL_DIR__/bin/debot",
-              "sudo chmod 755 __INSTALL_DIR__/bin/debot",
-              "aws s3 cp s3://__S3_BUCKET__/debot/libsigner.so __INSTALL_DIR__/lib/libsigner.so",
-              "sudo chmod 644 __INSTALL_DIR__/lib/libsigner.so",
-              "aws s3 sync s3://__S3_BUCKET__/debot/scripts __INSTALL_DIR__/scripts",
-              "aws s3 sync s3://__S3_BUCKET__/debot/configs __INSTALL_DIR__/configs",
-              "sudo chmod 755 __INSTALL_DIR__/scripts/*.sh",
-              "/bin/bash -lc 'set -e; UPDATED=0; for svc in debot-pair-btceth; do aws s3 cp s3://__S3_BUCKET__/deploy/$svc.service /tmp/$svc.service; if [ ! -f /etc/systemd/system/$svc.service ] || ! cmp -s /etc/systemd/system/$svc.service /tmp/$svc.service; then sudo mv /tmp/$svc.service /etc/systemd/system/$svc.service; UPDATED=1; else rm /tmp/$svc.service; fi; done; if [ $UPDATED -eq 1 ]; then sudo systemctl daemon-reload; fi'"
-            ]
-          }
-          JSON
-          sed -i "s|__INSTALL_DIR__|${INSTALL_DIR}|g; s|__S3_BUCKET__|${S3_BUCKET}|g" /tmp/ssm-params.json
-
-          COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "${INSTANCE_ID}" \
-            --document-name "AWS-RunShellScript" \
-            --comment "Deploy debot" \
-            --parameters file:///tmp/ssm-params.json \
-            --query "Command.CommandId" \
-            --output text)
-
-          # No service restart in the SSM commands above, so the command
-          # finishes as soon as the S3 pulls + daemon-reload complete.
-          # 30 minutes is ample for S3 transfers + SSM scheduling latency.
-          SSM_DEPLOY_TIMEOUT_SECS=${SSM_DEPLOY_TIMEOUT_SECS:-1800}
-          POLL_INTERVAL_SECS=30
-          deadline=$(( $(date +%s) + SSM_DEPLOY_TIMEOUT_SECS ))
-          while :; do
-            STATUS=$(aws ssm get-command-invocation \
-              --command-id "${COMMAND_ID}" \
-              --instance-id "${INSTANCE_ID}" \
-              --query "Status" --output text 2>/dev/null || echo "Pending")
-            case "${STATUS}" in
-              Success)
-                aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}" --output text
-                exit 0 ;;
-              Cancelled|TimedOut|Failed)
-                aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}" --output text
-                echo "##[error]SSM command finished with status ${STATUS}"
-                exit 1 ;;
-              Pending|InProgress|Delayed)
-                : ;;
-              *)
-                echo "Unexpected SSM status: ${STATUS}" ;;
-            esac
-            if [ $(date +%s) -ge ${deadline} ]; then
-              aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}" --output text || true
-              echo "##[error]Deploy polling timed out after ${SSM_DEPLOY_TIMEOUT_SECS}s (last status: ${STATUS})"
-              exit 1
-            fi
-            echo "deploy in progress (status=${STATUS}), sleeping ${POLL_INTERVAL_SECS}s..."
-            sleep ${POLL_INTERVAL_SECS}
-          done
-
-  # Separate deploy pipeline for the Tokyo instance running pairtrade against
-  # Extended Exchange (bot-strategy#123). No libsigner / Go dep since
-  # extended-sdk is pure Rust. Binary lives under `debot-extended/` prefix on
-  # the same eu-central-1 S3 bucket; Tokyo SSM pulls it cross-region (20MB,
-  # negligible transfer cost). Uses a separate service unit
-  # `debot-pair-btceth-extended.service` so the Frankfurt Lighter bot is
-  # unaffected even if both regions run simultaneously.
-  # CI ships new binary + configs but does not restart the service (symmetric
-  # with the Frankfurt `deploy` job, pairtrade#9). Operators restart
-  # debot-pair-btceth-extended manually once positions are flat.
-  deploy-tokyo:
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    needs: [resolve-ref, build-test]
-    if: needs.resolve-ref.outputs.should_deploy == 'true' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
-    environment: debot
-    env:
-      DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.dex_connector_ref }}
-      # Build + S3 upload happen against eu-central-1 (same bucket as the
-      # Frankfurt job). The SSM step below flips region to ap-northeast-1
-      # for the Tokyo instance.
-      AWS_REGION: eu-central-1
-      TOKYO_REGION: ap-northeast-1
-    steps:
-      - name: Checkout debot
-        uses: actions/checkout@v4
-        with:
-          path: debot
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-
-      - name: Checkout dex-connector
-        uses: actions/checkout@v4
-        with:
-          repository: shigeo-nakamura/dex-connector
-          ref: ${{ env.DEX_CONNECTOR_REF }}
-          path: dex-connector
-          token: ${{ secrets.DEX_CONNECTOR_PAT || github.token }}
-
-      - name: Cache cargo extended (linux/arm64)
-        id: cache_cargo_ext
-        uses: actions/cache@v4
-        with:
-          path: |
-            .cache/cargo/registry
-            .cache/cargo/git
-            .cache/cargo/bin
-            .cache/rustup
-            debot/target
-          key: ${{ runner.os }}-cargo-arm64-ext-${{ hashFiles('debot/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-arm64-ext-
-            ${{ runner.os }}-cargo-arm64-
-
-      - name: Build debot extended-sdk (linux/arm64)
-        id: build_debot_ext
-        run: |
-          mkdir -p .cache/cargo/registry .cache/cargo/git .cache/cargo/bin .cache/rustup debot/target
-          docker run --rm --platform linux/arm64 \
-            -v "${{ github.workspace }}:/workspace" \
-            -w /workspace \
-            -e HOST_UID="$(id -u)" \
-            -e HOST_GID="$(id -g)" \
-            -e CARGO_HOME=/workspace/.cache/cargo \
-            -e RUSTUP_HOME=/workspace/.cache/rustup \
-            -e CARGO_INCREMENTAL=0 \
-            ${AL2023_IMAGE} \
-            /bin/bash -lc "set -euo pipefail; dnf -y install gcc gcc-c++ make openssl-devel pkgconf-pkg-config git curl-minimal tar gzip; if [ ! -x /workspace/.cache/cargo/bin/rustup ]; then curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable; fi; export PATH=/workspace/.cache/cargo/bin:\$PATH; rustc -V; cargo -V; cd debot && cargo build --release --locked --no-default-features --features extended-sdk; chown -R ${HOST_UID}:${HOST_GID} /workspace/debot/target /workspace/.cache/cargo /workspace/.cache/rustup"
-
-      - name: Fix cargo cache permissions
-        if: steps.build_debot_ext.outcome == 'success'
-        run: |
-          if command -v sudo >/dev/null 2>&1; then
-            sudo chown -R "$(id -u):$(id -g)" .cache/cargo .cache/rustup debot/target
-            sudo chmod -R u+rwX,go+rX .cache/cargo .cache/rustup debot/target
-          else
-            chown -R "$(id -u):$(id -g)" .cache/cargo .cache/rustup debot/target
-            chmod -R u+rwX,go+rX .cache/cargo .cache/rustup debot/target
-          fi
-
-      - name: Save cargo cache extended (linux/arm64)
-        if: steps.build_debot_ext.outcome == 'success' && steps.cache_cargo_ext.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            .cache/cargo/registry
-            .cache/cargo/git
-            .cache/cargo/bin
-            .cache/rustup
-            debot/target
-          key: ${{ runner.os }}-cargo-arm64-ext-${{ hashFiles('debot/Cargo.lock') }}
-
-      - name: Package artifacts
-        run: |
-          mkdir -p dist/bin dist/scripts dist/configs
-          cp debot/target/release/debot dist/bin/debot
-          rsync -a \
-            --exclude "venv/" \
-            --exclude "__pycache__/" \
-            --exclude "*.log" \
-            --exclude "*.pyc" \
-            debot/scripts/ dist/scripts/
-          rsync -a debot/configs/ dist/configs/
-
-      - name: Configure AWS credentials (eu-central-1 for upload)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Upload Tokyo artifacts to S3
-        env:
-          S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
-        run: |
-          aws s3 cp dist/bin/debot "s3://${S3_BUCKET}/debot-extended/debot"
-          aws s3 sync dist/scripts/ "s3://${S3_BUCKET}/debot-extended/scripts/" \
-            --exclude "venv/*" \
-            --exclude "venv/**" \
-            --exclude "__pycache__/*" \
-            --exclude "__pycache__/**" \
-            --exclude "*.log" \
-            --exclude "*.pyc"
-          aws s3 sync dist/configs/ "s3://${S3_BUCKET}/debot-extended/configs/"
-          aws s3 cp debot/deploy/debot-pair-btceth-extended.service "s3://${S3_BUCKET}/deploy/debot-pair-btceth-extended.service"
+          aws s3 sync dist/configs/ "s3://${S3_BUCKET}/debot-xvenue-arb/configs/"
+          aws s3 cp debot/deploy/debot-xvenue-arb.service "s3://${S3_BUCKET}/deploy/debot-xvenue-arb.service"
 
       - name: Configure AWS credentials (ap-northeast-1 for SSM)
         uses: aws-actions/configure-aws-credentials@v4
@@ -486,6 +308,11 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.TOKYO_REGION }}
 
+      # No service restart. Operators restart debot-xvenue-arb manually
+      # once positions are flat — symmetric with the pairtrade deploy
+      # convention (pairtrade#9). libsigner.so is shared across bots in
+      # /opt/debot/lib/, so a pairtrade-extended bot (if it also ran
+      # here) would pick up the same file.
       - name: Deploy to Tokyo via SSM (no restart)
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
@@ -494,13 +321,15 @@ jobs:
           cat > /tmp/ssm-tokyo-params.json <<'JSON'
           {
             "commands": [
-              "sudo mkdir -p __INSTALL_DIR__/bin __INSTALL_DIR__/scripts __INSTALL_DIR__/configs",
-              "aws s3 cp --region eu-central-1 s3://__S3_BUCKET__/debot-extended/debot __INSTALL_DIR__/bin/debot",
+              "sudo mkdir -p __INSTALL_DIR__/bin __INSTALL_DIR__/lib __INSTALL_DIR__/scripts __INSTALL_DIR__/configs",
+              "aws s3 cp --region eu-central-1 s3://__S3_BUCKET__/debot-xvenue-arb/debot __INSTALL_DIR__/bin/debot",
               "sudo chmod 755 __INSTALL_DIR__/bin/debot",
-              "aws s3 sync --region eu-central-1 s3://__S3_BUCKET__/debot-extended/scripts __INSTALL_DIR__/scripts",
-              "aws s3 sync --region eu-central-1 s3://__S3_BUCKET__/debot-extended/configs __INSTALL_DIR__/configs",
+              "aws s3 cp --region eu-central-1 s3://__S3_BUCKET__/debot-xvenue-arb/libsigner.so __INSTALL_DIR__/lib/libsigner.so",
+              "sudo chmod 644 __INSTALL_DIR__/lib/libsigner.so",
+              "aws s3 sync --region eu-central-1 s3://__S3_BUCKET__/debot-xvenue-arb/scripts __INSTALL_DIR__/scripts",
+              "aws s3 sync --region eu-central-1 s3://__S3_BUCKET__/debot-xvenue-arb/configs __INSTALL_DIR__/configs",
               "sudo chmod 755 __INSTALL_DIR__/scripts/*.sh",
-              "/bin/bash -lc 'set -e; aws s3 cp --region eu-central-1 s3://__S3_BUCKET__/deploy/debot-pair-btceth-extended.service /tmp/debot-pair-btceth-extended.service; if [ ! -f /etc/systemd/system/debot-pair-btceth-extended.service ] || ! cmp -s /etc/systemd/system/debot-pair-btceth-extended.service /tmp/debot-pair-btceth-extended.service; then sudo mv /tmp/debot-pair-btceth-extended.service /etc/systemd/system/debot-pair-btceth-extended.service; sudo systemctl daemon-reload; else rm /tmp/debot-pair-btceth-extended.service; fi'"
+              "/bin/bash -lc 'set -e; aws s3 cp --region eu-central-1 s3://__S3_BUCKET__/deploy/debot-xvenue-arb.service /tmp/debot-xvenue-arb.service; if [ ! -f /etc/systemd/system/debot-xvenue-arb.service ] || ! cmp -s /etc/systemd/system/debot-xvenue-arb.service /tmp/debot-xvenue-arb.service; then sudo mv /tmp/debot-xvenue-arb.service /etc/systemd/system/debot-xvenue-arb.service; sudo systemctl daemon-reload; else rm /tmp/debot-xvenue-arb.service; fi'"
             ]
           }
           JSON
@@ -509,14 +338,11 @@ jobs:
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${TOKYO_INSTANCE_ID}" \
             --document-name "AWS-RunShellScript" \
-            --comment "Deploy debot-extended (Tokyo)" \
+            --comment "Deploy debot-xvenue-arb (Tokyo)" \
             --parameters file:///tmp/ssm-tokyo-params.json \
             --query "Command.CommandId" \
             --output text)
 
-          # No service restart in the SSM commands above (symmetric with the
-          # Frankfurt deploy job, pairtrade#9). Operators restart
-          # debot-pair-btceth-extended manually when positions are flat.
           SSM_DEPLOY_TIMEOUT_SECS=${SSM_DEPLOY_TIMEOUT_SECS:-1800}
           POLL_INTERVAL_SECS=15
           deadline=$(( $(date +%s) + SSM_DEPLOY_TIMEOUT_SECS ))

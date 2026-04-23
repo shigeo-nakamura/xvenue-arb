@@ -1,0 +1,15 @@
+[Unit]
+Description="debot-xvenue-arb (Tokyo, bot-strategy#166)"
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/debot
+ExecStart=/bin/bash /opt/debot/scripts/debot-xvenue-arb.sh
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
