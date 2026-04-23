@@ -192,20 +192,24 @@ dashboard (`debot-dashboard`) 側は xvenue-arb 識別 → 2 venue 表示。pill
 
 ## 8. デプロイ
 
-### 8.1 Tokyo (`debot-tokyo` / ARM)
+### 8.1 Tokyo (`debot-tokyo` / ARM64 / Amazon Linux 2023)
 
-1. **Go toolchain 導入**: `sudo dnf install -y golang` (Amazon Linux 2023) or upstream `go1.21+` for ARM64
-2. **lighter-go 取得 & ビルド**:
-   ```
-   git clone https://github.com/elliottech/lighter-go.git ~/lighter-go
-   cd ~/lighter-go && go build -buildmode=c-shared -o libsigner.so ./sharedlib
-   ```
-3. `LD_LIBRARY_PATH` に `~/lighter-go` を追加
-4. systemd unit `debot-xvenue-arb.service` で binary 起動
+サーバー上の Go toolchain は **不要**。libsigner.so は CI 側で arm64 クロスコンパイルして S3 経由で配布する方式 (pairtrade が既に採用済み)。
 
-### 8.2 CI
+実際 `/opt/debot/lib/libsigner.so` は pairtrade CI の arm64 ビルドステップで既にデプロイ済み (11.8 MB、ARM aarch64 ELF、依存はすべて標準 libc / libresolv で解決)。xvenue-arb はこの資産をそのまま流用できる。
 
-GitHub Actions runner (`ubuntu-latest` x86) 上でも同じ Go build を仕込む。pairtrade の CI が既に Frankfurt で lighter-sdk ビルドしているなら設定流用可。Tokyo 実機への SSM deploy step を追加。
+ランタイム側の要件は:
+- `/opt/debot/lib/libsigner.so` (既に存在)
+- systemd unit `debot-xvenue-arb.service` 新規追加
+- 起動スクリプトで `LD_LIBRARY_PATH=/opt/debot/lib` を export (pairtrade の `debot-pair-btceth.sh` と同じパターン)
+
+### 8.2 CI (arm64 クロスビルド)
+
+pairtrade の `.github/workflows/ci.yml` Tokyo job をベースに以下を改変:
+- **libsigner.so arm64 ビルド**: pairtrade の Docker `--platform linux/arm64` + `dnf install golang gcc` + `CGO_ENABLED=1 GOARCH=arm64 go build -buildmode=c-shared` ステップをそのまま流用
+- **cargo build**: `--no-default-features --features extended-sdk` から **default features (= lighter-sdk + extended-sdk)** に変更
+- **S3 prefix**: `debot-extended/` から `debot-xvenue-arb/` に変更
+- **SSM deploy target**: `debot-pair-btceth-extended.service` から `debot-xvenue-arb.service` に変更
 
 Phase 0 GO までは CI / deploy workflow は `.disabled` 拡張子で止めておく (`.github/workflows/*.yml.disabled`)。
 
