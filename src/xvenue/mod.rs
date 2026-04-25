@@ -4,6 +4,7 @@
 //! `docs/DESIGN.md` for the full design; this tree is a skeleton
 //! that will be filled in after Phase 0 data feasibility GO.
 
+pub mod bt;
 pub mod signal;
 pub mod sizing;
 pub mod spread;
