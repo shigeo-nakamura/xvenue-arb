@@ -166,11 +166,24 @@ async fn run_bt_async(replay: &DualReplay, cfg: BtConfig) -> Result<BtSummary> {
         // Both connectors carry valid current-cursor snapshots; read
         // each. Symbols may differ per venue (Extended vs Lighter
         // dumps record under whatever each DEX uses).
-        let ext_mid = ticker_price(&ext, &cfg.symbol_extended).await?;
-        let lt_mid = ticker_price(&lt, &cfg.symbol_lighter).await?;
+        let (ext_mid, ext_book_ok) = read_snapshot(&ext, &cfg.symbol_extended).await?;
+        let (lt_mid, lt_book_ok) = read_snapshot(&lt, &cfg.symbol_lighter).await?;
 
-        spread.update_extended(ts_ms, ext_mid);
-        spread.update_lighter(ts_ms, lt_mid);
+        // Skip the SpreadEngine update on stale one-sided books — a
+        // venue that writes zero bid_size or ask_size has no tradeable
+        // counterparty on that side and the dump's mid is artificially
+        // shifted. Lighter's per-symbol BTC dump has ~49% zero-size
+        // rows in the 2026-04-22..24 window; without this filter the
+        // spread engine sees phantom dislocations and emits trades on
+        // them. Phase 0 v2 simulator does the same drop. See
+        // `phase0/spread_analysis.py::parse_jsonl_mid` and
+        // bot-strategy#166 v2 refinement.
+        if ext_book_ok {
+            spread.update_extended(ts_ms, ext_mid);
+        }
+        if lt_book_ok {
+            spread.update_lighter(ts_ms, lt_mid);
+        }
 
         let dev = spread.current_dev_bps();
         let is_warm = spread.is_warm(cfg.signal.min_warmup_samples);
@@ -234,13 +247,33 @@ async fn run_bt_async(replay: &DualReplay, cfg: BtConfig) -> Result<BtSummary> {
     })
 }
 
-async fn ticker_price(c: &Arc<ReplayConnector>, symbol: &str) -> Result<Decimal> {
+/// Read mid + book-validity flag from the connector's current snapshot.
+/// `book_ok` is `true` only when both top-of-book sizes are positive —
+/// see the call site in `run_bt_async` for the rationale.
+async fn read_snapshot(
+    c: &Arc<ReplayConnector>,
+    symbol: &str,
+) -> Result<(Decimal, bool)> {
     use dex_connector::DexConnector;
     let t = c
         .get_ticker(symbol, None)
         .await
         .map_err(|e| anyhow!("get_ticker({}): {:?}", symbol, e))?;
-    Ok(t.price)
+    let ob = c
+        .get_order_book(symbol, 1)
+        .await
+        .map_err(|e| anyhow!("get_order_book({}): {:?}", symbol, e))?;
+    let book_ok = ob
+        .bids
+        .first()
+        .map(|b| b.size > Decimal::ZERO)
+        .unwrap_or(false)
+        && ob
+            .asks
+            .first()
+            .map(|a| a.size > Decimal::ZERO)
+            .unwrap_or(false);
+    Ok((t.price, book_ok))
 }
 
 fn entry_qty(notional_usd: Decimal, ext_mid: Decimal) -> Result<Decimal> {
@@ -327,9 +360,23 @@ mod tests {
 
     /// Helper to construct a JSONL line for a venue dump.
     fn dump_line(timestamp_ms: i64, symbol: &str, mid: f64) -> String {
+        dump_line_sized(timestamp_ms, symbol, mid, 1.0, 1.0)
+    }
+
+    /// Helper variant where `bid_size` and `ask_size` can be set
+    /// independently (used to test the zero-size stale-quote filter).
+    fn dump_line_sized(
+        timestamp_ms: i64,
+        symbol: &str,
+        mid: f64,
+        bid_size: f64,
+        ask_size: f64,
+    ) -> String {
         format!(
-            r#"{{"timestamp":{ts},"prices":{{"{sym}":{{"price":"{p}","funding_rate":"0","bid_price":"{p}","ask_price":"{p}","bid_size":"1","ask_size":"1","exchange_ts":{ets}}}}}}}"#,
+            r#"{{"timestamp":{ts},"prices":{{"{sym}":{{"price":"{p}","funding_rate":"0","bid_price":"{p}","ask_price":"{p}","bid_size":"{bs}","ask_size":"{as_}","exchange_ts":{ets}}}}}}}"#,
             ts = timestamp_ms,
+            bs = bid_size,
+            as_ = ask_size,
             sym = symbol,
             p = mid,
             ets = timestamp_ms / 1000
@@ -481,6 +528,45 @@ mod tests {
         // Short-spread blown wider then reverted: position closes at a
         // worse level than entry mid, so gross is negative.
         assert!(summary.trades[0].gross_pnl_usd < Decimal::ZERO);
+    }
+
+    #[test]
+    fn bt_skips_zero_size_buckets_no_phantom_trades() {
+        // Lighter occasionally writes stale one-sided books with
+        // bid_size or ask_size = 0; the displayed mid in those rows is
+        // shifted by however much the missing side leaned. Without the
+        // filter, BT would treat that shift as a real spread breach
+        // and fire a trade. Construct a dump where every `lt` row is
+        // zero-size and the displayed mid is artificially +30 bps
+        // wide; the filter should produce zero trades despite the
+        // signal threshold being only 5 bps.
+        let dir = tempfile::tempdir().unwrap();
+        let mut ext_lines = Vec::new();
+        let mut lt_lines = Vec::new();
+        for i in 0..200i64 {
+            let ts_ms = 1_776_000_000_000 + i * 1_000;
+            // Extended steady at 78000 with positive sizes
+            ext_lines.push(dump_line_sized(ts_ms, "BTC", 78_000.0, 1.0, 1.0));
+            // Lighter "fake mid" 78230 (~+29.5 bps lower-than-Ext) but
+            // the book is one-sided (zero ask_size); the strategy must
+            // not accumulate spread samples here.
+            lt_lines.push(dump_line_sized(ts_ms, "BTC", 78_230.0, 1.0, 0.0));
+        }
+        let ext_path = write_dump(dir.path(), "ext.jsonl", &ext_lines);
+        let lt_path = write_dump(dir.path(), "lt.jsonl", &lt_lines);
+        let replay =
+            DualReplay::new(ext_path.to_str().unwrap(), lt_path.to_str().unwrap()).unwrap();
+
+        let mut cfg = BtConfig::default();
+        cfg.signal.min_warmup_samples = 30;
+        cfg.signal.persistence_sec = 5;
+        cfg.signal.abs_threshold_bps = 5.0;
+
+        let summary = run_bt(&replay, cfg).unwrap();
+        // No aligned-bucket samples (Lighter side filtered out) → no
+        // dev → no entries.
+        assert_eq!(summary.samples_committed, 0);
+        assert_eq!(summary.trades.len(), 0);
     }
 
     #[test]

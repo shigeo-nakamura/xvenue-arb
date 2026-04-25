@@ -141,6 +141,7 @@ fn build_base(args: &Args, symbol: &str) -> Result<BtConfig> {
     cfg.extended_taker_fee_bps = args.opt::<f64>("ext-fee-bps", 2.5)?;
     cfg.lighter_taker_fee_bps = args.opt::<f64>("lt-fee-bps", 0.0)?;
     cfg.signal.min_warmup_samples = args.opt::<usize>("warmup-samples", 60)?;
+    cfg.spread.bucket_ms = args.opt::<u64>("bucket-ms", 1_000)?;
     Ok(cfg)
 }
 
