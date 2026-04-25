@@ -6,22 +6,26 @@ Cross-venue statistical arbitrage between Lighter and Extended. 対応 issue: [b
 
 ## 0. 確定事項 (2026-04-23 レビューで合意)
 
-- **初期 symbol**: **BTC-USD のみ**。ETH は Phase 3 probe で安定したら追加検討
+- **初期 symbol**: ~~BTC-USD のみ。ETH は Phase 3 probe で安定したら追加検討~~ → **2026-04-25 改定**: **ETH を Phase 0 / 1 の primary 対象とし、BTC は secondary**。3-day overlap dump で ETH の persistence-filtered trade rate は BTC の 2.4× / 平均 capture は 2.3× (issue #166 comment 4318185827 + 4318159352)
 - **両脚発注方式**: **hybrid** — entry は serialized (Extended post-only → fill 後に Lighter)、exit は parallel (両 venue 同時に reduce-only)。Entry の single-leg-filled リスクが exit より金額大きいため
 - **Extended アカウント**: 新規サブアカウント (既存 `debot-pair-btceth-extended` との分離のため。position / funding の相殺を避ける)
 - **Capital sizing**: **account equity の %** で指定 (`trade_size_pct: 0.05` = equity の 5%)。固定 USD でなく equity 追従にすることで PnL 蓄積に比例して size 増、資本効率を保つ
 - **`src/pairtrade/` 撤去**: scaffold の initial commit (`b7cf98b`) で git 履歴に残るため、次コミットで即削除。以降は `src/xvenue/` に一本化
+- **2026-04-25 追加 — エッジの真の出所**: cross-venue mid 差ではなく **inside-spread asymmetry**。Lighter standard は BTC mean inside 8.7 bps / ETH mean 10.4 bps と Extended (両方 1 tick = 0.13 / 0.43 bps) より遥かに広い。passive MM が Extended で機能しない構造的理由 (#102 の 6 reasons) はそのまま arb-taker 戦略にとっての追い風になる
+- **2026-04-25 追加 — signal 方法論**: z-score でなく `|spread - rolling_mean| ≥ ABS_THRESHOLD_BPS` の絶対 bps 閾値 + persistence filter (15-30s)。bucket-scale ノイズを除外する。詳細は `phase0.md` v2 GO 基準
 
 ## 1. 戦略サマリ
 
-両 venue の同一 perp 銘柄 (まず BTC-USD、余力があれば ETH-USD を追加) の価格を spread = `(P_ext - P_lt) / P_lt * 10000` [bps] で観測し、rolling z-score が閾値超過した瞬間に両脚同時建て、mean revert で決済する delta-neutral 戦略。
+両 venue の同一 perp 銘柄 (Phase 0/1 は ETH-USD primary、BTC-USD secondary) の価格を spread = `(P_ext - P_lt) / P_lt * 10000` [bps] で観測し、`|spread - μ_roll| ≥ ABS_THRESHOLD_BPS` が `persistence_sec` 秒以上持続した瞬間に両脚建て、rolling mean revert で決済する delta-neutral 戦略。
 
 ```
-z = (spread - μ_roll) / σ_roll
-z >  entry_z  →  Extended SHORT + Lighter LONG
-z < -entry_z  →  Extended LONG  + Lighter SHORT
-|z| < exit_z  →  両脚クローズ
+dev = spread - μ_roll
+dev >  +abs_threshold で persist 確認  →  Extended SHORT + Lighter LONG
+dev <  -abs_threshold で persist 確認  →  Extended LONG  + Lighter SHORT
+dev ≈ 0 (mean を跨いだら)              →  両脚クローズ
 ```
+
+`μ_roll` は 30 分窓のローリング平均で、cross-venue の構造的 funding bias (BTC ~+1.9 bps / ETH ~+3.1 bps、Extended が常時上方) を吸収する。z-score 方式 (旧 v1) はゼロ復帰を仮定するためこの bias 側で過剰発火していた。詳細は `phase0.md` の v2 methodology。
 
 ネット方向エクスポージャ ≈ 0。理論的には spread の mean-reversion のみに賭ける。
 
@@ -120,8 +124,20 @@ parallel exit で片脚先 fill → 反対脚未 fill が起きた場合は emer
 - 片脚約定後、反対脚が fill 期限 (例: 3s) 内に約定せず
 - inventory skew > 許容値 (e.g. |Δnotional| > $50)
 - global kill signal (SIGUSR1 / dashboard トリガ)
+- **Binance 1m reference との偏差 > 30 bps (片 venue で 3 bucket 連続)** — stale-quote pattern。`scripts/phase0/fetch_reference.sh` のリファレンスを live 化して使う。2026-04-21 22:33-22:55 UTC に Lighter で 23 分間 stuck quote が発生し +2182 bps の phantom signal を生んだケースを防ぐ
 
 Extended 側 taker 手数料 (2.5 bp) はこの時だけは許容する。
+
+### 4.4 残コネクタ stuck の escalation (#102 P2 流用)
+
+slow-mm が 2026-04-24 に 167 分間 stuck した事象 (#102 P2) と同型のリスクが xvenue-arb には複数 venue 分存在する。slow-mm に入れた 3 段 escalation をそのまま流用:
+
+1. **REST 失敗カウンタ**: venue ごとに `get_positions` / `get_filled_orders` の連続失敗を数え、3 回連続で escalate
+2. **Reduce-only retry counter**: `close_all_positions` 連続失敗を数え、5 回連続で kill switch
+3. **Kill switch on file**: `/var/run/xvenue-arb/STUCK` を best-effort で書き出し、新規 entry を停止 (operator 介入が必要なシグナル)
+4. **30s 間隔 retry**: TakerFlattening 状態で `inventory != 0` のとき次 tick 連打しない (slow-mm の 167 分 stuck の真因の修正)
+
+Lighter の `connect_timeout(5s)+timeout(15s)` は元から、Extended は v4.2.81 (#102 P2) で同パターンを獲得済み。両 venue とも request-level に bound されている。
 
 ### 4.4 Position sizing
 
@@ -154,17 +170,22 @@ Extended / Lighter で funding が 1h cadence で独立発生。保有中に fun
 
 ## 6. 設定スキーマ (draft)
 
-`configs/xvenue-arb/debot-xvenue-arb-btc.yaml`:
+`configs/xvenue-arb/debot-xvenue-arb-eth.yaml` (primary、ETH first per 2026-04-25 改定):
 
 ```yaml
 strategy:
-  symbol_ext: BTC-USD          # Extended 側シンボル (Phase 0-3 は BTC のみ)
-  symbol_lt:  BTC-USD          # Lighter 側シンボル
-  entry_z: 1.5
-  exit_z:  0.3
-  force_close_z: 3.0           # 逆方向暴走カットオフ
+  symbol_ext: ETH-USD          # Extended 側シンボル
+  symbol_lt:  ETH-USD          # Lighter 側シンボル
+  abs_threshold_bps: 5.0       # |spread - μ_roll| 閾値 (v2 methodology)
+  persistence_sec: 15          # signal 確認窓
+  exit_at_mean_cross: true     # μ_roll を跨いだ瞬間に exit
+  max_hold_sec: 600            # max hold (funding cycle 突入を回避)
+  force_close_dev_bps: 30      # 逆方向暴走カットオフ
   rolling_window_sec: 1800
   spread_bucket_ms: 1000
+  # 旧 z-score 互換 (legacy diagnostics 用、live signal は使わない)
+  entry_z_legacy: 1.5
+  exit_z_legacy: 0.3
 
 sizing:
   trade_size_pct: 0.05         # 全 equity (Ext + Lt 合計) の 5%
@@ -187,7 +208,16 @@ risk:
   emergency_flatten_on_ws_stale_ms: 5000
   max_inventory_skew_usd: 50
   leg_mismatch_timeout_ms: 3000
-  kill_switch_file: /tmp/xvenue-arb.kill
+  kill_switch_file: /var/run/xvenue-arb/STUCK
+  # Reference cross-check (stale-quote guard、§4.3)
+  reference_max_dev_bps: 30
+  reference_consec_buckets_for_halt: 3
+  # Funding cycle filter
+  no_entry_window_before_funding_sec: 1800
+  no_entry_window_after_funding_sec: 600
+  # #102 P2 escalation
+  rest_consec_fail_to_escalate: 3
+  reduce_only_consec_fail_to_kill: 5
 
 venues:
   extended:

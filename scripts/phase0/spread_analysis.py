@@ -221,6 +221,125 @@ class ThresholdStats:
     annualized_trades: float
 
 
+@dataclass
+class PersistenceStats:
+    """Persistence-filtered trade simulation results.
+
+    Discovered 2026-04-25 (issue #166 comment): the original z-score-based
+    `threshold_trade_count` counts every threshold crossing, including
+    bucket-scale oscillations around the mean. With 5s buckets and a
+    spread that mean-reverts on a few-second timescale, this conflates
+    noise with edge and inflates trade counts ~100×.
+
+    The persistence-filtered model only opens a trade if the deviation
+    has held for at least `persistence_sec` seconds, simulating the time
+    needed in practice to (1) confirm the signal and (2) get both legs
+    filled. It then holds until the spread reverts past the running mean
+    or `max_hold_sec` is reached. Win rate, hold time, and PnL match what
+    a real bot can capture far more closely than the threshold-crossing
+    count.
+    """
+    trades: int
+    avg_gross_bps: float
+    median_hold_sec: float
+    p90_hold_sec: float
+    win_rate: float
+    annualized_trades: float
+    annualized_gross_bps: float
+
+
+def persistence_filtered_trade_stats(
+    spread_bps: np.ndarray,
+    mean_offset: np.ndarray,
+    abs_threshold_bps: float,
+    persistence_buckets: int,
+    max_hold_buckets: int,
+    bucket_sec: int,
+) -> PersistenceStats:
+    """Simulate trades that require sustained breach before entry.
+
+    Algorithm:
+      1. At each bucket i, compute dev = spread_bps[i] - mean_offset[i].
+      2. If |dev| >= abs_threshold_bps and the *next* persistence_buckets
+         all have dev on the same side and >= threshold, open a trade at
+         bucket (i + persistence_buckets) — i.e., enter only after the
+         signal has confirmed itself.
+      3. Hold until dev crosses zero (the running mean) or max_hold_buckets
+         elapse. Capture = sign * (entry_dev - exit_dev), positive iff
+         the spread reverted toward mean during the hold.
+
+    `mean_offset` is typically a slow EMA / rolling mean of the spread,
+    so trades center on the structural Lighter-Extended basis (which is
+    ~+2 bps for BTC and ~+3 bps for ETH per 2026-04-22..24 dump) rather
+    than zero. Without this, the strategy systematically over-fires on
+    the natural-state side of the basis.
+    """
+    n = len(spread_bps)
+    if n == 0:
+        return PersistenceStats(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+    grosses = []
+    holds_buckets = []
+    i = 0
+    while i < n:
+        dev = spread_bps[i] - mean_offset[i]
+        if abs(dev) < abs_threshold_bps or np.isnan(dev):
+            i += 1
+            continue
+        breach_side = 1 if dev > 0 else -1
+        # Confirm: next persistence_buckets all on same side, all over threshold
+        confirm_end = min(i + persistence_buckets, n)
+        if confirm_end - i < persistence_buckets:
+            break
+        confirmed = True
+        for j in range(i, confirm_end):
+            d = spread_bps[j] - mean_offset[j]
+            if np.isnan(d) or d * breach_side < abs_threshold_bps:
+                confirmed = False
+                break
+        if not confirmed:
+            i += 1
+            continue
+        # Open at the bar AFTER the confirmation window
+        entry_idx = min(i + persistence_buckets, n - 1)
+        entry_dev = spread_bps[entry_idx] - mean_offset[entry_idx]
+        # Hold until revert past mean or max_hold reached
+        exit_idx = entry_idx
+        exit_dev = entry_dev
+        for k in range(entry_idx + 1, min(entry_idx + max_hold_buckets, n)):
+            dk = spread_bps[k] - mean_offset[k]
+            if np.isnan(dk):
+                continue
+            if dk * breach_side <= 0:
+                exit_idx = k
+                exit_dev = dk
+                break
+            exit_idx = k
+            exit_dev = dk
+        gross = (entry_dev - exit_dev) * breach_side
+        grosses.append(gross)
+        holds_buckets.append(exit_idx - entry_idx)
+        i = exit_idx + 1
+
+    if not grosses:
+        return PersistenceStats(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+    grosses_arr = np.asarray(grosses)
+    holds_arr = np.asarray(holds_buckets)
+    sample_secs = n * bucket_sec
+    annualized = len(grosses) / max(1, sample_secs) * (365 * 86400)
+    avg = float(grosses_arr.mean())
+    return PersistenceStats(
+        trades=len(grosses),
+        avg_gross_bps=avg,
+        median_hold_sec=float(np.median(holds_arr) * bucket_sec),
+        p90_hold_sec=float(np.quantile(holds_arr, 0.9) * bucket_sec),
+        win_rate=float((grosses_arr > 0).mean()),
+        annualized_trades=annualized,
+        annualized_gross_bps=avg * annualized,
+    )
+
+
 def threshold_trade_count(
     z: np.ndarray,
     spread_bps: np.ndarray,
@@ -294,14 +413,32 @@ def main() -> int:
                          "deviates more than this many bps from the reference. "
                          "Typical values: 30-50 bps. If unset, reference is used for "
                          "diagnostics only and no rows are filtered.")
+    ap.add_argument("--symbol", default="BTC", choices=("BTC", "ETH"),
+                    help="Which symbol to analyse. Defaults to BTC; the 2026-04-25 "
+                         "Phase 0 refinement (issue #166 comment) found ETH has "
+                         "materially better arb economics on this venue pair.")
+    ap.add_argument("--abs-threshold-bps", type=float, default=5.0,
+                    help="Absolute |spread - rolling_mean| threshold (bps) for the "
+                         "persistence-filtered trade simulator. Replaces the z-score "
+                         "in the v2 GO criterion. Default 5 bps clears the 2.5 bps "
+                         "round-trip cost floor with margin.")
+    ap.add_argument("--persistence-sec", type=int, default=15,
+                    help="Seconds the deviation must hold before a trade opens "
+                         "in the persistence-filtered simulator. 15s is roughly "
+                         "the time needed to confirm signal + place both legs.")
+    ap.add_argument("--max-hold-sec", type=int, default=600,
+                    help="Maximum seconds to hold an open arb trade before "
+                         "force-closing in the persistence-filtered simulator. "
+                         "10 min covers >99% of natural reverts in the 2026-04-22..24 "
+                         "preview window.")
     ap.add_argument("--out-csv", default=None,
                     help="Optional: write aligned (ts, spread_bps, z) CSV for plotting.")
     args = ap.parse_args()
 
-    print(f"[load] Lighter  from {args.lighter_dir}", file=sys.stderr)
-    lt = load_venue(args.lighter_dir)
-    print(f"[load] Extended from {args.extended_dir}", file=sys.stderr)
-    ext = load_venue(args.extended_dir)
+    print(f"[load] Lighter  from {args.lighter_dir} (symbol={args.symbol})", file=sys.stderr)
+    lt = load_venue(args.lighter_dir, args.symbol)
+    print(f"[load] Extended from {args.extended_dir} (symbol={args.symbol})", file=sys.stderr)
+    ext = load_venue(args.extended_dir, args.symbol)
 
     print(f"[align] bucket_sec={args.bucket_sec}", file=sys.stderr)
     aligned = align_buckets(lt, ext, args.bucket_sec)
@@ -474,7 +611,9 @@ def main() -> int:
     print(f"OU half-life (approx): {hl:.1f} s")
     print()
 
-    print(f"threshold stats (entry_z={args.entry_z}, exit_z={args.exit_z}):")
+    print(f"threshold stats v1 (z-score, entry_z={args.entry_z}, exit_z={args.exit_z}):")
+    print("  (legacy methodology — counts every threshold crossing, including bucket noise.")
+    print("   Kept for back-compat. The v2 metric below is the primary GO/NO-GO driver as of 2026-04-25.)")
     ts_stats = threshold_trade_count(zs, s, args.entry_z, args.exit_z, args.bucket_sec)
     print(f"  entries in sample  : {ts_stats.entries}")
     print(f"  annualized trades  : {ts_stats.annualized_trades:.1f} / year")
@@ -486,41 +625,83 @@ def main() -> int:
     print(f"  net bps / year     : {net_annual_bps:+.1f}")
     print()
 
-    # GO criteria (all must hold):
-    #  - gross bps/trade beats the round-trip floor
-    #  - annualized trades in a sane band; > 100 ensures sample, < 10k
-    #    ensures we are not just re-entering on noise
-    #  - OU half-life longer than the bucket cadence (otherwise we are
-    #    chasing white noise faster than we can observe it) and shorter
-    #    than one hour (so holds and funding bars do not erase the edge)
+    # v2 methodology (2026-04-25, issue #166 comment): persistence-filtered
+    # absolute-threshold trade simulator. Centers on rolling mean μ rather
+    # than zero, so the structural Lighter-Extended basis (~+2 bps for BTC,
+    # +3 bps for ETH) doesn't bias the signal.
+    persist_buckets = max(1, args.persistence_sec // args.bucket_sec)
+    max_hold_buckets = max(1, args.max_hold_sec // args.bucket_sec)
+    mu_arr = mu.reindex(valid.index).to_numpy()
+    p_stats = persistence_filtered_trade_stats(
+        spread_bps=s,
+        mean_offset=mu_arr,
+        abs_threshold_bps=args.abs_threshold_bps,
+        persistence_buckets=persist_buckets,
+        max_hold_buckets=max_hold_buckets,
+        bucket_sec=args.bucket_sec,
+    )
+    print(f"persistence-filtered stats v2 "
+          f"(threshold={args.abs_threshold_bps} bps, "
+          f"persist={args.persistence_sec}s, max_hold={args.max_hold_sec}s):")
+    print(f"  trades in sample   : {p_stats.trades}")
+    print(f"  annualized trades  : {p_stats.annualized_trades:.0f} / year")
+    print(f"  win rate           : {p_stats.win_rate*100:.1f}%")
+    print(f"  median hold        : {p_stats.median_hold_sec:.0f} s")
+    print(f"  p90 hold           : {p_stats.p90_hold_sec:.0f} s")
+    print(f"  gross bps / trade  : {p_stats.avg_gross_bps:+.2f}")
+    p_net_per_trade = p_stats.avg_gross_bps - args.roundtrip_bps
+    print(f"  net bps / trade    : {p_net_per_trade:+.2f}  (round-trip floor {args.roundtrip_bps} bps)")
+    p_net_annual_bps = p_net_per_trade * p_stats.annualized_trades
+    print(f"  net bps / year     : {p_net_annual_bps:+.0f}")
+    print()
+
+    # v2 GO criteria (PRIMARY as of 2026-04-25):
+    #  - persistence-filtered trade count in a sane band (500..50k/year)
+    #  - win rate > 90% (real arb opportunities are nearly always profitable
+    #    when the persistence filter cuts noise; below 90% suggests we are
+    #    still picking up trend-thru events rather than mean-reversion)
+    #  - net bps/trade > 5 (clears 2.5 bps cost floor with 2× margin)
+    #  - p90 hold < 10 min (longer holds are funding-sensitive and the
+    #    backtester's "hold to mean revert" assumption breaks down)
+    go_v2_freq = 500 <= p_stats.annualized_trades <= 50_000
+    go_v2_win = p_stats.win_rate >= 0.90
+    go_v2_net = p_net_per_trade >= 5.0
+    go_v2_hold = p_stats.p90_hold_sec <= 600
+    go_v2 = go_v2_freq and go_v2_win and go_v2_net and go_v2_hold
+
+    # v1 (legacy) GO retained as secondary signal for back-compat
     go_bps = ts_stats.expected_gross_bps > args.roundtrip_bps
     go_freq = 100 <= ts_stats.annualized_trades <= 10_000
     min_hl_sec = max(30, 2 * args.bucket_sec)
     go_hl = np.isfinite(hl) and min_hl_sec <= hl <= 3600
-    go = go_bps and go_freq and go_hl
+    go_v1 = go_bps and go_freq and go_hl
+
+    go = go_v2  # v2 is the primary verdict as of 2026-04-25
 
     print("=" * 68)
     verdict = "GO" if go else "NO-GO"
-    print(f"Phase 0 verdict     : {verdict}")
+    print(f"Phase 0 verdict (v2): {verdict}   (v1 legacy: {'GO' if go_v1 else 'NO-GO'})")
     print("=" * 68)
     if not go:
-        print("Reasons to reconsider:")
-        if not go_bps:
-            print(f"  - gross/trade ({ts_stats.expected_gross_bps:+.2f} bps) "
-                  f"<= round-trip floor ({args.roundtrip_bps} bps)")
-        if not go_freq:
-            if ts_stats.annualized_trades < 100:
-                print(f"  - annualized trades ({ts_stats.annualized_trades:.0f}) < 100 — too few to pay fixed costs")
+        print("v2 reasons to reconsider:")
+        if not go_v2_freq:
+            if p_stats.annualized_trades < 500:
+                print(f"  - annualized trades ({p_stats.annualized_trades:.0f}) < 500 — "
+                      "too few real signals to pay fixed costs")
             else:
-                print(f"  - annualized trades ({ts_stats.annualized_trades:.0f}) > 10000 — "
-                      "we are churning, likely trading noise")
-        if not go_hl:
-            if not np.isfinite(hl):
-                print(f"  - OU half-life non-reverting — no mean reversion detected")
-            elif hl < min_hl_sec:
-                print(f"  - OU half-life ({hl:.1f} s) < {min_hl_sec:.0f} s — edge decays inside the bucket cadence")
-            else:
-                print(f"  - OU half-life ({hl:.1f} s) > 3600 s — edge decays too slowly for funding-sensitive holds")
+                print(f"  - annualized trades ({p_stats.annualized_trades:.0f}) > 50000 — "
+                      "still trading noise even after persistence filter; "
+                      "raise --abs-threshold-bps or --persistence-sec")
+        if not go_v2_win:
+            print(f"  - win rate {p_stats.win_rate*100:.1f}% < 90% — "
+                  f"persistence-filtered signals aren't mean-reverting reliably; "
+                  f"may be trending-through events (raise threshold or persist)")
+        if not go_v2_net:
+            print(f"  - net/trade ({p_net_per_trade:+.2f} bps) < 5 bps — "
+                  f"insufficient margin over round-trip cost floor")
+        if not go_v2_hold:
+            print(f"  - p90 hold ({p_stats.p90_hold_sec:.0f} s) > 600 s — "
+                  f"holds run into funding cycles, simple revert model breaks down")
     if dur_days < 7:
         print()
         print(f"NOTE: only {dur_days:.2f} days of overlap. A 7-day sample is required for")
