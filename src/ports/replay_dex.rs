@@ -132,7 +132,7 @@ impl From<BincodeDataEntry> for DumpedDataEntry {
 
 #[derive(Debug)]
 pub struct ReplayConnector {
-    data: Vec<DumpedDataEntry>,
+    data: std::sync::Arc<Vec<DumpedDataEntry>>,
     cursor: AtomicUsize,
 }
 
@@ -151,9 +151,21 @@ impl ReplayConnector {
         }
 
         Ok(Self {
-            data,
+            data: std::sync::Arc::new(data),
             cursor: AtomicUsize::new(0),
         })
+    }
+
+    /// Build a fresh connector that shares the parsed dump (Arc) with
+    /// `self` but starts at cursor 0 with independent atomic state. Used
+    /// by the BT grid runner so we parse the dump once and replay it
+    /// many times in parallel without re-loading. See
+    /// bot-strategy#166 Phase 1.
+    pub fn clone_with_fresh_cursor(&self) -> Self {
+        Self {
+            data: std::sync::Arc::clone(&self.data),
+            cursor: AtomicUsize::new(0),
+        }
     }
 
     fn load_jsonl(path: &str) -> Result<Vec<DumpedDataEntry>, DexError> {
@@ -274,7 +286,7 @@ impl ReplayConnector {
     #[cfg(test)]
     fn from_entries(data: Vec<DumpedDataEntry>) -> Self {
         Self {
-            data,
+            data: std::sync::Arc::new(data),
             cursor: AtomicUsize::new(0),
         }
     }
@@ -394,6 +406,17 @@ impl DualReplay {
 
     pub fn at_end(&self) -> bool {
         self.extended.at_end() && self.lighter.at_end()
+    }
+
+    /// Build a fresh `DualReplay` whose connectors share the parsed
+    /// dumps (Arc) with `self` but reset their cursors to 0. The grid
+    /// runner uses this to spawn many independent replays from a
+    /// single load. Bot-strategy#166 Phase 1.
+    pub fn clone_with_fresh_cursors(&self) -> Self {
+        Self {
+            extended: std::sync::Arc::new(self.extended.clone_with_fresh_cursor()),
+            lighter: std::sync::Arc::new(self.lighter.clone_with_fresh_cursor()),
+        }
     }
 
     #[cfg(test)]

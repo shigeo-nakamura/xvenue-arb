@@ -5,6 +5,7 @@
 //! that will be filled in after Phase 0 data feasibility GO.
 
 pub mod bt;
+pub mod bt_grid;
 pub mod signal;
 pub mod sizing;
 pub mod spread;
