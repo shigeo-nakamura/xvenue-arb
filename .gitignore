@@ -12,7 +12,10 @@ scripts/venv/
 *.log
 *.md
 !online_adaptation_plan.md
-!docs/*.md
+# docs/ holds private strategy notes — keep locally, don't publish.
+# This repo is public, so the design doc (DESIGN.md) and Phase 0
+# methodology (phase0.md) live on the operator's machine only.
+docs/
 *.patch
 pairtrade_history.json
 *.swp
