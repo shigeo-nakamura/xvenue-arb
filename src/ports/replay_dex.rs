@@ -255,11 +255,152 @@ impl ReplayConnector {
         self.data.get(current_cursor).map(|e| e.timestamp / 1000) // stored as ms
     }
 
+    pub fn current_timestamp_ms(&self) -> Option<i64> {
+        let current_cursor = self.cursor.load(AtomicOrdering::SeqCst);
+        self.data.get(current_cursor).map(|e| e.timestamp)
+    }
+
+    /// Timestamp_ms of the cursor+1 record, or `None` when at the last
+    /// record. Used by [`DualReplay`] for event-time merge ordering.
+    pub fn peek_next_timestamp_ms(&self) -> Option<i64> {
+        let next = self.cursor.load(AtomicOrdering::SeqCst).checked_add(1)?;
+        self.data.get(next).map(|e| e.timestamp)
+    }
+
+    pub fn at_end(&self) -> bool {
+        self.cursor.load(AtomicOrdering::SeqCst) >= self.data.len().saturating_sub(1)
+    }
+
     #[cfg(test)]
     fn from_entries(data: Vec<DumpedDataEntry>) -> Self {
         Self {
             data,
             cursor: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// Identifies which venue advanced on a given [`DualReplay::advance`] step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Venue {
+    Extended,
+    Lighter,
+}
+
+/// Coordinates two [`ReplayConnector`] instances (one per venue) over a
+/// shared event-time clock. Each `advance()` call ticks whichever venue's
+/// next record carries the older timestamp, producing a deterministic merge
+/// of two independently-recorded JSONL dumps with possibly different
+/// cadences. Both connectors are exposed as `Arc<ReplayConnector>` so the
+/// strategy can call them through the existing `DexConnector` trait.
+///
+/// Bot-strategy#166 Phase 1 BT prep.
+pub struct DualReplay {
+    extended: std::sync::Arc<ReplayConnector>,
+    lighter: std::sync::Arc<ReplayConnector>,
+}
+
+impl DualReplay {
+    /// Load both venue dumps. `extended_path` and `lighter_path` accept the
+    /// same `.jsonl` / `.bin` extensions as [`ReplayConnector::new`].
+    pub fn new(extended_path: &str, lighter_path: &str) -> Result<Self, DexError> {
+        Ok(Self {
+            extended: std::sync::Arc::new(ReplayConnector::new(extended_path)?),
+            lighter: std::sync::Arc::new(ReplayConnector::new(lighter_path)?),
+        })
+    }
+
+    pub fn extended(&self) -> std::sync::Arc<ReplayConnector> {
+        std::sync::Arc::clone(&self.extended)
+    }
+
+    pub fn lighter(&self) -> std::sync::Arc<ReplayConnector> {
+        std::sync::Arc::clone(&self.lighter)
+    }
+
+    /// Advance the venue whose next record has the older timestamp. When
+    /// only one venue still has data, that venue advances. Returns the
+    /// venue that advanced, or `None` when both are exhausted.
+    ///
+    /// Tie-break: when both `peek_next_timestamp_ms` are equal, Extended
+    /// advances first. The strategy must read both venues every call (the
+    /// other side did not move, but still has a fresh-from-its-perspective
+    /// snapshot at its current cursor) — order of reads within a tick is
+    /// the strategy's responsibility.
+    pub fn advance(&self) -> Option<Venue> {
+        let ext_next = self.extended.peek_next_timestamp_ms();
+        let lt_next = self.lighter.peek_next_timestamp_ms();
+        match (ext_next, lt_next) {
+            (Some(e), Some(l)) => {
+                if e <= l {
+                    self.extended.tick();
+                    Some(Venue::Extended)
+                } else {
+                    self.lighter.tick();
+                    Some(Venue::Lighter)
+                }
+            }
+            (Some(_), None) => {
+                self.extended.tick();
+                Some(Venue::Extended)
+            }
+            (None, Some(_)) => {
+                self.lighter.tick();
+                Some(Venue::Lighter)
+            }
+            (None, None) => None,
+        }
+    }
+
+    /// `min(ext_current_ts, lt_current_ts)` in ms. Treat as the BT clock —
+    /// both venues have committed at least one snapshot at or before this
+    /// instant, so any [`crate::xvenue::spread::SpreadEngine`] sample
+    /// corresponding to this bucket is back-fillable. `None` until at
+    /// least one venue has loaded its first record (always loaded after
+    /// `new()`, so in practice always `Some`).
+    pub fn aligned_timestamp_ms(&self) -> Option<i64> {
+        let e = self.extended.current_timestamp_ms();
+        let l = self.lighter.current_timestamp_ms();
+        match (e, l) {
+            (Some(e), Some(l)) => Some(e.min(l)),
+            (Some(e), None) => Some(e),
+            (None, Some(l)) => Some(l),
+            (None, None) => None,
+        }
+    }
+
+    /// Advance until both venues have committed a record on or after
+    /// `target_ts_ms`, then stop. Useful for warm-up (`SpreadEngine`'s
+    /// rolling window needs `min_warmup_samples` paired observations).
+    /// Returns `false` if both venues exhausted before reaching the
+    /// target.
+    pub fn advance_until_ms(&self, target_ts_ms: i64) -> bool {
+        loop {
+            let e = self.extended.current_timestamp_ms().unwrap_or(i64::MIN);
+            let l = self.lighter.current_timestamp_ms().unwrap_or(i64::MIN);
+            if e >= target_ts_ms && l >= target_ts_ms {
+                return true;
+            }
+            if self.advance().is_none() {
+                return false;
+            }
+        }
+    }
+
+    pub fn reset(&self) {
+        self.extended.reset();
+        self.lighter.reset();
+    }
+
+    pub fn at_end(&self) -> bool {
+        self.extended.at_end() && self.lighter.at_end()
+    }
+
+    #[cfg(test)]
+    fn from_connectors(extended: ReplayConnector, lighter: ReplayConnector) -> Self {
+        Self {
+            extended: std::sync::Arc::new(extended),
+            lighter: std::sync::Arc::new(lighter),
         }
     }
 }
@@ -595,5 +736,129 @@ mod tests {
             Some(1_776_232_919),
             "must use per-symbol exchange_ts, not top-level timestamp/1000",
         );
+    }
+
+    // ---- DualReplay tests (bot-strategy#166 Phase 1) ------------------
+
+    fn mk_replay(timestamps_ms: &[i64]) -> ReplayConnector {
+        let entries = timestamps_ms
+            .iter()
+            .map(|ts| mk_entry(*ts, 70_000.0, Some(ts / 1000)))
+            .collect();
+        ReplayConnector::from_entries(entries)
+    }
+
+    #[test]
+    fn dual_replay_advances_older_venue_first() {
+        // Extended ticks every 1s, Lighter every 5s — common case where one
+        // venue has a faster cadence. Merge order should walk Extended four
+        // times for every Lighter step.
+        let ext = mk_replay(&[1_000, 2_000, 3_000, 4_000, 5_000]);
+        let lt = mk_replay(&[1_000, 5_000]);
+        let dual = DualReplay::from_connectors(ext, lt);
+
+        // Initial state: both at index 0 (ts=1000). aligned_ts = min = 1000.
+        assert_eq!(dual.aligned_timestamp_ms(), Some(1_000));
+
+        // Tie-break favors Extended on equal next timestamps. The first
+        // peek_next: ext_next=2000, lt_next=5000 -> Extended wins.
+        assert_eq!(dual.advance(), Some(Venue::Extended));
+        assert_eq!(dual.extended().current_timestamp_ms(), Some(2_000));
+        assert_eq!(dual.lighter().current_timestamp_ms(), Some(1_000));
+
+        // ext_next=3000, lt_next=5000 -> Extended.
+        assert_eq!(dual.advance(), Some(Venue::Extended));
+        // ext_next=4000, lt_next=5000 -> Extended.
+        assert_eq!(dual.advance(), Some(Venue::Extended));
+        // ext_next=5000, lt_next=5000 -> tie, Extended wins.
+        assert_eq!(dual.advance(), Some(Venue::Extended));
+        assert_eq!(dual.extended().current_timestamp_ms(), Some(5_000));
+
+        // Now Extended is at end (cursor at last). lt is still at index 0.
+        // ext peek_next = None, lt peek_next = 5000 -> Lighter advances.
+        assert_eq!(dual.advance(), Some(Venue::Lighter));
+        assert_eq!(dual.lighter().current_timestamp_ms(), Some(5_000));
+
+        // Both exhausted.
+        assert_eq!(dual.advance(), None);
+        assert!(dual.at_end());
+    }
+
+    #[test]
+    fn dual_replay_advance_until_ms() {
+        let ext = mk_replay(&[1_000, 2_000, 3_000, 4_000]);
+        let lt = mk_replay(&[1_500, 2_500, 3_500]);
+        let dual = DualReplay::from_connectors(ext, lt);
+
+        // Advance until both venues have committed >= 3000ms.
+        assert!(dual.advance_until_ms(3_000));
+        assert!(dual.extended().current_timestamp_ms().unwrap() >= 3_000);
+        assert!(dual.lighter().current_timestamp_ms().unwrap() >= 3_000);
+    }
+
+    #[test]
+    fn dual_replay_advance_until_ms_returns_false_on_exhaustion() {
+        let ext = mk_replay(&[1_000, 2_000]);
+        let lt = mk_replay(&[1_000, 2_000]);
+        let dual = DualReplay::from_connectors(ext, lt);
+
+        // Target is past the last record on both sides.
+        assert!(!dual.advance_until_ms(10_000));
+        assert!(dual.at_end());
+    }
+
+    #[test]
+    fn dual_replay_aligned_timestamp_is_min() {
+        // aligned_timestamp = min(ext_current, lt_current). The strategy can
+        // only safely emit a SpreadEngine sample at or before this instant
+        // because the slower-cadence venue hasn't reported newer data yet.
+        let ext = mk_replay(&[1_000, 2_000, 3_000]);
+        let lt = mk_replay(&[1_000, 5_000]);
+        let dual = DualReplay::from_connectors(ext, lt);
+
+        assert_eq!(dual.aligned_timestamp_ms(), Some(1_000));
+        // Walk Extended forward; aligned should follow Lighter (the slower
+        // venue) until Lighter ticks.
+        dual.advance(); // ext->2000
+        assert_eq!(dual.aligned_timestamp_ms(), Some(1_000));
+        dual.advance(); // ext->3000 (last)
+        assert_eq!(dual.aligned_timestamp_ms(), Some(1_000));
+        dual.advance(); // lt->5000
+        assert_eq!(dual.aligned_timestamp_ms(), Some(3_000)); // ext capped at 3000
+    }
+
+    #[test]
+    fn dual_replay_independent_cursors_share_no_state() {
+        let ext = mk_replay(&[1_000, 2_000, 3_000]);
+        let lt = mk_replay(&[1_000, 2_000, 3_000]);
+        let dual = DualReplay::from_connectors(ext, lt);
+
+        // After advance(), Extended advances, Lighter does not.
+        assert_eq!(dual.advance(), Some(Venue::Extended));
+        assert_eq!(dual.extended().current_timestamp_ms(), Some(2_000));
+        assert_eq!(dual.lighter().current_timestamp_ms(), Some(1_000));
+    }
+
+    #[test]
+    fn dual_replay_reset_resets_both() {
+        let ext = mk_replay(&[1_000, 2_000, 3_000]);
+        let lt = mk_replay(&[1_000, 2_000]);
+        let dual = DualReplay::from_connectors(ext, lt);
+        dual.advance();
+        dual.advance();
+        dual.advance();
+        assert!(dual.extended().current_timestamp_ms().unwrap() > 1_000);
+        dual.reset();
+        assert_eq!(dual.extended().current_timestamp_ms(), Some(1_000));
+        assert_eq!(dual.lighter().current_timestamp_ms(), Some(1_000));
+    }
+
+    #[test]
+    fn replay_peek_next_returns_none_at_last_record() {
+        let r = mk_replay(&[1_000, 2_000]);
+        assert_eq!(r.peek_next_timestamp_ms(), Some(2_000));
+        r.tick();
+        assert_eq!(r.peek_next_timestamp_ms(), None);
+        assert!(r.at_end());
     }
 }
