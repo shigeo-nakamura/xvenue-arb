@@ -57,6 +57,15 @@ pub struct BtConfig {
     /// post-only ~-10 (rebate). Default 5.0 mirrors taker-only baseline
     /// so live numbers don't surprise downward; tune per Lighter regime.
     pub lighter_round_trip_slippage_bps: f64,
+    /// Path to a Binance 1m kline JSONL (one row per minute with
+    /// `ts_ms` / `high` / `low`) used as a stale-quote reference. When
+    /// set together with `binance_ref_max_dev_bps > 0`, any venue mid
+    /// that drifts farther than the threshold from the corresponding
+    /// minute's `(high + low) / 2` is suppressed for that tick (its
+    /// `book_ok` becomes false → no spread commit). Mirrors the Phase 0
+    /// v2 `--drop-ref-deviation-bps` pre-filter. None = disabled.
+    pub binance_ref_path: Option<String>,
+    pub binance_ref_max_dev_bps: f64,
     /// When true, BtSummary.buckets is populated with one record per
     /// aligned-bucket commit. Off by default — only the bt CLI's
     /// `--out-buckets-csv` flag turns it on. bot-strategy#166 parity.
@@ -75,6 +84,8 @@ impl Default for BtConfig {
             lighter_taker_fee_bps: 0.0,
             extended_round_trip_slippage_bps: 0.0,
             lighter_round_trip_slippage_bps: 0.0,
+            binance_ref_path: None,
+            binance_ref_max_dev_bps: 0.0,
             record_buckets: false,
         }
     }
@@ -190,6 +201,11 @@ async fn run_bt_async(replay: &DualReplay, cfg: BtConfig) -> Result<BtSummary> {
     let mut open: Option<OpenLeg> = None;
     let mut ticks: u64 = 0;
 
+    let ref_map = match (&cfg.binance_ref_path, cfg.binance_ref_max_dev_bps) {
+        (Some(path), thr) if thr > 0.0 => Some(load_binance_ref(path)?),
+        _ => None,
+    };
+
     let ext = replay.extended();
     let lt = replay.lighter();
 
@@ -214,8 +230,32 @@ async fn run_bt_async(replay: &DualReplay, cfg: BtConfig) -> Result<BtSummary> {
         // Both connectors carry valid current-cursor snapshots; read
         // each. Symbols may differ per venue (Extended vs Lighter
         // dumps record under whatever each DEX uses).
-        let (ext_mid, ext_book_ok) = read_snapshot(&ext, &cfg.symbol_extended).await?;
-        let (lt_mid, lt_book_ok) = read_snapshot(&lt, &cfg.symbol_lighter).await?;
+        let (ext_mid, mut ext_book_ok) = read_snapshot(&ext, &cfg.symbol_extended).await?;
+        let (lt_mid, mut lt_book_ok) = read_snapshot(&lt, &cfg.symbol_lighter).await?;
+
+        // Binance 1m reference cross-check: when the loaded reference
+        // covers the current minute, suppress any side whose mid drifts
+        // farther than `binance_ref_max_dev_bps` from the reference mid.
+        // Catches the 2026-04-21 22:33-22:55 UTC kind of stuck-quote
+        // event (Lighter froze for 23 min while spot moved). The 100
+        // bps spread filter already drops the most extreme cases; this
+        // catches the smaller-but-still-stale ones a per-spread cap
+        // misses. See bot-strategy#166 design and
+        // `phase0/spread_analysis.py --drop-ref-deviation-bps`.
+        if let Some(ref_map) = ref_map.as_ref() {
+            let minute_ts = (ext_ts.min(lt_ts) / 60_000) * 60_000;
+            if let Some(ref_mid) = ref_map.get(&minute_ts) {
+                let cap = cfg.binance_ref_max_dev_bps;
+                let ext_dev = mid_dev_bps(ext_mid, *ref_mid);
+                let lt_dev = mid_dev_bps(lt_mid, *ref_mid);
+                if ext_dev.abs() > cap {
+                    ext_book_ok = false;
+                }
+                if lt_dev.abs() > cap {
+                    lt_book_ok = false;
+                }
+            }
+        }
 
         // Skip the SpreadEngine update on stale one-sided books — a
         // venue that writes zero bid_size or ask_size has no tradeable
@@ -457,6 +497,52 @@ fn settle_trade(
         net_pnl_usd: net,
         net_bps,
     }
+}
+
+/// `(venue_mid - ref_mid) / ref_mid * 10_000` in bps. Returns 0.0 if
+/// `ref_mid` is non-positive (defensive — shouldn't happen with sane
+/// kline data, but avoids a division-by-zero panic).
+fn mid_dev_bps(venue_mid: Decimal, ref_mid: f64) -> f64 {
+    if ref_mid <= 0.0 {
+        return 0.0;
+    }
+    let m = venue_mid.to_f64().unwrap_or(0.0);
+    (m - ref_mid) / ref_mid * 10_000.0
+}
+
+/// Load Binance 1m kline JSONL into a `minute_ts_ms → (high+low)/2` map.
+/// Same shape as `phase0/fetch_reference.sh` writes. Lines that fail to
+/// parse are skipped silently — the BT will only suppress samples for
+/// minutes that did parse, which matches the Phase 0 sim's behavior.
+fn load_binance_ref(path: &str) -> Result<std::collections::HashMap<u64, f64>> {
+    use std::io::BufRead;
+    let f = std::fs::File::open(path)
+        .map_err(|e| anyhow!("open binance ref {}: {}", path, e))?;
+    let r = std::io::BufReader::new(f);
+    let mut out = std::collections::HashMap::new();
+    for line in r.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let v: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let ts_ms = match v.get("ts_ms").and_then(|x| x.as_u64()) {
+            Some(t) => t,
+            None => continue,
+        };
+        let high = v.get("high").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok());
+        let low = v.get("low").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok());
+        match (high, low) {
+            (Some(h), Some(l)) if h > 0.0 && l > 0.0 && h >= l => {
+                out.insert(ts_ms, 0.5 * (h + l));
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 fn decimal_from_f64(v: f64) -> Option<Decimal> {
@@ -719,6 +805,57 @@ mod tests {
         let _ = summary.total_net_pnl_usd();
         let _ = summary.win_rate();
         let _ = summary.mean_net_bps();
+    }
+
+    #[test]
+    fn binance_ref_filter_suppresses_stale_venue_quotes() {
+        // Construct a 200-tick scenario where Lighter's mid drifts to
+        // a stale value that's 50 bps off the Binance reference, while
+        // Extended stays in sync. With a 30 bps cap, the filter should
+        // suppress every Lighter update → no aligned-bucket commits at
+        // all → zero trades, despite the spread crossing threshold.
+        // bot-strategy#166 stale-quote guard.
+        let dir = tempfile::tempdir().unwrap();
+        let mut ext_lines = Vec::new();
+        let mut lt_lines = Vec::new();
+        let mut ref_lines = Vec::new();
+        let true_mid = 78_000.0_f64;
+        for i in 0..200i64 {
+            let ts_ms = 1_776_000_000_000 + i * 1_000;
+            ext_lines.push(dump_line(ts_ms, "BTC", true_mid));
+            // Lighter writes a stale mid +50 bps off the truth — the
+            // BT's spread will read +50 bps but the ref check should
+            // suppress it.
+            lt_lines.push(dump_line(ts_ms, "BTC", true_mid * 1.005));
+        }
+        // One Binance kline per minute covering all the ticks above.
+        // (high, low) chosen so (h+l)/2 = true_mid exactly.
+        for minute in (0..4i64) {
+            let m_ts = 1_776_000_000_000 + minute * 60_000;
+            ref_lines.push(format!(
+                r#"{{"ts_ms":{},"high":"{}","low":"{}"}}"#,
+                m_ts,
+                true_mid + 1.0,
+                true_mid - 1.0,
+            ));
+        }
+        let ext_path = write_dump(dir.path(), "ext.jsonl", &ext_lines);
+        let lt_path = write_dump(dir.path(), "lt.jsonl", &lt_lines);
+        let ref_path = dir.path().join("ref.jsonl");
+        std::fs::write(&ref_path, ref_lines.join("\n")).unwrap();
+
+        let replay = DualReplay::new(ext_path.to_str().unwrap(), lt_path.to_str().unwrap())
+            .unwrap();
+        let mut cfg = BtConfig::default();
+        cfg.signal.min_warmup_samples = 30;
+        cfg.signal.persistence_sec = 5;
+        cfg.signal.abs_threshold_bps = 5.0;
+        cfg.binance_ref_path = Some(ref_path.to_str().unwrap().to_string());
+        cfg.binance_ref_max_dev_bps = 30.0;
+        let summary = run_bt(&replay, cfg).unwrap();
+        // Every Lighter update gets suppressed → no paired commits.
+        assert_eq!(summary.samples_committed, 0);
+        assert!(summary.trades.is_empty());
     }
 
     #[test]

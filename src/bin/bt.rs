@@ -158,6 +158,11 @@ fn build_base(args: &Args, symbol: &str) -> Result<BtConfig> {
         args.opt::<u64>("funding-lockout-pre-sec", 1_800)?;
     cfg.signal.funding_lockout_post_sec =
         args.opt::<u64>("funding-lockout-post-sec", 1_800)?;
+    if let Some(p) = args.map.get("binance-ref-jsonl") {
+        cfg.binance_ref_path = Some(p.clone());
+    }
+    cfg.binance_ref_max_dev_bps =
+        args.opt::<f64>("binance-ref-max-dev-bps", 0.0)?;
     Ok(cfg)
 }
 
