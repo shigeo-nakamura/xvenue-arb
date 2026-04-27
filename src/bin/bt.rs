@@ -140,6 +140,10 @@ fn build_base(args: &Args, symbol: &str) -> Result<BtConfig> {
         .opt::<Decimal>("notional", Decimal::from(100))?;
     cfg.extended_taker_fee_bps = args.opt::<f64>("ext-fee-bps", 2.5)?;
     cfg.lighter_taker_fee_bps = args.opt::<f64>("lt-fee-bps", 0.0)?;
+    cfg.extended_round_trip_slippage_bps =
+        args.opt::<f64>("ext-slippage-bps", 0.0)?;
+    cfg.lighter_round_trip_slippage_bps =
+        args.opt::<f64>("lt-slippage-bps", 0.0)?;
     cfg.signal.min_warmup_samples = args.opt::<usize>("warmup-samples", 60)?;
     cfg.spread.bucket_ms = args.opt::<u64>("bucket-ms", 1_000)?;
     // Phase 0 v2 parity diagnostic. When set, Enter fires at the bar

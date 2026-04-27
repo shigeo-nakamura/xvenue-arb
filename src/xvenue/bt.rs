@@ -45,6 +45,18 @@ pub struct BtConfig {
     pub extended_taker_fee_bps: f64,
     /// Round-trip taker fee on Lighter in bps (0 in production).
     pub lighter_taker_fee_bps: f64,
+    /// Round-trip slippage on Extended in bps (entry + exit, both legs).
+    /// Approximates the cost of crossing the bid-ask vs hitting mid.
+    /// Extended's tight 1-tick book makes this small (~0.3 bps default).
+    /// Set to 0 to keep mid-fill semantics. bot-strategy#166 Phase 1
+    /// fill-model refinement.
+    pub extended_round_trip_slippage_bps: f64,
+    /// Round-trip slippage on Lighter in bps. Lighter's wider inside
+    /// (~10 bps for ETH) means taker crosses ~10 bps round-trip; with
+    /// post-only at 50% fill rate the average becomes ~0; with always
+    /// post-only ~-10 (rebate). Default 5.0 mirrors taker-only baseline
+    /// so live numbers don't surprise downward; tune per Lighter regime.
+    pub lighter_round_trip_slippage_bps: f64,
     /// When true, BtSummary.buckets is populated with one record per
     /// aligned-bucket commit. Off by default — only the bt CLI's
     /// `--out-buckets-csv` flag turns it on. bot-strategy#166 parity.
@@ -61,6 +73,8 @@ impl Default for BtConfig {
             trade_notional_usd: Decimal::from(100),
             extended_taker_fee_bps: 2.5,
             lighter_taker_fee_bps: 0.0,
+            extended_round_trip_slippage_bps: 0.0,
+            lighter_round_trip_slippage_bps: 0.0,
             record_buckets: false,
         }
     }
@@ -393,6 +407,11 @@ fn settle_trade(
     // Fees: round-trip on each leg = 2 * fee_bps * notional / 10_000.
     // Simplification: notional is held constant at the configured value
     // (entry/exit price drift typically <1% on these holds).
+    //
+    // Slippage is added to fees as bps * notional. It represents the
+    // bid-ask cost of crossing the book vs hitting mid (already round-
+    // trip). Set to 0 to keep mid-fill semantics. bot-strategy#166
+    // Phase 1 fill-model refinement.
     let two = Decimal::from(2);
     let bps_div = Decimal::from(10_000);
     let ext_fee = decimal_from_f64(cfg.extended_taker_fee_bps).unwrap_or(Decimal::ZERO)
@@ -403,7 +422,15 @@ fn settle_trade(
         * cfg.trade_notional_usd
         * two
         / bps_div;
-    let fees = ext_fee + lt_fee;
+    let ext_slip = decimal_from_f64(cfg.extended_round_trip_slippage_bps)
+        .unwrap_or(Decimal::ZERO)
+        * cfg.trade_notional_usd
+        / bps_div;
+    let lt_slip = decimal_from_f64(cfg.lighter_round_trip_slippage_bps)
+        .unwrap_or(Decimal::ZERO)
+        * cfg.trade_notional_usd
+        / bps_div;
+    let fees = ext_fee + lt_fee + ext_slip + lt_slip;
     let net = gross - fees;
 
     let net_bps = (net.to_f64().unwrap_or(0.0)
@@ -692,5 +719,62 @@ mod tests {
         let _ = summary.total_net_pnl_usd();
         let _ = summary.win_rate();
         let _ = summary.mean_net_bps();
+    }
+
+    #[test]
+    fn slippage_subtracts_from_net_pnl() {
+        // Same one-cycle setup as bt_runs_one_full_cycle_with_mean_cross_exit
+        // but with explicit slippage configured. Verifies that fees +
+        // slippage are deducted and result is lower than the no-slippage
+        // baseline. bot-strategy#166 Phase 1 fill-model refinement.
+        let dir = tempfile::tempdir().unwrap();
+        let mut ext_lines = Vec::new();
+        let mut lt_lines = Vec::new();
+        for i in 0..200i64 {
+            let ts_ms = 1_776_000_000_000 + i * 1_000;
+            let lt_mid = 78_000.0_f64;
+            let ext_mid = if (60..130).contains(&i) {
+                lt_mid * 1.002
+            } else {
+                lt_mid
+            };
+            ext_lines.push(dump_line(ts_ms, "BTC", ext_mid));
+            lt_lines.push(dump_line(ts_ms, "BTC", lt_mid));
+        }
+        let ext_path = write_dump(dir.path(), "ext.jsonl", &ext_lines);
+        let lt_path = write_dump(dir.path(), "lt.jsonl", &lt_lines);
+
+        let make_cfg = || {
+            let mut c = BtConfig::default();
+            c.signal.min_warmup_samples = 30;
+            c.signal.persistence_sec = 5;
+            c.signal.abs_threshold_bps = 5.0;
+            c.extended_taker_fee_bps = 0.0;
+            c.lighter_taker_fee_bps = 0.0;
+            c.trade_notional_usd = dec!(100);
+            c
+        };
+
+        let replay = DualReplay::new(ext_path.to_str().unwrap(), lt_path.to_str().unwrap())
+            .unwrap();
+        let baseline = run_bt(&replay, make_cfg()).unwrap();
+        assert_eq!(baseline.trades.len(), 1);
+        let baseline_net = baseline.trades[0].net_pnl_usd;
+
+        // Re-run with 5 bps round-trip slippage on Lighter. With $100
+        // notional, the slippage cost should be 5 * 100 / 10000 = $0.05.
+        let replay2 = DualReplay::new(ext_path.to_str().unwrap(), lt_path.to_str().unwrap())
+            .unwrap();
+        let mut cfg = make_cfg();
+        cfg.lighter_round_trip_slippage_bps = 5.0;
+        let with_slip = run_bt(&replay2, cfg).unwrap();
+        assert_eq!(with_slip.trades.len(), 1);
+        let slip_net = with_slip.trades[0].net_pnl_usd;
+        let diff = (baseline_net - slip_net).to_f64().unwrap_or(0.0);
+        assert!(
+            (diff - 0.05).abs() < 1e-6,
+            "expected 5 bps slippage to cost $0.05, baseline {} - slip {} = {}",
+            baseline_net, slip_net, diff
+        );
     }
 }
