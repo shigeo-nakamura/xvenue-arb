@@ -45,6 +45,10 @@ pub struct BtConfig {
     pub extended_taker_fee_bps: f64,
     /// Round-trip taker fee on Lighter in bps (0 in production).
     pub lighter_taker_fee_bps: f64,
+    /// When true, BtSummary.buckets is populated with one record per
+    /// aligned-bucket commit. Off by default — only the bt CLI's
+    /// `--out-buckets-csv` flag turns it on. bot-strategy#166 parity.
+    pub record_buckets: bool,
 }
 
 impl Default for BtConfig {
@@ -57,6 +61,7 @@ impl Default for BtConfig {
             trade_notional_usd: Decimal::from(100),
             extended_taker_fee_bps: 2.5,
             lighter_taker_fee_bps: 0.0,
+            record_buckets: false,
         }
     }
 }
@@ -85,6 +90,21 @@ pub struct TradeRecord {
     pub net_bps: f64,
 }
 
+/// Per-bucket commit record for parity diagnostics. Rust BT exposes
+/// these so we can diff bucket-by-bucket against the Python sim's
+/// `--out-csv` output (bot-strategy#166).
+#[derive(Debug, Clone)]
+pub struct BucketRecord {
+    pub bucket_ts_ms: u64,
+    pub ext_ts_ms: u64,
+    pub lt_ts_ms: u64,
+    pub ext_mid: Decimal,
+    pub lt_mid: Decimal,
+    pub spread_bps: f64,
+    pub rolling_mean_bps: f64,
+    pub dev_bps: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct BtSummary {
     pub trades: Vec<TradeRecord>,
@@ -94,6 +114,9 @@ pub struct BtSummary {
     /// strategy decides on every advance, but only commits a spread
     /// sample on aligned-bucket pairs.
     pub ticks: u64,
+    /// Per-commit bucket records. Empty unless `BtConfig.record_buckets`
+    /// is true (avoid 25k×Vec allocation cost on grid runs).
+    pub buckets: Vec<BucketRecord>,
 }
 
 impl BtSummary {
@@ -149,6 +172,7 @@ async fn run_bt_async(replay: &DualReplay, cfg: BtConfig) -> Result<BtSummary> {
     let mut signal = SignalEngine::new(cfg.signal.clone());
     let mut machine = PositionMachine::new();
     let mut trades: Vec<TradeRecord> = Vec::new();
+    let mut buckets: Vec<BucketRecord> = Vec::new();
     let mut open: Option<OpenLeg> = None;
     let mut ticks: u64 = 0;
 
@@ -205,6 +229,25 @@ async fn run_bt_async(replay: &DualReplay, cfg: BtConfig) -> Result<BtSummary> {
         // by gating on commit. Exits are still evaluated every tick so
         // max_hold and force_close can fire promptly. bot-strategy#166.
         let committed = spread.samples_committed() > prev_committed;
+        if committed && cfg.record_buckets {
+            // Capture the just-committed bucket for parity diagnostics.
+            // `last_spread_bps` and `rolling_mean` are post-push, so
+            // they reflect the state after the new sample is included.
+            let bucket_ts = (ext_ts.min(lt_ts) / cfg.spread.bucket_ms)
+                * cfg.spread.bucket_ms;
+            let s = spread.last_spread_bps().unwrap_or(0.0);
+            let m = spread.rolling_mean().unwrap_or(0.0);
+            buckets.push(BucketRecord {
+                bucket_ts_ms: bucket_ts,
+                ext_ts_ms: ext_ts,
+                lt_ts_ms: lt_ts,
+                ext_mid,
+                lt_mid,
+                spread_bps: s,
+                rolling_mean_bps: m,
+                dev_bps: s - m,
+            });
+        }
         let position = machine.summary();
         let evaluate = committed || position.is_some();
         if !evaluate {
@@ -272,36 +315,49 @@ async fn run_bt_async(replay: &DualReplay, cfg: BtConfig) -> Result<BtSummary> {
         trades,
         samples_committed: spread.samples_committed(),
         ticks,
+        buckets,
     })
 }
 
 /// Read mid + book-validity flag from the connector's current snapshot.
 /// `book_ok` is `true` only when both top-of-book sizes are positive —
 /// see the call site in `run_bt_async` for the rationale.
+///
+/// **Mid is `(bid + ask) / 2`, NOT `t.price`.** Extended's dump writes a
+/// stale `price` field (e.g. 75522 when the real BTC bid/ask is 76320/
+/// 76321 in the same record); using `t.price` gives a constant ~100 bps
+/// phantom spread that the Phase 0 v2 Python sim avoids by computing
+/// mid from bid/ask. This was the dominant source of the Rust-vs-Python
+/// BT divergence (bot-strategy#166).
 async fn read_snapshot(
     c: &Arc<ReplayConnector>,
     symbol: &str,
 ) -> Result<(Decimal, bool)> {
     use dex_connector::DexConnector;
-    let t = c
-        .get_ticker(symbol, None)
-        .await
-        .map_err(|e| anyhow!("get_ticker({}): {:?}", symbol, e))?;
     let ob = c
         .get_order_book(symbol, 1)
         .await
         .map_err(|e| anyhow!("get_order_book({}): {:?}", symbol, e))?;
-    let book_ok = ob
-        .bids
-        .first()
-        .map(|b| b.size > Decimal::ZERO)
-        .unwrap_or(false)
-        && ob
-            .asks
-            .first()
-            .map(|a| a.size > Decimal::ZERO)
-            .unwrap_or(false);
-    Ok((t.price, book_ok))
+    let bid = ob.bids.first();
+    let ask = ob.asks.first();
+    let book_ok = bid.map(|b| b.size > Decimal::ZERO).unwrap_or(false)
+        && ask.map(|a| a.size > Decimal::ZERO).unwrap_or(false);
+    let mid = match (bid, ask) {
+        (Some(b), Some(a)) if b.price > Decimal::ZERO && a.price > Decimal::ZERO => {
+            (b.price + a.price) / Decimal::from(2)
+        }
+        _ => {
+            // Degenerate / one-sided book: fall back to ticker price so
+            // we don't blow up. The book_ok flag will still suppress
+            // committing this sample upstream.
+            let t = c
+                .get_ticker(symbol, None)
+                .await
+                .map_err(|e| anyhow!("get_ticker({}): {:?}", symbol, e))?;
+            t.price
+        }
+    };
+    Ok((mid, book_ok))
 }
 
 fn entry_qty(notional_usd: Decimal, ext_mid: Decimal) -> Result<Decimal> {

@@ -160,6 +160,9 @@ fn run_single(argv: &[String]) -> Result<()> {
     cfg.signal.persistence_sec = args.opt::<u64>("persistence-sec", 15)?;
     cfg.signal.max_hold_sec = args.opt::<u64>("max-hold-sec", 600)?;
     cfg.spread.rolling_window_sec = args.opt::<u64>("rolling-window-sec", 1800)?;
+    if args.map.contains_key("out-buckets-csv") {
+        cfg.record_buckets = true;
+    }
 
     let ext_dump = args.req_str("ext-dump")?;
     let lt_dump = args.req_str("lt-dump")?;
@@ -167,6 +170,29 @@ fn run_single(argv: &[String]) -> Result<()> {
         .map_err(|e| anyhow!("DualReplay::new: {:?}", e))?;
 
     let summary = run_bt(&replay, cfg.clone())?;
+
+    if let Some(path) = args.map.get("out-buckets-csv") {
+        let mut wtr = std::fs::File::create(path)?;
+        use std::io::Write;
+        writeln!(
+            wtr,
+            "bucket_ts_ms,ext_ts_ms,lt_ts_ms,ext_mid,lt_mid,spread_bps,rolling_mean_bps,dev_bps"
+        )?;
+        for b in &summary.buckets {
+            writeln!(
+                wtr,
+                "{},{},{},{},{},{:.6},{:.6},{:.6}",
+                b.bucket_ts_ms,
+                b.ext_ts_ms,
+                b.lt_ts_ms,
+                b.ext_mid,
+                b.lt_mid,
+                b.spread_bps,
+                b.rolling_mean_bps,
+                b.dev_bps,
+            )?;
+        }
+    }
 
     if let Some(path) = args.map.get("out-trades-csv") {
         let mut wtr = std::fs::File::create(path)?;
