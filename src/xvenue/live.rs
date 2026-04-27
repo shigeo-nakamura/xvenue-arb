@@ -287,54 +287,8 @@ fn paper_qty(notional_usd: f64, mid: Decimal) -> Result<Decimal> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rust_decimal_macros::dec;
-    use std::sync::Mutex;
+    use crate::xvenue::test_helpers::{mid, stale_mid, ScriptedHub};
     use tokio::time::timeout;
-
-    /// Deterministic VenueHub: serves a scripted sequence of mid pairs.
-    /// Each call to `read_mid` pops the next ts/mid for the requested venue.
-    /// When exhausted, returns the last value (so the loop can keep ticking).
-    struct ScriptedHub {
-        ext: Mutex<Vec<MidSnapshot>>,
-        lt: Mutex<Vec<MidSnapshot>>,
-    }
-
-    impl ScriptedHub {
-        fn new(ext: Vec<MidSnapshot>, lt: Vec<MidSnapshot>) -> Self {
-            // Reverse so we can pop() in order.
-            let mut ext = ext;
-            ext.reverse();
-            let mut lt = lt;
-            lt.reverse();
-            Self {
-                ext: Mutex::new(ext),
-                lt: Mutex::new(lt),
-            }
-        }
-
-        fn pop_or_last(stack: &Mutex<Vec<MidSnapshot>>) -> MidSnapshot {
-            let mut s = stack.lock().unwrap();
-            if s.len() > 1 {
-                s.pop().unwrap()
-            } else {
-                s.last().cloned().unwrap_or(MidSnapshot {
-                    ts_ms: 0,
-                    mid: dec!(1),
-                    book_ok: true,
-                })
-            }
-        }
-    }
-
-    #[async_trait]
-    impl VenueHub for ScriptedHub {
-        async fn read_mid(&self, venue: Venue) -> Result<MidSnapshot> {
-            Ok(match venue {
-                Venue::Extended => Self::pop_or_last(&self.ext),
-                Venue::Lighter => Self::pop_or_last(&self.lt),
-            })
-        }
-    }
 
     fn min_cfg() -> XvenueConfig {
         let yaml = r#"
@@ -358,17 +312,9 @@ max_hold_sec: 60
         c
     }
 
-    fn ms(v: u64, mid: f64) -> MidSnapshot {
-        MidSnapshot {
-            ts_ms: v,
-            mid: Decimal::from_f64_retain(mid).unwrap(),
-            book_ok: true,
-        }
-    }
-
     #[tokio::test]
     async fn loop_exits_on_shutdown() {
-        let hub = Arc::new(ScriptedHub::new(vec![ms(1000, 2000.0)], vec![ms(1000, 2000.0)]));
+        let hub = Arc::new(ScriptedHub::new(vec![mid(1000, 2000.0)], vec![mid(1000, 2000.0)]));
         let cfg = min_cfg();
         let loop_cfg = LiveLoopConfig {
             tick_interval_ms: 5,
@@ -389,8 +335,8 @@ max_hold_sec: 60
     #[tokio::test]
     async fn one_tick_runs_and_increments_counters() {
         let hub = Arc::new(ScriptedHub::new(
-            vec![ms(1000, 2000.0), ms(2000, 2001.0)],
-            vec![ms(1000, 2000.0), ms(2000, 2000.5)],
+            vec![mid(1000, 2000.0), mid(2000, 2001.0)],
+            vec![mid(1000, 2000.0), mid(2000, 2000.5)],
         ));
         let cfg = min_cfg();
         let mut spread = SpreadEngine::new(cfg.spread_config());
@@ -414,9 +360,10 @@ max_hold_sec: 60
 
     #[tokio::test]
     async fn book_not_ok_suppresses_commit() {
-        let mut bad_ext = ms(1000, 2000.0);
-        bad_ext.book_ok = false;
-        let hub = Arc::new(ScriptedHub::new(vec![bad_ext], vec![ms(1000, 2000.0)]));
+        let hub = Arc::new(ScriptedHub::new(
+            vec![stale_mid(1000, 2000.0)],
+            vec![mid(1000, 2000.0)],
+        ));
         let cfg = min_cfg();
         let mut spread = SpreadEngine::new(cfg.spread_config());
         let mut signal = SignalEngine::new(cfg.signal_config());
@@ -440,13 +387,78 @@ max_hold_sec: 60
     }
 
     #[tokio::test]
+    async fn dev_breach_fires_decision_enter() {
+        // Warm up with 30 buckets at zero spread to fill the 30s
+        // rolling window with zeros, then several breached buckets at
+        // +30 bps. After two breached buckets the rolling mean is only
+        // ~2 bps (28 zeros + 2 thirties / 30) so dev ≈ 28 bps, well
+        // over abs_threshold=5. Persistence=1s → Enter fires once a
+        // breached state has lasted past one bucket.
+        let lt_mid = 2000.0;
+        let warm_ext = lt_mid;
+        let breach_ext = lt_mid * (1.0 + 30.0 / 10_000.0); // +30 bps
+        let mut ext = Vec::new();
+        let mut lt = Vec::new();
+        let warm_n = 30u64;
+        let breach_n = 8u64;
+        // Offset timestamps past the funding-lockout post window
+        // (default 120s). Keep all ticks inside [120s, 2940s) so neither
+        // pre nor post lockout fires.
+        let t0 = 200_000u64;
+        for i in 0..warm_n {
+            let ts = t0 + i * 1000;
+            ext.push(mid(ts, warm_ext));
+            lt.push(mid(ts, lt_mid));
+        }
+        for i in warm_n..(warm_n + breach_n) {
+            let ts = t0 + i * 1000;
+            ext.push(mid(ts, breach_ext));
+            lt.push(mid(ts, lt_mid));
+        }
+        let hub = Arc::new(ScriptedHub::new(ext, lt));
+        let cfg = min_cfg();
+        let mut spread = SpreadEngine::new(cfg.spread_config());
+        let mut signal = SignalEngine::new(cfg.signal_config());
+        let mut machine = PositionMachine::new();
+        let mut summary = LivePaperSummary::default();
+        let mut open_qty = None;
+
+        // Drive ticks through the entire scripted sequence.
+        let total_ticks = warm_n + breach_n;
+        for _ in 0..total_ticks {
+            run_one_tick(
+                &cfg,
+                &*hub,
+                &mut spread,
+                &mut signal,
+                &mut machine,
+                &mut summary,
+                &mut open_qty,
+            )
+            .await
+            .unwrap();
+        }
+
+        // At least one short entry should have fired (ext > lt in bps
+        // means the *Extended* leg is rich → SHORT extended + LONG lt).
+        assert!(
+            summary.decisions_enter_short >= 1,
+            "expected enter_short ≥ 1, summary={:?}",
+            summary
+        );
+        // open_qty should be set — the position is still held since
+        // prices haven't reverted.
+        assert!(open_qty.is_some());
+    }
+
+    #[tokio::test]
     async fn tick_loop_advances_under_short_interval() {
         // Build a long-enough scripted stream so the loop has data to read.
         let mut ext = Vec::new();
         let mut lt = Vec::new();
         for i in 0..10 {
-            ext.push(ms(i * 1000, 2000.0 + (i as f64) * 0.1));
-            lt.push(ms(i * 1000, 2000.0));
+            ext.push(mid(i * 1000, 2000.0 + (i as f64) * 0.1));
+            lt.push(mid(i * 1000, 2000.0));
         }
         let hub = Arc::new(ScriptedHub::new(ext, lt));
         let cfg = min_cfg();
