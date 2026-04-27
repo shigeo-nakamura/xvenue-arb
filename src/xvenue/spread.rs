@@ -24,6 +24,14 @@ pub struct SpreadConfig {
     /// Rolling-mean window in seconds. Tracks the slow basis drift
     /// without over-fitting noise; 30 min is a reasonable default.
     pub rolling_window_sec: u64,
+    /// Drop a candidate sample when `|spread| > max_abs_spread_bps`.
+    /// Cross-venue spreads above ~100 bps come from feed stalls (one
+    /// venue's quote frozen during a liquidity event on the other), not
+    /// from tradeable dislocations — including them poisons the rolling
+    /// mean and fires phantom signals when the stalled side reverts.
+    /// `None` disables the filter; matches the v2 Phase 0 simulator's
+    /// `--max-abs-bps 100` default (bot-strategy#166 byte-parity work).
+    pub max_abs_spread_bps: Option<f64>,
 }
 
 impl Default for SpreadConfig {
@@ -31,6 +39,7 @@ impl Default for SpreadConfig {
         Self {
             bucket_ms: 1_000,
             rolling_window_sec: 1_800,
+            max_abs_spread_bps: Some(100.0),
         }
     }
 }
@@ -175,6 +184,11 @@ impl SpreadEngine {
             return;
         }
         if let Some(s) = spread_bps(em, lm) {
+            if let Some(cap) = self.cfg.max_abs_spread_bps {
+                if s.abs() > cap {
+                    return;
+                }
+            }
             self.rolling.push(s);
             self.last_committed_spread = Some(s);
             self.last_bucket = Some(bucket);
@@ -265,6 +279,7 @@ mod tests {
         let cfg = SpreadConfig {
             bucket_ms: 1_000,
             rolling_window_sec: 60,
+            max_abs_spread_bps: None,
         };
         let mut eng = SpreadEngine::new(cfg);
         // Different buckets: no commit
@@ -282,6 +297,7 @@ mod tests {
         let cfg = SpreadConfig {
             bucket_ms: 1_000,
             rolling_window_sec: 60,
+            max_abs_spread_bps: None,
         };
         let mut eng = SpreadEngine::new(cfg);
         eng.update_extended(1_000, dec!(78010));
@@ -297,6 +313,7 @@ mod tests {
         let cfg = SpreadConfig {
             bucket_ms: 1_000,
             rolling_window_sec: 60,
+            max_abs_spread_bps: None,
         };
         let mut eng = SpreadEngine::new(cfg);
         // Stream with a steady ~+0.26 bps spread — biases μ_roll to
@@ -316,5 +333,31 @@ mod tests {
         let dev = eng.current_dev_bps().unwrap();
         assert!(dev > 8.0, "dev={dev}");
         assert!(dev < 10.0, "dev={dev} should be less than the raw spread");
+    }
+
+    #[test]
+    fn engine_drops_samples_above_max_abs_spread() {
+        // 2360 bps spreads observed in the 2026-04-22..24 BTC dump come
+        // from Lighter feed stalls (frozen quote during a real spot
+        // move). Including them poisons the rolling mean and triggers
+        // phantom signals when the stalled side reverts. Phase 0 v2
+        // sim drops anything past --max-abs-bps; the BT does the same.
+        let cfg = SpreadConfig {
+            bucket_ms: 1_000,
+            rolling_window_sec: 60,
+            max_abs_spread_bps: Some(100.0),
+        };
+        let mut eng = SpreadEngine::new(cfg);
+        // ~+1 bps spread — accepted
+        eng.update_extended(1_000, dec!(78008));
+        eng.update_lighter(1_000, dec!(78000));
+        assert_eq!(eng.samples_committed(), 1);
+        // ~+2360 bps spread (Lighter frozen at 63k, Extended at 78k) —
+        // dropped, no commit, rolling mean unchanged.
+        let mean_before = eng.rolling_mean().unwrap();
+        eng.update_extended(2_000, dec!(78000));
+        eng.update_lighter(2_000, dec!(63000));
+        assert_eq!(eng.samples_committed(), 1);
+        assert_eq!(eng.rolling_mean().unwrap(), mean_before);
     }
 }
