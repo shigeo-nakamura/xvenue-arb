@@ -163,6 +163,16 @@ async fn run_bt_async(replay: &DualReplay, cfg: BtConfig) -> Result<BtSummary> {
             None => break,
         };
 
+        // Each venue's snapshot is tagged with that venue's OWN cursor
+        // timestamp, not `min(cursors)`. Tagging with the merged
+        // timestamp lets the SpreadEngine commit cross-time samples (ext
+        // mid from one bucket paired with lt mid from another) at any
+        // bucket the merged ts touches — Python's inner-join sim sees
+        // ~10% fewer aligned buckets than Rust did before this fix.
+        // bot-strategy#166 byte-parity work.
+        let ext_ts = ext.current_timestamp_ms().unwrap_or(ts_ms as i64) as u64;
+        let lt_ts = lt.current_timestamp_ms().unwrap_or(ts_ms as i64) as u64;
+
         // Both connectors carry valid current-cursor snapshots; read
         // each. Symbols may differ per venue (Extended vs Lighter
         // dumps record under whatever each DEX uses).
@@ -178,16 +188,34 @@ async fn run_bt_async(replay: &DualReplay, cfg: BtConfig) -> Result<BtSummary> {
         // them. Phase 0 v2 simulator does the same drop. See
         // `phase0/spread_analysis.py::parse_jsonl_mid` and
         // bot-strategy#166 v2 refinement.
+        let prev_committed = spread.samples_committed();
         if ext_book_ok {
-            spread.update_extended(ts_ms, ext_mid);
+            spread.update_extended(ext_ts, ext_mid);
         }
         if lt_book_ok {
-            spread.update_lighter(ts_ms, lt_mid);
+            spread.update_lighter(lt_ts, lt_mid);
+        }
+
+        // Run the strategy ONLY when this advance produced a fresh
+        // aligned-bucket sample, OR when a position is open and we're
+        // checking for exit. Calling `decide` on every advance lets the
+        // wall-clock-based persistence timer accumulate elapsed time
+        // between commits, firing entries on stale dev — Phase 0 v2
+        // iterates one decision per aligned bucket, so we mirror that
+        // by gating on commit. Exits are still evaluated every tick so
+        // max_hold and force_close can fire promptly. bot-strategy#166.
+        let committed = spread.samples_committed() > prev_committed;
+        let position = machine.summary();
+        let evaluate = committed || position.is_some();
+        if !evaluate {
+            if replay.advance().is_none() {
+                break;
+            }
+            continue;
         }
 
         let dev = spread.current_dev_bps();
         let is_warm = spread.is_warm(cfg.signal.min_warmup_samples);
-        let position = machine.summary();
 
         match signal.decide(ts_ms, dev, is_warm, position) {
             Decision::Hold => {}

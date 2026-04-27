@@ -142,6 +142,13 @@ fn build_base(args: &Args, symbol: &str) -> Result<BtConfig> {
     cfg.lighter_taker_fee_bps = args.opt::<f64>("lt-fee-bps", 0.0)?;
     cfg.signal.min_warmup_samples = args.opt::<usize>("warmup-samples", 60)?;
     cfg.spread.bucket_ms = args.opt::<u64>("bucket-ms", 1_000)?;
+    // Phase 0 v2 parity diagnostic. When set, Enter fires at the bar
+    // where persistence elapses regardless of current dev — matching
+    // the offline sim's "open at i+persistence_buckets without
+    // dev[entry_idx] check". See bot-strategy#166 for context.
+    if args.opt::<bool>("python-compat-entry", false)? {
+        cfg.signal.entry_check_threshold_at_fire = false;
+    }
     Ok(cfg)
 }
 

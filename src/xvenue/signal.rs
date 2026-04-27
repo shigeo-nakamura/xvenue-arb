@@ -16,6 +16,15 @@ pub struct SignalConfig {
     pub max_hold_sec: u64,
     pub force_close_dev_bps: f64,
     pub min_warmup_samples: usize,
+    /// When true (Rust default), `Decision::Enter` only fires on a tick
+    /// where `|dev| >= abs_threshold_bps` is still satisfied AND the
+    /// breach has lasted `persistence_sec`. When false (Phase 0 v2
+    /// Python-compat), the entry fires once persistence has elapsed
+    /// regardless of the current dev value — matching the offline sim's
+    /// "open at the bar AFTER the confirmation window without checking
+    /// dev[entry_idx]" behavior. Used for parity diagnostics with the
+    /// Phase 0 simulator (bot-strategy#166).
+    pub entry_check_threshold_at_fire: bool,
 }
 
 impl Default for SignalConfig {
@@ -27,6 +36,7 @@ impl Default for SignalConfig {
             max_hold_sec: 600,
             force_close_dev_bps: 30.0,
             min_warmup_samples: 60,
+            entry_check_threshold_at_fire: true,
         }
     }
 }
@@ -112,6 +122,22 @@ impl SignalEngine {
     }
 
     fn decide_entry(&mut self, now_ts_ms: u64, dev: f64) -> Decision {
+        // Python-compat path (entry_check_threshold_at_fire = false):
+        // fire as soon as an active breach has matured, even if the
+        // current bar's dev has already reverted below threshold or
+        // crossed sign. Matches the Phase 0 v2 simulator's
+        // `entry_idx = i + persistence_buckets` rule which does not
+        // re-check dev at the entry bar.
+        if !self.cfg.entry_check_threshold_at_fire {
+            if let Some(b) = self.breach {
+                let elapsed_ms = now_ts_ms.saturating_sub(b.started_ts_ms);
+                if elapsed_ms >= self.cfg.persistence_sec.saturating_mul(1_000) {
+                    self.breach = None;
+                    return Decision::Enter(b.direction);
+                }
+            }
+        }
+
         let dir = if dev >= self.cfg.abs_threshold_bps {
             SpreadDirection::Short
         } else if dev <= -self.cfg.abs_threshold_bps {
@@ -186,6 +212,7 @@ mod tests {
             max_hold_sec: 600,
             force_close_dev_bps: 30.0,
             min_warmup_samples: 10,
+            entry_check_threshold_at_fire: true,
         }
     }
 
@@ -438,5 +465,66 @@ mod tests {
             s.decide(76_000, Some(7.0), true, None),
             Decision::Enter(SpreadDirection::Short)
         );
+    }
+
+    #[test]
+    fn python_compat_fires_after_persistence_even_if_dev_reverted() {
+        // bot-strategy#166: parity diagnostic. Phase 0 v2 sim opens at
+        // `i + persistence_buckets` without re-checking dev there. With
+        // entry_check_threshold_at_fire=false we mirror that behavior:
+        // breach holds for persistence_sec while dev confirms, and the
+        // tick after persistence elapses fires Enter regardless of the
+        // current dev.
+        let mut c = cfg();
+        c.entry_check_threshold_at_fire = false;
+        let mut s = SignalEngine::new(c);
+        // Confirmation window — dev stays past threshold for the full
+        // persistence_sec (bars at 5s cadence).
+        assert_eq!(s.decide(0, Some(7.0), true, None), Decision::Hold);
+        assert_eq!(s.decide(5_000, Some(7.0), true, None), Decision::Hold);
+        assert_eq!(s.decide(10_000, Some(7.0), true, None), Decision::Hold);
+        // Bar at +15s: persistence elapsed. Even though dev has reverted
+        // to +2 (below threshold), Python-compat fires Enter.
+        assert_eq!(
+            s.decide(15_000, Some(2.0), true, None),
+            Decision::Enter(SpreadDirection::Short)
+        );
+    }
+
+    #[test]
+    fn python_compat_breach_still_resets_on_mid_window_dip() {
+        // The "fire regardless of current dev" rule only applies AFTER
+        // persistence has fully elapsed under continuous confirmation.
+        // A mid-window dip below threshold still resets the breach,
+        // matching Phase 0 v2's "all bars in [i, i+persistence_buckets)
+        // must confirm" rule.
+        let mut c = cfg();
+        c.entry_check_threshold_at_fire = false;
+        let mut s = SignalEngine::new(c);
+        assert_eq!(s.decide(0, Some(7.0), true, None), Decision::Hold);
+        // Mid-window dip — breach must reset.
+        assert_eq!(s.decide(5_000, Some(2.0), true, None), Decision::Hold);
+        // Re-cross at 10s: new breach starts here. 15s elapsed from
+        // the original i=0 must NOT be enough to fire.
+        assert_eq!(s.decide(10_000, Some(7.0), true, None), Decision::Hold);
+        // 15s after the new breach start (= 25s wall-clock) is when
+        // the Python-compat rule fires.
+        assert_eq!(s.decide(20_000, Some(7.0), true, None), Decision::Hold);
+        assert_eq!(
+            s.decide(25_000, Some(2.0), true, None),
+            Decision::Enter(SpreadDirection::Short)
+        );
+    }
+
+    #[test]
+    fn python_compat_does_not_change_strict_default_behavior() {
+        // Sanity: with entry_check_threshold_at_fire = true (default),
+        // a reverted dev at the persistence boundary still skips entry.
+        let mut s = SignalEngine::new(cfg()); // default = strict
+        assert_eq!(s.decide(0, Some(7.0), true, None), Decision::Hold);
+        assert_eq!(s.decide(5_000, Some(7.0), true, None), Decision::Hold);
+        assert_eq!(s.decide(10_000, Some(7.0), true, None), Decision::Hold);
+        // Bar at +15s with reverted dev: strict mode resets, Holds.
+        assert_eq!(s.decide(15_000, Some(2.0), true, None), Decision::Hold);
     }
 }
