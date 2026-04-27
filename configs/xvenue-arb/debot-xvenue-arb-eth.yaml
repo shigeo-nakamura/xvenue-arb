@@ -1,0 +1,67 @@
+# xvenue-arb live config — ETH primary (bot-strategy#166).
+#
+# Values track the Phase 1 BT-validated recommended config from
+# #166 part 9 (2026-04-27): post-only 50% slippage assumption,
+# tight funding lockout, 100 bps reference guard for ETH.
+#
+# Field semantics: docs/DESIGN.md §6 + docs/execution_layer.md.
+# Schema/defaults: src/xvenue/config.rs (XvenueConfig).
+#
+# Override at runtime via $XVENUE_CONFIG_PATH; secrets stay in
+# /opt/debot/scripts/debot-xvenue-arb.env (see env.example).
+
+agent_name: debot-xvenue-arb-eth
+dry_run: true                 # flip to false only after Phase 2 paper trading clears
+
+# ---- Symbol pair (one symbol per process) ----
+symbol_ext: ETH-USD
+symbol_lt:  ETH
+
+# ---- Spread engine ----
+spread_bucket_ms: 5000        # Phase 1 BT bucket; matches dump cadence
+rolling_window_sec: 1200      # 20 min — ETH best from #166 part 5 grid
+max_abs_spread_bps: 100.0     # outlier filter (feed-stall guard)
+min_warmup_samples: 90        # ~7.5 min at 5s buckets
+
+# ---- Signal engine ----
+abs_threshold_bps: 5.0        # Phase 1 ETH champion
+persistence_sec: 15
+exit_at_mean_cross: true
+max_hold_sec: 600
+force_close_dev_bps: 30.0
+entry_check_threshold_at_fire: true   # strict (matches Python sim, #166 part 3)
+
+# Funding cycle filter (tight per #166 part 7: keeps 82% of PnL)
+funding_cycle_sec: 3600
+funding_lockout_pre_sec: 660
+funding_lockout_post_sec: 120
+
+# ---- Sizing ----
+trade_size_pct: 0.05          # 5% of (ext + lt) equity
+min_notional_usd: 20
+max_notional_usd: 1000        # raise after Phase 3 probe stabilises
+
+# ---- Execution: Extended (post-only with chase + taker fallback) ----
+extended_post_only: true
+extended_chase_ticks: 1
+extended_chase_retries: 3
+extended_chase_timeout_ms: 500
+extended_taker_fallback: true
+
+# ---- Execution: Lighter (market) ----
+lighter_order_type: market
+lighter_fill_timeout_ms: 1000
+
+# ---- Risk ----
+ws_stale_emergency_ms: 5000
+max_inventory_skew_usd: 50.0
+leg_mismatch_timeout_ms: 3000
+kill_switch_file: /var/run/xvenue-arb/STUCK
+emergency_retry_interval_ms: 30000     # slow-mm 167-min stuck fix (docs/execution_layer.md §5)
+rest_consec_fail_to_escalate: 3
+reduce_only_consec_fail_to_kill: 5
+
+# ---- Reference guard (Binance 1m cross-check) ----
+binance_reference_symbol: ETHUSDT
+reference_max_dev_bps: 100.0           # ETH-specific (BTC would be 30; see #166 part 9)
+reference_consec_buckets_for_halt: 3

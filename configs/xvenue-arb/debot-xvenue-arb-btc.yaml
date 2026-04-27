@@ -1,0 +1,59 @@
+# xvenue-arb live config — BTC secondary (bot-strategy#166).
+#
+# Same Phase 1 champion shape as ETH, with BTC-specific reference
+# threshold (30 bps — BTC's 1-minute realised range is much tighter).
+
+agent_name: debot-xvenue-arb-btc
+dry_run: true
+
+# ---- Symbol pair ----
+symbol_ext: BTC-USD
+symbol_lt:  BTC
+
+# ---- Spread engine ----
+spread_bucket_ms: 5000
+rolling_window_sec: 1200
+max_abs_spread_bps: 100.0
+min_warmup_samples: 90
+
+# ---- Signal engine ----
+abs_threshold_bps: 5.0
+persistence_sec: 15
+exit_at_mean_cross: true
+max_hold_sec: 600
+force_close_dev_bps: 30.0
+entry_check_threshold_at_fire: true
+
+funding_cycle_sec: 3600
+funding_lockout_pre_sec: 660
+funding_lockout_post_sec: 120
+
+# ---- Sizing ----
+trade_size_pct: 0.05
+min_notional_usd: 20
+max_notional_usd: 1000
+
+# ---- Execution: Extended ----
+extended_post_only: true
+extended_chase_ticks: 1
+extended_chase_retries: 3
+extended_chase_timeout_ms: 500
+extended_taker_fallback: true
+
+# ---- Execution: Lighter ----
+lighter_order_type: market
+lighter_fill_timeout_ms: 1000
+
+# ---- Risk ----
+ws_stale_emergency_ms: 5000
+max_inventory_skew_usd: 50.0
+leg_mismatch_timeout_ms: 3000
+kill_switch_file: /var/run/xvenue-arb/STUCK
+emergency_retry_interval_ms: 30000
+rest_consec_fail_to_escalate: 3
+reduce_only_consec_fail_to_kill: 5
+
+# ---- Reference guard (BTC: tight 30 bps; ETH would be 100; see #166 part 9) ----
+binance_reference_symbol: BTCUSDT
+reference_max_dev_bps: 30.0
+reference_consec_buckets_for_halt: 3
