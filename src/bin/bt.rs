@@ -153,6 +153,11 @@ fn build_base(args: &Args, symbol: &str) -> Result<BtConfig> {
     if args.opt::<bool>("python-compat-entry", false)? {
         cfg.signal.entry_check_threshold_at_fire = false;
     }
+    cfg.signal.funding_cycle_sec = args.opt::<u64>("funding-cycle-sec", 0)?;
+    cfg.signal.funding_lockout_pre_sec =
+        args.opt::<u64>("funding-lockout-pre-sec", 1_800)?;
+    cfg.signal.funding_lockout_post_sec =
+        args.opt::<u64>("funding-lockout-post-sec", 1_800)?;
     Ok(cfg)
 }
 

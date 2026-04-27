@@ -25,6 +25,22 @@ pub struct SignalConfig {
     /// dev[entry_idx]" behavior. Used for parity diagnostics with the
     /// Phase 0 simulator (bot-strategy#166).
     pub entry_check_threshold_at_fire: bool,
+    /// Funding cycle in seconds (typically 3600 for hourly perps). 0
+    /// disables the funding-cycle filter entirely. Both Lighter and
+    /// Extended currently fund hourly on the hour; if that diverges
+    /// per-venue lockout layers will need their own check.
+    pub funding_cycle_sec: u64,
+    /// Block new entries when `now_ts_ms` lies within
+    /// `funding_lockout_pre_sec` seconds *before* a funding settle.
+    /// 1800 (30 min) is the issue body's recommended default and pairs
+    /// with `max_hold_sec ≤ 600` so any open position closes well before
+    /// settle. Ignored when `funding_cycle_sec = 0`.
+    pub funding_lockout_pre_sec: u64,
+    /// Block new entries within this many seconds *after* a funding
+    /// settle. Same default of 1800 (30 min). Open positions are not
+    /// affected — `max_hold` and the mean-cross/force-close exits still
+    /// fire normally during the lockout window.
+    pub funding_lockout_post_sec: u64,
 }
 
 impl Default for SignalConfig {
@@ -37,6 +53,9 @@ impl Default for SignalConfig {
             force_close_dev_bps: 30.0,
             min_warmup_samples: 60,
             entry_check_threshold_at_fire: true,
+            funding_cycle_sec: 0,
+            funding_lockout_pre_sec: 1_800,
+            funding_lockout_post_sec: 1_800,
         }
     }
 }
@@ -118,7 +137,30 @@ impl SignalEngine {
             return Decision::Hold;
         }
 
+        // Funding-cycle lockout: refuse new entries within ±N min of a
+        // settle. Drops any in-progress breach so the post-lockout
+        // window starts a fresh persistence count, not a stale one
+        // accumulated through settle. Only entries are gated; open
+        // positions still exit normally (max_hold/force_close), and
+        // pairing this with `max_hold_sec ≤ funding_lockout_pre_sec`
+        // guarantees no live position crosses settle.
+        if self.in_funding_lockout(now_ts_ms) {
+            self.breach = None;
+            return Decision::Hold;
+        }
+
         self.decide_entry(now_ts_ms, dev)
+    }
+
+    fn in_funding_lockout(&self, now_ts_ms: u64) -> bool {
+        let cycle = self.cfg.funding_cycle_sec;
+        if cycle == 0 {
+            return false;
+        }
+        let secs_in_cycle = (now_ts_ms / 1_000) % cycle;
+        let post = self.cfg.funding_lockout_post_sec;
+        let pre = self.cfg.funding_lockout_pre_sec;
+        secs_in_cycle < post || secs_in_cycle >= cycle.saturating_sub(pre)
     }
 
     fn decide_entry(&mut self, now_ts_ms: u64, dev: f64) -> Decision {
@@ -213,6 +255,9 @@ mod tests {
             force_close_dev_bps: 30.0,
             min_warmup_samples: 10,
             entry_check_threshold_at_fire: true,
+            funding_cycle_sec: 0,
+            funding_lockout_pre_sec: 1_800,
+            funding_lockout_post_sec: 1_800,
         }
     }
 
@@ -513,6 +558,75 @@ mod tests {
         assert_eq!(
             s.decide(25_000, Some(2.0), true, None),
             Decision::Enter(SpreadDirection::Short)
+        );
+    }
+
+    #[test]
+    fn funding_lockout_blocks_entries_pre_settle() {
+        // Hourly funding (cycle=3600), ±300s lockout. Settle is at
+        // ts_ms multiples of 3600000. At ts 100s before next settle
+        // (= seconds_in_cycle 3500, with pre=300 → lockout starts at
+        // 3300), entry is blocked.
+        let mut c = cfg();
+        c.funding_cycle_sec = 3_600;
+        c.funding_lockout_pre_sec = 300;
+        c.funding_lockout_post_sec = 300;
+        let mut s = SignalEngine::new(c);
+        // ts 3500s into the cycle (= 100s before settle). Lockout pre
+        // window started at 3300s. So 3500 is in lockout.
+        assert_eq!(
+            s.decide(3_500_000, Some(7.0), true, None),
+            Decision::Hold
+        );
+        // Even after enough wall-clock for persistence, still blocked.
+        assert_eq!(
+            s.decide(3_516_000, Some(7.0), true, None),
+            Decision::Hold
+        );
+        // Past settle by 200s — still in post-window (post=300).
+        assert_eq!(
+            s.decide(3_800_000, Some(7.0), true, None),
+            Decision::Hold
+        );
+        // Past settle by 400s — clear of lockout. Breach starts fresh.
+        assert_eq!(
+            s.decide(4_000_000, Some(7.0), true, None),
+            Decision::Hold
+        );
+        assert_eq!(
+            s.decide(4_016_000, Some(7.0), true, None),
+            Decision::Enter(SpreadDirection::Short)
+        );
+    }
+
+    #[test]
+    fn funding_lockout_zero_cycle_disables() {
+        let mut c = cfg();
+        c.funding_cycle_sec = 0; // disabled
+        c.funding_lockout_pre_sec = 1_800;
+        let mut s = SignalEngine::new(c);
+        // Pre-settle position would be blocked if cycle were on; with
+        // cycle=0 normal flow.
+        assert_eq!(s.decide(3_500_000, Some(7.0), true, None), Decision::Hold);
+        assert_eq!(
+            s.decide(3_516_000, Some(7.0), true, None),
+            Decision::Enter(SpreadDirection::Short)
+        );
+    }
+
+    #[test]
+    fn funding_lockout_does_not_block_exits() {
+        // Open position should continue to evaluate exit conditions
+        // even mid-lockout — only entries are gated.
+        let mut c = cfg();
+        c.funding_cycle_sec = 3_600;
+        c.funding_lockout_pre_sec = 300;
+        c.funding_lockout_post_sec = 300;
+        let mut s = SignalEngine::new(c);
+        // Mid-lockout, mean-cross would normally fire Exit. Confirm.
+        assert_eq!(
+            s.decide(3_550_000, Some(0.0), true, held_short(3_400_000)),
+            Decision::Exit(ExitReason::MeanCross)
         );
     }
 
