@@ -3,7 +3,11 @@
 # so phase0/spread_analysis.py can align the BTC quotes.
 #
 # Frankfurt (`debot` alias): Lighter side, dumps from pairtrade-btceth
+#   /opt/debot/market_data_btceth_*.jsonl
 # Tokyo (`debot-tokyo` alias): Extended side, dumps from pairtrade-btceth-extended
+#   /opt/debot-extended/market_data_btceth_extended_*.jsonl
+#   (path moved from /opt/debot/ to /opt/debot-extended/ with bot-strategy#218
+#    where Tokyo Lighter took over /opt/debot/ on the same instance)
 #
 # Usage: scripts/phase0/fetch_data.sh [OUTPUT_DIR]
 #        Default OUTPUT_DIR = /tmp/xvenue-phase0
@@ -22,7 +26,7 @@ scp 'debot:/opt/debot/market_data_btceth_*.jsonl' "$OUT/lighter/" 2>&1 \
   | tail -20
 
 echo "==> Tokyo Extended dumps → $OUT/extended/"
-scp 'debot-tokyo:/opt/debot/market_data_btceth_extended_*.jsonl' "$OUT/extended/" 2>&1 \
+scp 'debot-tokyo:/opt/debot-extended/market_data_btceth_extended_*.jsonl' "$OUT/extended/" 2>&1 \
   | tail -20
 
 echo
