@@ -1,5 +1,6 @@
 // src/lib.rs
 pub mod ports {
+    pub mod live_dual;
     pub mod replay_dex;
 }
 pub mod config;
