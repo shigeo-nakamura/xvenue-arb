@@ -1,7 +1,7 @@
 #!/bin/bash
-# Fetch Binance BTCUSDT 1m klines for the analysis window so
-# spread_analysis.py can cross-check each venue's mid against an
-# independent reference.
+# Fetch Binance 1m klines for the analysis window so spread_analysis.py
+# (and the Rust BT's --binance-ref-jsonl path) can cross-check each
+# venue's mid against an independent reference.
 #
 # Rationale: smoke-test of 04-22/23 showed 5 top outliers all at Lighter
 # $70k / Extended $78k. Without a third reference we cannot attribute
@@ -9,12 +9,14 @@
 # comment (2026-04-23 smoke test).
 #
 # Usage:
-#   scripts/phase0/fetch_reference.sh START_MS END_MS [OUTPUT_DIR]
+#   scripts/phase0/fetch_reference.sh START_MS END_MS [SYMBOL] [OUTPUT_DIR]
 #     START_MS, END_MS : epoch milliseconds (inclusive open, exclusive close)
+#     SYMBOL           : Binance pair, default BTCUSDT (e.g. ETHUSDT)
 #     OUTPUT_DIR       : default /tmp/xvenue-phase0
 #
-# Example (covers 2026-04-22 00:00 UTC to 2026-04-23 00:00 UTC):
+# Examples (covers 2026-04-22 00:00 UTC to 2026-04-23 00:00 UTC):
 #   scripts/phase0/fetch_reference.sh 1776870000000 1776956400000
+#   scripts/phase0/fetch_reference.sh 1776870000000 1776956400000 ETHUSDT
 #
 # Idempotent: output file is rewritten on each run. API is anonymous
 # (no auth) and Binance's public klines has a weight budget of ~1200/min
@@ -24,10 +26,12 @@ set -euo pipefail
 
 START_MS="${1:?missing START_MS}"
 END_MS="${2:?missing END_MS}"
-OUT_DIR="${3:-/tmp/xvenue-phase0}/reference"
+SYMBOL="${3:-BTCUSDT}"
+OUT_DIR="${4:-/tmp/xvenue-phase0}/reference"
 mkdir -p "$OUT_DIR"
 
-OUT_FILE="$OUT_DIR/binance_btcusdt_1m.jsonl"
+SYMBOL_LOWER="$(echo "$SYMBOL" | tr '[:upper:]' '[:lower:]')"
+OUT_FILE="$OUT_DIR/binance_${SYMBOL_LOWER}_1m.jsonl"
 : > "$OUT_FILE"
 
 # Binance returns up to 1000 rows per request. 1m interval → 1000 min =
@@ -36,7 +40,7 @@ CURSOR="$START_MS"
 PAGES=0
 while [[ "$CURSOR" -lt "$END_MS" ]]; do
   PAGES=$((PAGES + 1))
-  URL="https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=1000&startTime=${CURSOR}&endTime=${END_MS}"
+  URL="https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=1m&limit=1000&startTime=${CURSOR}&endTime=${END_MS}"
   RESP=$(curl -sS --max-time 10 "$URL")
 
   # Emit one JSON-per-line in our own schema: {ts_ms, open, high, low, close}

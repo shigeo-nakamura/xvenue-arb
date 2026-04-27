@@ -29,11 +29,20 @@ With Binance cross-check (bot-strategy#166 smoke test found Lighter-side
 stale quotes; the reference anchors which venue is mis-quoting and lets
 us drop those buckets cleanly):
 
+  # BTC (default symbol)
   scripts/phase0/fetch_reference.sh 1776870000000 1776956400000
   python3 scripts/phase0/spread_analysis.py \\
       --lighter-dir  /tmp/xvenue-phase0/lighter \\
       --extended-dir /tmp/xvenue-phase0/extended \\
       --reference-jsonl /tmp/xvenue-phase0/reference/binance_btcusdt_1m.jsonl \\
+      --drop-ref-deviation-bps 50
+
+  # ETH (pass SYMBOL to fetch_reference.sh)
+  scripts/phase0/fetch_reference.sh 1776870000000 1776956400000 ETHUSDT
+  python3 scripts/phase0/spread_analysis.py --symbol ETH \\
+      --lighter-dir  /tmp/xvenue-phase0/lighter \\
+      --extended-dir /tmp/xvenue-phase0/extended \\
+      --reference-jsonl /tmp/xvenue-phase0/reference/binance_ethusdt_1m.jsonl \\
       --drop-ref-deviation-bps 50
 
 Requires: numpy, pandas (no scipy / statsmodels — we keep deps light).
