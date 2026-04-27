@@ -255,6 +255,7 @@ def persistence_filtered_trade_stats(
     persistence_buckets: int,
     max_hold_buckets: int,
     bucket_sec: int,
+    strict_entry: bool = False,
 ) -> PersistenceStats:
     """Simulate trades that require sustained breach before entry.
 
@@ -303,6 +304,18 @@ def persistence_filtered_trade_stats(
         # Open at the bar AFTER the confirmation window
         entry_idx = min(i + persistence_buckets, n - 1)
         entry_dev = spread_bps[entry_idx] - mean_offset[entry_idx]
+        # Strict-entry mode (bot-strategy#166 parity diagnostic): only
+        # open if dev at the entry bar is *still* past threshold on the
+        # same side. Mirrors the live SignalEngine's "dev must still
+        # confirm at fire tick" rule, and rejects entries booked at a
+        # near-mean dev (which inflates v2's apparent win rate by
+        # capturing the tail of the revert as an "arb"). Falling back
+        # to skipping the candidate entirely matches what a live bot
+        # would do — there's no order to place once dev has reverted.
+        if strict_entry:
+            if np.isnan(entry_dev) or entry_dev * breach_side < abs_threshold_bps:
+                i += 1
+                continue
         # Hold until revert past mean or max_hold reached
         exit_idx = entry_idx
         exit_dev = entry_dev
@@ -433,6 +446,15 @@ def main() -> int:
                          "preview window.")
     ap.add_argument("--out-csv", default=None,
                     help="Optional: write aligned (ts, spread_bps, z) CSV for plotting.")
+    ap.add_argument("--strict-entry", action="store_true",
+                    help="Reject candidates whose dev at entry_idx (i + "
+                         "persistence_buckets) has already reverted below "
+                         "abs_threshold_bps. Mirrors the live bot's "
+                         "SignalEngine entry rule. Without this, v2 opens "
+                         "trades at near-mean dev values that book the tail "
+                         "of the revert as a gross-bps capture (likely "
+                         "inflating Phase 0 v2 GO numbers — see "
+                         "bot-strategy#166).")
     args = ap.parse_args()
 
     print(f"[load] Lighter  from {args.lighter_dir} (symbol={args.symbol})", file=sys.stderr)
@@ -639,10 +661,13 @@ def main() -> int:
         persistence_buckets=persist_buckets,
         max_hold_buckets=max_hold_buckets,
         bucket_sec=args.bucket_sec,
+        strict_entry=args.strict_entry,
     )
+    entry_label = "strict" if args.strict_entry else "v2-default"
     print(f"persistence-filtered stats v2 "
           f"(threshold={args.abs_threshold_bps} bps, "
-          f"persist={args.persistence_sec}s, max_hold={args.max_hold_sec}s):")
+          f"persist={args.persistence_sec}s, max_hold={args.max_hold_sec}s, "
+          f"entry={entry_label}):")
     print(f"  trades in sample   : {p_stats.trades}")
     print(f"  annualized trades  : {p_stats.annualized_trades:.0f} / year")
     print(f"  win rate           : {p_stats.win_rate*100:.1f}%")
