@@ -168,6 +168,37 @@ fn run_single(argv: &[String]) -> Result<()> {
 
     let summary = run_bt(&replay, cfg.clone())?;
 
+    if let Some(path) = args.map.get("out-trades-csv") {
+        let mut wtr = std::fs::File::create(path)?;
+        use std::io::Write;
+        writeln!(
+            wtr,
+            "entry_ts_ms,exit_ts_ms,direction,exit_reason,entry_dev,exit_dev,entry_ext_mid,entry_lt_mid,exit_ext_mid,exit_lt_mid,qty,gross_pnl_usd,fees_usd,net_pnl_usd,net_bps,hold_secs"
+        )?;
+        for t in &summary.trades {
+            writeln!(
+                wtr,
+                "{},{},{:?},{:?},{:.4},{:.4},{},{},{},{},{},{},{},{},{:.4},{}",
+                t.entry_ts_ms,
+                t.exit_ts_ms,
+                t.direction,
+                t.exit_reason,
+                t.entry_dev_bps,
+                t.exit_dev_bps,
+                t.entry_ext_mid,
+                t.entry_lt_mid,
+                t.exit_ext_mid,
+                t.exit_lt_mid,
+                t.qty,
+                t.gross_pnl_usd,
+                t.fees_usd,
+                t.net_pnl_usd,
+                t.net_bps,
+                t.hold_secs,
+            )?;
+        }
+    }
+
     println!("== Single BT ==");
     println!(
         "config: abs_threshold={} persistence={}s max_hold={}s rolling={}s warmup={} notional={} ext_fee={}bps lt_fee={}bps",

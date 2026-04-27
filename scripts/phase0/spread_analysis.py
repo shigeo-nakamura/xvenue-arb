@@ -256,6 +256,8 @@ def persistence_filtered_trade_stats(
     max_hold_buckets: int,
     bucket_sec: int,
     strict_entry: bool = False,
+    timestamps_ms: "np.ndarray | None" = None,
+    trades_csv_path: "str | None" = None,
 ) -> PersistenceStats:
     """Simulate trades that require sustained breach before entry.
 
@@ -281,6 +283,7 @@ def persistence_filtered_trade_stats(
 
     grosses = []
     holds_buckets = []
+    trade_rows = [] if trades_csv_path else None
     i = 0
     while i < n:
         dev = spread_bps[i] - mean_offset[i]
@@ -332,7 +335,46 @@ def persistence_filtered_trade_stats(
         gross = (entry_dev - exit_dev) * breach_side
         grosses.append(gross)
         holds_buckets.append(exit_idx - entry_idx)
+        if trade_rows is not None:
+            entry_ts = (
+                int(timestamps_ms[entry_idx])
+                if timestamps_ms is not None
+                else entry_idx * bucket_sec * 1000
+            )
+            exit_ts = (
+                int(timestamps_ms[exit_idx])
+                if timestamps_ms is not None
+                else exit_idx * bucket_sec * 1000
+            )
+            trade_rows.append(
+                {
+                    "entry_ts_ms": entry_ts,
+                    "exit_ts_ms": exit_ts,
+                    "entry_idx": entry_idx,
+                    "exit_idx": exit_idx,
+                    "direction": "Short" if breach_side == 1 else "Long",
+                    "entry_spread": float(spread_bps[entry_idx]),
+                    "exit_spread": float(spread_bps[exit_idx]),
+                    "entry_dev": float(entry_dev),
+                    "exit_dev": float(exit_dev),
+                    "entry_mu": float(mean_offset[entry_idx]),
+                    "exit_mu": float(mean_offset[exit_idx]),
+                    "gross_bps": float(gross),
+                    "hold_buckets": int(exit_idx - entry_idx),
+                }
+            )
         i = exit_idx + 1
+
+    if trade_rows is not None:
+        import csv as _csv
+
+        with open(trades_csv_path, "w", newline="") as fh:
+            if trade_rows:
+                w = _csv.DictWriter(fh, fieldnames=list(trade_rows[0].keys()))
+                w.writeheader()
+                w.writerows(trade_rows)
+            else:
+                fh.write("entry_ts_ms,exit_ts_ms,entry_idx,exit_idx,direction,entry_spread,exit_spread,entry_dev,exit_dev,entry_mu,exit_mu,gross_bps,hold_buckets\n")
 
     if not grosses:
         return PersistenceStats(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
@@ -446,6 +488,9 @@ def main() -> int:
                          "preview window.")
     ap.add_argument("--out-csv", default=None,
                     help="Optional: write aligned (ts, spread_bps, z) CSV for plotting.")
+    ap.add_argument("--out-trades-csv", default=None,
+                    help="Write the persistence-filtered trade list to this "
+                         "CSV path. Used for Rust BT parity diff.")
     ap.add_argument("--strict-entry", action="store_true",
                     help="Reject candidates whose dev at entry_idx (i + "
                          "persistence_buckets) has already reverted below "
@@ -654,6 +699,7 @@ def main() -> int:
     persist_buckets = max(1, args.persistence_sec // args.bucket_sec)
     max_hold_buckets = max(1, args.max_hold_sec // args.bucket_sec)
     mu_arr = mu.reindex(valid.index).to_numpy()
+    valid_ts = valid.index.to_numpy()  # bucket-start ts in ms
     p_stats = persistence_filtered_trade_stats(
         spread_bps=s,
         mean_offset=mu_arr,
@@ -662,6 +708,8 @@ def main() -> int:
         max_hold_buckets=max_hold_buckets,
         bucket_sec=args.bucket_sec,
         strict_entry=args.strict_entry,
+        timestamps_ms=valid_ts,
+        trades_csv_path=args.out_trades_csv,
     )
     entry_label = "strict" if args.strict_entry else "v2-default"
     print(f"persistence-filtered stats v2 "
