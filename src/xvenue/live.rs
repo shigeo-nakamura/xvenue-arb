@@ -419,100 +419,6 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
     // Drain any pending SIGUSR1 — arms the STUCK file if needed.
     let _ = stuck.poll_sigusr1();
 
-    // WS staleness check (#244 Group C). Runs *before* the read_mid
-    // calls so a sustained venue outage that prevents read_mid from
-    // returning fresh data still surfaces — `evaluate` uses the last
-    // recorded healthy-book timestamp, not this tick's reads.
-    //
-    // Decision policy:
-    //   - Position open: emit Event::Emergency{WsStale} → state
-    //     machine routes to EmergencyFlattening. One event per trip;
-    //     the latch keeps the runner from re-emitting on subsequent
-    //     ticks while still flattening.
-    //   - Flat (no position): just block any new entry by short-
-    //     circuiting the rest of the tick. Counters bump so the
-    //     operator can see the suppression in [STATUS].
-    //   - NotReady (warm-up): proceed normally; the read_mid warm-up
-    //     gate handles the "no data yet" case.
-    let now_wall_ms = wall_clock_ms();
-    let ws_outcome = ws_health.evaluate(now_wall_ms);
-    if let WsHealthOutcome::Stale(stale_venue) = ws_outcome {
-        if machine.summary().is_some() {
-            // Only emit the event if it hasn't already been latched
-            // *and* applied. The latch flips when evaluate sees stale,
-            // but the state machine may already be in
-            // EmergencyFlattening from a prior tick — Emergency from
-            // that phase is rejected by the state machine. So we
-            // count the emit only when it actually goes through.
-            let event = Event::Emergency {
-                reason: super::state::EmergencyReason::WsStale,
-            };
-            match machine.apply(now_wall_ms, event) {
-                Ok(()) => {
-                    log::error!(
-                        "[XVENUE] WS staleness emergency: venue={:?} threshold_ms={} \
-                         → flattening",
-                        stale_venue,
-                        ws_health.ws_stale_emergency_ms()
-                    );
-                    summary.ws_stale_emergencies_emitted += 1;
-
-                    // Paper-mode short-circuit: Group B (real orders +
-                    // emergency-flatten loop) is not yet wired, so
-                    // there is no producer of `EmergencyComplete` in
-                    // dry-run. Without this, a transient WS hiccup
-                    // would dead-end the state machine in
-                    // EmergencyFlattening and block all future
-                    // entries until restart. Synthesise the exit
-                    // fills + EmergencyComplete so the paper loop
-                    // recovers and the operator can keep observing.
-                    // Live mode (Group B once it lands) MUST NOT take
-                    // this path — the real flatten orders drive
-                    // `EmergencyComplete`.
-                    if cfg.dry_run {
-                        if let Some(qty) = open_qty.take() {
-                            let _ = machine.apply(
-                                now_wall_ms,
-                                Event::ExtendedExitFilled { qty },
-                            );
-                            let _ = machine.apply(
-                                now_wall_ms,
-                                Event::LighterExitFilled { qty },
-                            );
-                        }
-                        let _ = machine.apply(now_wall_ms, Event::EmergencyComplete);
-                        ws_health.reset_after_recovery();
-                        log::warn!(
-                            "[XVENUE] paper-mode WS-stale recovery: synthesised \
-                             EmergencyComplete (Group B will replace this in live)"
-                        );
-                    }
-                }
-                Err(e) => {
-                    // Either Phase::Flat or already EmergencyFlattening.
-                    // Both are fine — log at debug level so we don't
-                    // spam WARN every tick during a sustained outage.
-                    log::debug!(
-                        "[XVENUE] WS stale ignored by state machine \
-                         (likely already flattening): {:?}",
-                        e
-                    );
-                }
-            }
-        } else {
-            log::warn!(
-                "[XVENUE] WS staleness latched: venue={:?} threshold_ms={} \
-                 (Flat — blocking new entries until a healthy book lands)",
-                stale_venue,
-                ws_health.ws_stale_emergency_ms()
-            );
-            summary.entries_blocked_by_ws_stale += 1;
-        }
-        // Skip the rest of the tick — we don't want to feed stale
-        // mid into the spread engine or evaluate signals from it.
-        return Ok(());
-    }
-
     let mut ext_snap = match hub.read_mid(Venue::Extended).await {
         Ok(s) => {
             warmup.mark_ready(Venue::Extended);
@@ -542,17 +448,93 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
         Err(e) => return Err(e).context("read_mid Lighter"),
     };
 
-    // Record successful book observations for WS health tracking. We
-    // only count `book_ok = true` reads — a one-sided book is a
-    // "venue alive but unfit to trade" state, which the watchdog
-    // *should* eventually escalate. The wall-clock ts is the same
-    // clock `evaluate` runs on so the age math stays monotonic.
-    let now_wall_ms_after_reads = wall_clock_ms();
-    if ext_snap.book_ok {
-        ws_health.record_book_update(VenueLabel::Extended, now_wall_ms_after_reads);
-    }
-    if lt_snap.book_ok {
-        ws_health.record_book_update(VenueLabel::Lighter, now_wall_ms_after_reads);
+    // Record successful WS observations for health tracking. Any
+    // `read_mid` Ok is a sign that the venue's WS subscription is
+    // alive — we record on Ok regardless of `book_ok`. A
+    // one-sided book is a venue-side data quality issue (handled
+    // by the spread engine's `book_ok` filter and reference_guard),
+    // not a WS health signal — recording only on `book_ok=true`
+    // would falsely flag a thin book as a WS outage. True WS
+    // outages manifest as `read_mid` Err → no record → eventually
+    // `evaluate` sees the staleness.
+    let now_wall_ms = wall_clock_ms();
+    ws_health.record_book_update(VenueLabel::Extended, now_wall_ms);
+    ws_health.record_book_update(VenueLabel::Lighter, now_wall_ms);
+
+    // WS staleness check (#244 Group C). Runs *after* the reads so
+    // a successful read clears any prior staleness latch. Decision
+    // policy:
+    //   - Position open: emit Event::Emergency{WsStale} → state
+    //     machine routes to EmergencyFlattening.
+    //   - Flat (no position): log debug, continue normally. The
+    //     spread engine already drops thin-book samples via
+    //     `book_ok=false`; we don't need a separate gate.
+    //   - NotReady (warm-up): proceed normally; the read_mid
+    //     warm-up gate already handled the "no data yet" case.
+    let ws_outcome = ws_health.evaluate(now_wall_ms);
+    if let WsHealthOutcome::Stale(stale_venue) = ws_outcome {
+        if machine.summary().is_some() {
+            let event = Event::Emergency {
+                reason: super::state::EmergencyReason::WsStale,
+            };
+            match machine.apply(now_wall_ms, event) {
+                Ok(()) => {
+                    log::error!(
+                        "[XVENUE] WS staleness emergency: venue={:?} threshold_ms={} \
+                         → flattening",
+                        stale_venue,
+                        ws_health.ws_stale_emergency_ms()
+                    );
+                    summary.ws_stale_emergencies_emitted += 1;
+
+                    // Paper-mode short-circuit: Group B (real orders +
+                    // emergency-flatten loop) is not yet wired, so
+                    // there is no producer of `EmergencyComplete` in
+                    // dry-run. Without this, a transient WS hiccup
+                    // would dead-end the state machine in
+                    // EmergencyFlattening. Synthesise the exit fills
+                    // + EmergencyComplete so the paper loop recovers.
+                    // Live mode (Group B once it lands) MUST NOT take
+                    // this path.
+                    if cfg.dry_run {
+                        if let Some(qty) = open_qty.take() {
+                            let _ = machine.apply(
+                                now_wall_ms,
+                                Event::ExtendedExitFilled { qty },
+                            );
+                            let _ = machine.apply(
+                                now_wall_ms,
+                                Event::LighterExitFilled { qty },
+                            );
+                        }
+                        let _ = machine.apply(now_wall_ms, Event::EmergencyComplete);
+                        ws_health.reset_after_recovery();
+                        log::warn!(
+                            "[XVENUE] paper-mode WS-stale recovery: synthesised \
+                             EmergencyComplete (Group B will replace this in live)"
+                        );
+                    }
+                }
+                Err(e) => {
+                    log::debug!(
+                        "[XVENUE] WS stale ignored by state machine \
+                         (likely already flattening): {:?}",
+                        e
+                    );
+                }
+            }
+            return Ok(());
+        } else {
+            log::debug!(
+                "[XVENUE] WS staleness in Flat: venue={:?} threshold_ms={} \
+                 (no position to flatten — continuing)",
+                stale_venue,
+                ws_health.ws_stale_emergency_ms()
+            );
+            // Don't increment entries_blocked_by_ws_stale — Flat
+            // doesn't block anything; the spread engine's book_ok
+            // filter is what gates entries on bad data.
+        }
     }
 
     // Reference guard cross-check (#244 C). Reads the latest Binance
