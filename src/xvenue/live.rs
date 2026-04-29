@@ -84,6 +84,11 @@ pub struct LivePaperSummary {
     pub decisions_exit: u64,
     pub last_dev_bps: Option<f64>,
     pub last_decision_ts_ms: Option<u64>,
+    /// Count of `Decision::Enter` outcomes that were suppressed by the
+    /// external KILL_SWITCH file (bot-strategy#244 D-1). Visible in
+    /// `[STATUS]` log line and the shutdown summary so the operator
+    /// can confirm the file actually held entries off.
+    pub entries_blocked_by_kill_switch: u64,
 }
 
 /// Control surface for the run loop.
@@ -189,13 +194,15 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
 
             _ = status_ivl.tick() => {
                 log::info!(
-                    "[STATUS] ticks={} samples={} hold={} enter_l={} enter_s={} exit={} dev_bps={:?}",
+                    "[STATUS] ticks={} samples={} hold={} enter_l={} enter_s={} exit={} \
+                     ks_blocked={} dev_bps={:?}",
                     summary.ticks,
                     summary.samples_committed,
                     summary.decisions_hold,
                     summary.decisions_enter_long,
                     summary.decisions_enter_short,
                     summary.decisions_exit,
+                    summary.entries_blocked_by_kill_switch,
                     summary.last_dev_bps,
                 );
                 if let Some(r) = reporter.as_mut() {
@@ -217,6 +224,13 @@ fn wall_clock_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// `true` when the external KILL_SWITCH file exists. File-presence is
+/// the source of truth — no caching, no edge-trigger persistence —
+/// so removing the file resumes entries on the next tick (#244 D-1).
+fn kill_switch_active(path: &str) -> bool {
+    !path.is_empty() && std::path::Path::new(path).exists()
 }
 
 /// Pulls equity from both venues and threads the sum into the reporter
@@ -293,7 +307,24 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
     }
     let is_warm = spread.is_warm(cfg.min_warmup_samples);
 
-    match signal.decide(now_ts_ms, dev, is_warm, position) {
+    let mut decision = signal.decide(now_ts_ms, dev, is_warm, position);
+
+    // External KILL_SWITCH gate (bot-strategy#244 D-1). Pairtrade-
+    // symmetric: when /opt/debot/KILL_SWITCH exists, refuse new
+    // entries; held positions still exit normally. We gate at the
+    // live-loop level rather than the SignalEngine so the strategy
+    // logic stays free of file-IO concerns.
+    if matches!(decision, Decision::Enter(_)) && kill_switch_active(&cfg.kill_switch_file) {
+        log::warn!(
+            "[XVENUE] KILL_SWITCH active ({}); blocking new entry. \
+             Existing positions exit normally; remove the file to resume.",
+            cfg.kill_switch_file
+        );
+        summary.entries_blocked_by_kill_switch += 1;
+        decision = Decision::Hold;
+    }
+
+    match decision {
         Decision::Hold => {
             summary.decisions_hold += 1;
         }
@@ -541,6 +572,121 @@ max_hold_sec: 60
         // open_qty should be set — the position is still held since
         // prices haven't reverted.
         assert!(open_qty.is_some());
+    }
+
+    #[tokio::test]
+    async fn kill_switch_file_blocks_entries_and_clears_on_removal() {
+        // Same scripted stream as `dev_breach_fires_decision_enter` —
+        // a clean entry signal we expect to land. While the kill
+        // switch file is present, the entry must be suppressed and
+        // the counter must increment. After removal, re-driving the
+        // breach should let the entry through.
+        let lt_mid = 2000.0;
+        let breach_ext = lt_mid * (1.0 + 30.0 / 10_000.0);
+        let mut ext = Vec::new();
+        let mut lt = Vec::new();
+        let warm_n = 30u64;
+        let breach_n = 8u64;
+        let t0 = 200_000u64;
+        for i in 0..warm_n {
+            ext.push(mid(t0 + i * 1000, lt_mid));
+            lt.push(mid(t0 + i * 1000, lt_mid));
+        }
+        for i in warm_n..(warm_n + breach_n) {
+            ext.push(mid(t0 + i * 1000, breach_ext));
+            lt.push(mid(t0 + i * 1000, lt_mid));
+        }
+        let hub = Arc::new(ScriptedHub::new(ext, lt));
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ks_path = tmp.path().join("KILL_SWITCH");
+        std::fs::write(&ks_path, b"").unwrap();
+
+        // Inject the temp path into the config.
+        let mut cfg = min_cfg();
+        cfg.kill_switch_file = ks_path.to_string_lossy().into_owned();
+
+        let mut spread = SpreadEngine::new(cfg.spread_config());
+        let mut signal = SignalEngine::new(cfg.signal_config());
+        let mut machine = PositionMachine::new();
+        let mut summary = LivePaperSummary::default();
+        let mut open_qty = None;
+
+        for _ in 0..(warm_n + breach_n) {
+            run_one_tick(
+                &cfg,
+                &*hub,
+                &mut spread,
+                &mut signal,
+                &mut machine,
+                &mut summary,
+                &mut open_qty,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // No entry should have landed; counter increments per blocked
+        // signal so it should be ≥ 1.
+        assert_eq!(summary.decisions_enter_long, 0);
+        assert_eq!(summary.decisions_enter_short, 0);
+        assert!(open_qty.is_none());
+        assert!(
+            summary.entries_blocked_by_kill_switch >= 1,
+            "expected ks_blocked ≥ 1, got {}",
+            summary.entries_blocked_by_kill_switch
+        );
+    }
+
+    #[tokio::test]
+    async fn entry_fires_once_kill_switch_path_is_empty_or_missing() {
+        // Symmetric check: pointing kill_switch_file at a path that
+        // doesn't exist (or the empty string) must not block entries.
+        let lt_mid = 2000.0;
+        let breach_ext = lt_mid * (1.0 + 30.0 / 10_000.0);
+        let mut ext = Vec::new();
+        let mut lt = Vec::new();
+        let warm_n = 30u64;
+        let breach_n = 8u64;
+        let t0 = 200_000u64;
+        for i in 0..warm_n {
+            ext.push(mid(t0 + i * 1000, lt_mid));
+            lt.push(mid(t0 + i * 1000, lt_mid));
+        }
+        for i in warm_n..(warm_n + breach_n) {
+            ext.push(mid(t0 + i * 1000, breach_ext));
+            lt.push(mid(t0 + i * 1000, lt_mid));
+        }
+        let hub = Arc::new(ScriptedHub::new(ext, lt));
+
+        let mut cfg = min_cfg();
+        // Path that does not exist — the gate should treat this as
+        // "no kill switch" and let entries through.
+        cfg.kill_switch_file = "/tmp/xvenue-arb-test-nonexistent-ks".to_string();
+
+        let mut spread = SpreadEngine::new(cfg.spread_config());
+        let mut signal = SignalEngine::new(cfg.signal_config());
+        let mut machine = PositionMachine::new();
+        let mut summary = LivePaperSummary::default();
+        let mut open_qty = None;
+
+        for _ in 0..(warm_n + breach_n) {
+            run_one_tick(
+                &cfg,
+                &*hub,
+                &mut spread,
+                &mut signal,
+                &mut machine,
+                &mut summary,
+                &mut open_qty,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(summary.entries_blocked_by_kill_switch, 0);
+        assert!(summary.decisions_enter_short >= 1);
     }
 
     #[tokio::test]

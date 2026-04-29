@@ -99,8 +99,19 @@ pub struct XvenueConfig {
     pub max_inventory_skew_usd: f64,
     #[serde(default = "default_leg_mismatch_timeout_ms")]
     pub leg_mismatch_timeout_ms: u64,
+    /// Pairtrade-symmetric **external KILL_SWITCH file**, dropped by
+    /// the operator to block new entries (existing positions exit
+    /// normally). bot-strategy#244 D-1. See `docs/execution_layer.md`
+    /// §4 for the reconciliation between this and `stuck_file`.
     #[serde(default = "default_kill_switch_file")]
     pub kill_switch_file: String,
+    /// Runner-written **STUCK file**, used by the runner to flag
+    /// unrecoverable emergency-flatten state (#102 P2 precedent).
+    /// Operator must inspect + clear via `RISK_ACK` (D-5). Old YAMLs
+    /// that still write to `kill_switch_file: /var/run/xvenue-arb/STUCK`
+    /// keep working through the `kill_switch_file` alias below.
+    #[serde(default = "default_stuck_file", alias = "kill_switch_file_legacy")]
+    pub stuck_file: String,
     /// 30s cadence in EmergencyFlattening — slow-mm 167-min stuck fix.
     /// See docs/execution_layer.md §5.
     #[serde(default = "default_emergency_retry_interval_ms")]
@@ -252,6 +263,11 @@ fn default_leg_mismatch_timeout_ms() -> u64 {
     3_000
 }
 fn default_kill_switch_file() -> String {
+    // Pairtrade-symmetric path so one operator workflow drives both
+    // fleets (bot-strategy#244 D-1).
+    "/opt/debot/KILL_SWITCH".to_string()
+}
+fn default_stuck_file() -> String {
     "/var/run/xvenue-arb/STUCK".to_string()
 }
 fn default_emergency_retry_interval_ms() -> u64 {
@@ -298,7 +314,8 @@ reference_max_dev_bps: 100
         assert_eq!(cfg.persistence_sec, 15);
         assert_eq!(cfg.max_hold_sec, 600);
         assert_eq!(cfg.emergency_retry_interval_ms, 30_000);
-        assert_eq!(cfg.kill_switch_file, "/var/run/xvenue-arb/STUCK");
+        assert_eq!(cfg.kill_switch_file, "/opt/debot/KILL_SWITCH");
+        assert_eq!(cfg.stuck_file, "/var/run/xvenue-arb/STUCK");
         assert_eq!(cfg.lighter_order_type, "market");
         assert!(!cfg.dry_run);
     }

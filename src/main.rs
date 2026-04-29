@@ -197,13 +197,14 @@ async fn run() -> anyhow::Result<()> {
         let loop_cfg = LiveLoopConfig::from_xvenue(&cfg);
         let summary = run_paper_loop(cfg, loop_cfg, hub, shutdown_rx).await?;
         log::info!(
-            "[EXIT] ticks={} samples={} hold={} enter_l={} enter_s={} exit={}",
+            "[EXIT] ticks={} samples={} hold={} enter_l={} enter_s={} exit={} ks_blocked={}",
             summary.ticks,
             summary.samples_committed,
             summary.decisions_hold,
             summary.decisions_enter_long,
             summary.decisions_enter_short,
             summary.decisions_exit,
+            summary.entries_blocked_by_kill_switch,
         );
 
         // Best-effort connector shutdown; any errors are logged but don't
