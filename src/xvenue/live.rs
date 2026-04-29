@@ -33,6 +33,7 @@ use super::signal::{Decision, ExitReason, SignalEngine, SpreadDirection};
 use super::spread::SpreadEngine;
 use super::state::{Event, PositionMachine};
 use super::status::{equity_decimal_to_f64, StatusReporter};
+use crate::risk::manager::{BlockReason, RiskManager};
 
 /// Which venue an operation targets. Avoids leaking the underlying
 /// DexConnector type into the runner core so the mock in
@@ -89,6 +90,12 @@ pub struct LivePaperSummary {
     /// `[STATUS]` log line and the shutdown summary so the operator
     /// can confirm the file actually held entries off.
     pub entries_blocked_by_kill_switch: u64,
+    /// Count of entries blocked by the risk gates (#244 D-2..D-7).
+    /// Bucketed by gate kind so the operator can tell daily-DD vs
+    /// session-DD vs circuit-breaker apart from the [STATUS] line.
+    pub entries_blocked_by_daily_dd: u64,
+    pub entries_blocked_by_session_dd: u64,
+    pub entries_blocked_by_circuit_breaker: u64,
 }
 
 /// Control surface for the run loop.
@@ -124,6 +131,10 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
     let mut machine = PositionMachine::new();
     let mut summary = LivePaperSummary::default();
     let mut reporter = StatusReporter::from_env(&cfg);
+    let mut risk_manager = RiskManager::new(
+        cfg.risk_config(),
+        cfg.agent_name.clone(),
+    );
     if let Some(r) = reporter.as_ref() {
         log::info!(
             "[STATUS] writing snapshots to {} (cadence ≥ 60s)",
@@ -157,8 +168,9 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
     // the first read may be Err while the WS is still warming, in
     // which case PnL stays at zero until the next tick.
     if let Some(r) = reporter.as_mut() {
-        refresh_equity(&*hub, r).await;
+        refresh_equity(&*hub, r, &mut risk_manager).await;
         r.mark_dirty();
+        publish_risk(&risk_manager, r);
         if let Err(e) = r.write_snapshot_if_due(&machine, wall_clock_ms()) {
             log::warn!("[STATUS] initial snapshot write failed: {:?}", e);
         }
@@ -175,6 +187,11 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
 
             _ = tick_ivl.tick() => {
                 summary.ticks += 1;
+                // Per-tick risk housekeeping: rolls UTC session,
+                // consumes a RISK_ACK, ages out cooldowns. Side-
+                // effect-free idempotent — safe even when the inner
+                // tick errors out.
+                risk_manager.tick(now_unix_secs());
                 if let Err(e) = run_one_tick(
                     &cfg,
                     &*hub,
@@ -184,6 +201,7 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                     &mut summary,
                     &mut open_qty,
                     reporter.as_mut(),
+                    &mut risk_manager,
                 ).await {
                     // Read-mid / decision errors are logged but don't
                     // terminate the loop. Phase 3 will add a consec-fail
@@ -195,7 +213,7 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
             _ = status_ivl.tick() => {
                 log::info!(
                     "[STATUS] ticks={} samples={} hold={} enter_l={} enter_s={} exit={} \
-                     ks_blocked={} dev_bps={:?}",
+                     ks_blocked={} dd_blocked={} sd_blocked={} cb_blocked={} dev_bps={:?}",
                     summary.ticks,
                     summary.samples_committed,
                     summary.decisions_hold,
@@ -203,10 +221,14 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                     summary.decisions_enter_short,
                     summary.decisions_exit,
                     summary.entries_blocked_by_kill_switch,
+                    summary.entries_blocked_by_daily_dd,
+                    summary.entries_blocked_by_session_dd,
+                    summary.entries_blocked_by_circuit_breaker,
                     summary.last_dev_bps,
                 );
                 if let Some(r) = reporter.as_mut() {
-                    refresh_equity(&*hub, r).await;
+                    refresh_equity(&*hub, r, &mut risk_manager).await;
+                    publish_risk(&risk_manager, r);
                     let now_ts_ms = wall_clock_ms();
                     if let Err(e) = r.write_snapshot_if_due(&machine, now_ts_ms) {
                         log::warn!("[STATUS] snapshot write failed: {:?}", e);
@@ -216,7 +238,12 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
         }
     }
 
+    risk_manager.flush();
     Ok(summary)
+}
+
+fn now_unix_secs() -> i64 {
+    chrono::Utc::now().timestamp()
 }
 
 fn wall_clock_ms() -> u64 {
@@ -235,9 +262,15 @@ fn kill_switch_active(path: &str) -> bool {
 
 /// Pulls equity from both venues and threads the sum into the reporter
 /// so the dashboard's `pnl_total` / `pnl_today` line tracks the live
-/// account. Best-effort: per-venue failures are logged and treated as
-/// zero so a hung venue doesn't stall the snapshot.
-async fn refresh_equity<H: VenueHub + ?Sized>(hub: &H, reporter: &mut StatusReporter) {
+/// account. Also hands the equity sample to the risk manager so the
+/// session-DD rolling peak (#244 D-4) tracks the same number the
+/// dashboard renders. Best-effort: per-venue failures are logged and
+/// treated as zero so a hung venue doesn't stall the snapshot.
+async fn refresh_equity<H: VenueHub + ?Sized>(
+    hub: &H,
+    reporter: &mut StatusReporter,
+    risk_manager: &mut RiskManager,
+) {
     let mut total = Decimal::ZERO;
     let mut any_ok = false;
     for v in [Venue::Extended, Venue::Lighter] {
@@ -253,8 +286,19 @@ async fn refresh_equity<H: VenueHub + ?Sized>(hub: &H, reporter: &mut StatusRepo
         }
     }
     if any_ok {
-        reporter.update_equity(equity_decimal_to_f64(total));
+        let eq_f64 = equity_decimal_to_f64(total);
+        reporter.update_equity(eq_f64);
+        risk_manager.record_equity_sample(eq_f64, now_unix_secs());
     }
+}
+
+fn publish_risk(risk_manager: &RiskManager, reporter: &mut StatusReporter) {
+    reporter.set_daily_risk(risk_manager.daily_snapshot());
+    reporter.set_session_risk(risk_manager.session_snapshot());
+    reporter.set_circuit_breaker(Some(
+        risk_manager.circuit_breaker_snapshot(now_unix_secs()),
+    ));
+    reporter.set_risk_history(risk_manager.risk_history());
 }
 
 async fn run_one_tick<H: VenueHub + ?Sized>(
@@ -266,6 +310,7 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
     summary: &mut LivePaperSummary,
     open_qty: &mut Option<Decimal>,
     mut reporter: Option<&mut StatusReporter>,
+    risk_manager: &mut RiskManager,
 ) -> Result<()> {
     let ext_snap = hub.read_mid(Venue::Extended).await.context("read_mid Extended")?;
     let lt_snap = hub.read_mid(Venue::Lighter).await.context("read_mid Lighter")?;
@@ -324,6 +369,31 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
         decision = Decision::Hold;
     }
 
+    // Risk gates (#244 D-2..D-7). KILL_SWITCH ran first so the
+    // operator-pause path doesn't burn a risk-gate counter; risk
+    // gates fire only if the bot is otherwise willing to enter.
+    if matches!(decision, Decision::Enter(_)) {
+        if let Some(reason) = risk_manager.block_reason(now_unix_secs()) {
+            log::warn!(
+                "[XVENUE] risk gate {:?} blocking new entry. dev_bps={:?}",
+                reason,
+                dev
+            );
+            match reason {
+                BlockReason::DailyDdHalted => {
+                    summary.entries_blocked_by_daily_dd += 1;
+                }
+                BlockReason::SessionDdHalted => {
+                    summary.entries_blocked_by_session_dd += 1;
+                }
+                BlockReason::CircuitBreakerCooldown => {
+                    summary.entries_blocked_by_circuit_breaker += 1;
+                }
+            }
+            decision = Decision::Hold;
+        }
+    }
+
     match decision {
         Decision::Hold => {
             summary.decisions_hold += 1;
@@ -374,6 +444,11 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
                 if let Some(r) = reporter.as_deref_mut() {
                     r.record_fill(true, true, now_ts_ms);
                 }
+                // Paper PnL is 0 in DRY_RUN — Group B will replace
+                // this with realized USD once orders flow. The
+                // record_close call exercises the risk path so the
+                // counters / persistence stay live during paper.
+                risk_manager.record_close(0.0, now_unix_secs());
             }
             summary.last_decision_ts_ms = Some(now_ts_ms);
             summary.decisions_exit += 1;
@@ -407,8 +482,30 @@ fn paper_qty(notional_usd: f64, mid: Decimal) -> Result<Decimal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::risk::manager::{RiskConfig, RiskManager};
     use crate::xvenue::test_helpers::{mid, stale_mid, ScriptedHub};
     use tokio::time::timeout;
+
+    /// Builds a RiskManager pointing at a fresh temp dir so each test
+    /// owns its own risk_state.json / RISK_ACK paths and parallel
+    /// execution doesn't fight over /var/lib.
+    fn test_risk_manager() -> (tempfile::TempDir, RiskManager) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = RiskConfig {
+            max_daily_loss_bps: 300,
+            daily_reset_utc_hour: 0,
+            max_session_loss_bps: 500,
+            session_dd_lookback_secs: 86_400,
+            session_dd_sample_secs: 60,
+            cb_tier1_threshold: 5,
+            cb_tier2_threshold: 8,
+            cb_tier1_cooldown_secs: 1_800,
+            cb_tier2_cooldown_secs: 21_600,
+            risk_state_path: dir.path().join("risk_state.json"),
+            risk_ack_path: dir.path().join("RISK_ACK"),
+        };
+        (dir, RiskManager::new(cfg, "test".to_string()))
+    }
 
     fn min_cfg() -> XvenueConfig {
         let yaml = r#"
@@ -464,6 +561,7 @@ max_hold_sec: 60
         let mut machine = PositionMachine::new();
         let mut summary = LivePaperSummary::default();
         let mut open_qty = None;
+        let (_rm_dir, mut rm) = test_risk_manager();
         run_one_tick(
             &cfg,
             &*hub,
@@ -473,6 +571,7 @@ max_hold_sec: 60
             &mut summary,
             &mut open_qty,
             None,
+            &mut rm,
         )
         .await
         .unwrap();
@@ -491,6 +590,7 @@ max_hold_sec: 60
         let mut machine = PositionMachine::new();
         let mut summary = LivePaperSummary::default();
         let mut open_qty = None;
+        let (_rm_dir, mut rm) = test_risk_manager();
         run_one_tick(
             &cfg,
             &*hub,
@@ -500,6 +600,7 @@ max_hold_sec: 60
             &mut summary,
             &mut open_qty,
             None,
+            &mut rm,
         )
         .await
         .unwrap();
@@ -547,6 +648,7 @@ max_hold_sec: 60
 
         // Drive ticks through the entire scripted sequence.
         let total_ticks = warm_n + breach_n;
+        let (_rm_dir, mut rm) = test_risk_manager();
         for _ in 0..total_ticks {
             run_one_tick(
                 &cfg,
@@ -557,6 +659,7 @@ max_hold_sec: 60
                 &mut summary,
                 &mut open_qty,
                 None,
+                &mut rm,
             )
             .await
             .unwrap();
@@ -612,6 +715,7 @@ max_hold_sec: 60
         let mut summary = LivePaperSummary::default();
         let mut open_qty = None;
 
+        let (_rm_dir, mut rm) = test_risk_manager();
         for _ in 0..(warm_n + breach_n) {
             run_one_tick(
                 &cfg,
@@ -622,6 +726,7 @@ max_hold_sec: 60
                 &mut summary,
                 &mut open_qty,
                 None,
+                &mut rm,
             )
             .await
             .unwrap();
@@ -671,6 +776,7 @@ max_hold_sec: 60
         let mut summary = LivePaperSummary::default();
         let mut open_qty = None;
 
+        let (_rm_dir, mut rm) = test_risk_manager();
         for _ in 0..(warm_n + breach_n) {
             run_one_tick(
                 &cfg,
@@ -681,12 +787,83 @@ max_hold_sec: 60
                 &mut summary,
                 &mut open_qty,
                 None,
+                &mut rm,
             )
             .await
             .unwrap();
         }
         assert_eq!(summary.entries_blocked_by_kill_switch, 0);
         assert!(summary.decisions_enter_short >= 1);
+    }
+
+    #[tokio::test]
+    async fn risk_session_dd_blocks_entry_in_live_loop() {
+        // Same breach scenario as `dev_breach_fires_decision_enter`,
+        // but pre-arm a session-DD halt by feeding the manager two
+        // equity samples that produce a 6% drop. The live loop must
+        // see the halt and convert Enter → Hold, incrementing the
+        // session-dd counter.
+        let lt_mid = 2000.0;
+        let breach_ext = lt_mid * (1.0 + 30.0 / 10_000.0);
+        let mut ext = Vec::new();
+        let mut lt = Vec::new();
+        let warm_n = 30u64;
+        let breach_n = 8u64;
+        let t0 = 200_000u64;
+        for i in 0..warm_n {
+            ext.push(mid(t0 + i * 1000, lt_mid));
+            lt.push(mid(t0 + i * 1000, lt_mid));
+        }
+        for i in warm_n..(warm_n + breach_n) {
+            ext.push(mid(t0 + i * 1000, breach_ext));
+            lt.push(mid(t0 + i * 1000, lt_mid));
+        }
+        let hub = Arc::new(ScriptedHub::new(ext, lt));
+        let cfg = min_cfg();
+        let mut spread = SpreadEngine::new(cfg.spread_config());
+        let mut signal = SignalEngine::new(cfg.signal_config());
+        let mut machine = PositionMachine::new();
+        let mut summary = LivePaperSummary::default();
+        let mut open_qty = None;
+
+        // Pre-arm the manager: equity drops 6% > 500 bps threshold.
+        let (_rm_dir, mut rm) = test_risk_manager();
+        rm.record_equity_sample(1_000.0, 0);
+        rm.record_equity_sample(940.0, 60);
+        // Sanity — the manager itself should report the halt.
+        assert_eq!(
+            rm.block_reason(60),
+            Some(BlockReason::SessionDdHalted),
+            "test pre-arm: session-DD halt did not activate"
+        );
+
+        for _ in 0..(warm_n + breach_n) {
+            run_one_tick(
+                &cfg,
+                &*hub,
+                &mut spread,
+                &mut signal,
+                &mut machine,
+                &mut summary,
+                &mut open_qty,
+                None,
+                &mut rm,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(summary.decisions_enter_long, 0);
+        assert_eq!(summary.decisions_enter_short, 0);
+        assert!(open_qty.is_none());
+        assert!(
+            summary.entries_blocked_by_session_dd >= 1,
+            "expected sd_blocked ≥ 1, got {}",
+            summary.entries_blocked_by_session_dd
+        );
+        assert_eq!(summary.entries_blocked_by_kill_switch, 0);
+        assert_eq!(summary.entries_blocked_by_daily_dd, 0);
+        assert_eq!(summary.entries_blocked_by_circuit_breaker, 0);
     }
 
     #[tokio::test]

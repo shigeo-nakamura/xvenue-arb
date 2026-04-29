@@ -62,6 +62,19 @@ emergency_retry_interval_ms: 30000     # slow-mm 167-min stuck fix (docs/executi
 rest_consec_fail_to_escalate: 3
 reduce_only_consec_fail_to_kill: 5
 
+# ---- Risk gates (#244 D-2..D-7) ----
+max_daily_loss_bps: 300                # -3% of session_start_equity, auto-resets at UTC midnight
+daily_reset_utc_hour: 0
+max_session_loss_bps: 500              # -5% from rolling-peak; sticky until RISK_ACK
+session_dd_lookback_secs: 86400        # 24h rolling peak
+session_dd_sample_secs: 60
+cb_tier1_threshold: 5                  # consec losses; cooldown active for tier1 / tier2
+cb_tier1_cooldown_secs: 1800           # 30 min
+cb_tier2_threshold: 8
+cb_tier2_cooldown_secs: 21600          # 6h
+risk_state_path: /var/lib/xvenue-arb/risk_state.json
+risk_ack_path: /opt/debot/RISK_ACK     # pairtrade-symmetric (#244 D-5)
+
 # ---- Reference guard (Binance 1m cross-check) ----
 binance_reference_symbol: ETHUSDT
 reference_max_dev_bps: 100.0           # ETH-specific (BTC would be 30; see #166 part 9)

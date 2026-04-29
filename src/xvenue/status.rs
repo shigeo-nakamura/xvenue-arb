@@ -33,6 +33,9 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use crate::error_counter::{self, ErrorSummary};
+use crate::risk::manager::{
+    CircuitBreakerSnapshot, DailyRiskSnapshot, RiskHistoryEvent, SessionRiskSnapshot,
+};
 
 use super::config::XvenueConfig;
 use super::signal::SpreadDirection;
@@ -126,6 +129,18 @@ pub struct StatusSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_dev_bps: Option<f64>,
     pub samples_committed: u64,
+
+    // ---- Risk gates (#244 D-2..D-7). All optional — emitted only
+    // when the manager has populated them so a fresh boot does not
+    // surface noisy zeros to the dashboard. ----
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daily_risk: Option<DailyRiskSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_risk: Option<SessionRiskSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub circuit_breaker: Option<CircuitBreakerSnapshot>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub risk_history: Vec<RiskHistoryEvent>,
 }
 
 /// Persisted equity baseline. One file per status_path, same shape as
@@ -168,6 +183,13 @@ pub struct StatusReporter {
     samples_committed: u64,
 
     last_snapshot: Option<Instant>,
+
+    // Risk-manager-supplied snapshots. Set via `set_risk_*` from the
+    // live loop so this module stays free of risk-domain concerns.
+    daily_risk: Option<DailyRiskSnapshot>,
+    session_risk: Option<SessionRiskSnapshot>,
+    circuit_breaker: Option<CircuitBreakerSnapshot>,
+    risk_history: Vec<RiskHistoryEvent>,
 }
 
 impl StatusReporter {
@@ -226,6 +248,10 @@ impl StatusReporter {
             last_dev_bps: None,
             samples_committed: 0,
             last_snapshot: None,
+            daily_risk: None,
+            session_risk: None,
+            circuit_breaker: None,
+            risk_history: Vec::new(),
         };
         reporter.load_equity_baseline();
         if let Err(err) = reporter.ensure_status_file() {
@@ -284,6 +310,22 @@ impl StatusReporter {
 
     pub fn record_samples_committed(&mut self, n: u64) {
         self.samples_committed = n;
+    }
+
+    pub fn set_daily_risk(&mut self, v: Option<DailyRiskSnapshot>) {
+        self.daily_risk = v;
+    }
+
+    pub fn set_session_risk(&mut self, v: Option<SessionRiskSnapshot>) {
+        self.session_risk = v;
+    }
+
+    pub fn set_circuit_breaker(&mut self, v: Option<CircuitBreakerSnapshot>) {
+        self.circuit_breaker = v;
+    }
+
+    pub fn set_risk_history(&mut self, v: Vec<RiskHistoryEvent>) {
+        self.risk_history = v;
     }
 
     /// Updates equity → PnL bookkeeping. Same contract as pairtrade:
@@ -390,6 +432,10 @@ impl StatusReporter {
             spread_series: self.spread_series.iter().cloned().collect(),
             current_dev_bps: self.last_dev_bps,
             samples_committed: self.samples_committed,
+            daily_risk: self.daily_risk.clone(),
+            session_risk: self.session_risk.clone(),
+            circuit_breaker: self.circuit_breaker.clone(),
+            risk_history: self.risk_history.clone(),
         }
     }
 

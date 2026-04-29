@@ -20,6 +20,7 @@ use serde::Deserialize;
 
 use super::signal::SignalConfig;
 use super::spread::SpreadConfig;
+use crate::risk::manager::RiskConfig;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct XvenueConfig {
@@ -121,6 +122,40 @@ pub struct XvenueConfig {
     #[serde(default = "default_reduce_only_consec_fail_to_kill")]
     pub reduce_only_consec_fail_to_kill: u32,
 
+    // ---- Risk gates (#244 D-2..D-7) ----
+    /// 0 disables. Daily DD blocks new entries when realized PnL
+    /// today crosses below `-max_daily_loss_bps` of session start
+    /// equity (auto-clears at the next UTC reset).
+    #[serde(default = "default_max_daily_loss_bps")]
+    pub max_daily_loss_bps: u32,
+    #[serde(default = "default_daily_reset_utc_hour")]
+    pub daily_reset_utc_hour: u8,
+    /// Sticky session-DD halt; cleared only via `risk_ack_path`.
+    #[serde(default = "default_max_session_loss_bps")]
+    pub max_session_loss_bps: u32,
+    #[serde(default = "default_session_dd_lookback_secs")]
+    pub session_dd_lookback_secs: u64,
+    #[serde(default = "default_session_dd_sample_secs")]
+    pub session_dd_sample_secs: u64,
+    /// Consecutive-loss cooldowns. Lower priority for xvenue-arb (>=
+    /// 90% win profile) but emitted for dashboard parity.
+    #[serde(default = "default_cb_tier1_threshold")]
+    pub cb_tier1_threshold: u32,
+    #[serde(default = "default_cb_tier1_cooldown_secs")]
+    pub cb_tier1_cooldown_secs: i64,
+    #[serde(default = "default_cb_tier2_threshold")]
+    pub cb_tier2_threshold: u32,
+    #[serde(default = "default_cb_tier2_cooldown_secs")]
+    pub cb_tier2_cooldown_secs: i64,
+    /// `risk_state.json` location — pairtrade uses `/opt/debot/`,
+    /// xvenue-arb defaults to `/var/lib/xvenue-arb/` so the two
+    /// fleets don't fight over the file.
+    #[serde(default = "default_risk_state_path")]
+    pub risk_state_path: String,
+    /// Pairtrade-symmetric `RISK_ACK` path (#244 D-5).
+    #[serde(default = "default_risk_ack_path")]
+    pub risk_ack_path: String,
+
     // ---- Reference guard (Binance 1m cross-check) ----
     /// Binance pair, e.g. "BTCUSDT" or "ETHUSDT".
     pub binance_reference_symbol: String,
@@ -181,6 +216,22 @@ impl XvenueConfig {
             bucket_ms: self.spread_bucket_ms,
             rolling_window_sec: self.rolling_window_sec,
             max_abs_spread_bps: self.max_abs_spread_bps,
+        }
+    }
+
+    pub fn risk_config(&self) -> RiskConfig {
+        RiskConfig {
+            max_daily_loss_bps: self.max_daily_loss_bps,
+            daily_reset_utc_hour: self.daily_reset_utc_hour,
+            max_session_loss_bps: self.max_session_loss_bps,
+            session_dd_lookback_secs: self.session_dd_lookback_secs,
+            session_dd_sample_secs: self.session_dd_sample_secs,
+            cb_tier1_threshold: self.cb_tier1_threshold,
+            cb_tier1_cooldown_secs: self.cb_tier1_cooldown_secs,
+            cb_tier2_threshold: self.cb_tier2_threshold,
+            cb_tier2_cooldown_secs: self.cb_tier2_cooldown_secs,
+            risk_state_path: self.risk_state_path.clone().into(),
+            risk_ack_path: self.risk_ack_path.clone().into(),
         }
     }
 
@@ -281,6 +332,39 @@ fn default_reduce_only_consec_fail_to_kill() -> u32 {
 }
 fn default_reference_consec_buckets_for_halt() -> u32 {
     3
+}
+fn default_max_daily_loss_bps() -> u32 {
+    300
+}
+fn default_daily_reset_utc_hour() -> u8 {
+    0
+}
+fn default_max_session_loss_bps() -> u32 {
+    500
+}
+fn default_session_dd_lookback_secs() -> u64 {
+    86_400
+}
+fn default_session_dd_sample_secs() -> u64 {
+    60
+}
+fn default_cb_tier1_threshold() -> u32 {
+    5
+}
+fn default_cb_tier1_cooldown_secs() -> i64 {
+    1_800
+}
+fn default_cb_tier2_threshold() -> u32 {
+    8
+}
+fn default_cb_tier2_cooldown_secs() -> i64 {
+    21_600
+}
+fn default_risk_state_path() -> String {
+    "/var/lib/xvenue-arb/risk_state.json".to_string()
+}
+fn default_risk_ack_path() -> String {
+    "/opt/debot/RISK_ACK".to_string()
 }
 
 #[cfg(test)]
