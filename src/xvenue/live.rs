@@ -46,6 +46,37 @@ pub enum Venue {
     Lighter,
 }
 
+/// Per-venue WS warm-up tracker (bot-strategy#248). While a venue has
+/// never delivered a successful `read_mid`, errors are demoted to
+/// `debug!` and the tick is skipped silently — the WS subscription is
+/// still bootstrapping and `[WARN] tick error: read_mid` is just noise.
+/// Once the first successful read lands, the flag flips sticky and
+/// subsequent errors propagate normally so a real WS outage still
+/// surfaces. Reconnect transients can produce one stray WARN per
+/// reconnect; the dedicated `ws_health.rs` monitor (#244 Group C) will
+/// take over once it lands and these can be demoted in full.
+#[derive(Debug, Default)]
+pub struct VenueWarmup {
+    pub ext_ready: bool,
+    pub lt_ready: bool,
+}
+
+impl VenueWarmup {
+    fn is_ready(&self, venue: Venue) -> bool {
+        match venue {
+            Venue::Extended => self.ext_ready,
+            Venue::Lighter => self.lt_ready,
+        }
+    }
+
+    fn mark_ready(&mut self, venue: Venue) {
+        match venue {
+            Venue::Extended => self.ext_ready = true,
+            Venue::Lighter => self.lt_ready = true,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MidSnapshot {
     pub ts_ms: u64,
@@ -192,6 +223,7 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
         tokio::time::interval(Duration::from_millis(loop_cfg.status_log_interval_ms));
     status_ivl.tick().await; // discard the immediate-fire tick
     let mut open_qty: Option<Decimal> = None;
+    let mut warmup = VenueWarmup::default();
 
     // Drop an initial snapshot so the dashboard sees the DRY_RUN pill /
     // agent identity on boot instead of waiting for the first
@@ -235,6 +267,7 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                     &mut risk_manager,
                     &mut reference_guard,
                     &mut stuck,
+                    &mut warmup,
                 ).await {
                     // Read-mid / decision errors are logged but don't
                     // terminate the loop. Phase 3 will add a consec-fail
@@ -350,11 +383,38 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
     risk_manager: &mut RiskManager,
     reference_guard: &mut ReferenceGuard,
     stuck: &mut StuckTripwire,
+    warmup: &mut VenueWarmup,
 ) -> Result<()> {
     // Drain any pending SIGUSR1 — arms the STUCK file if needed.
     let _ = stuck.poll_sigusr1();
-    let mut ext_snap = hub.read_mid(Venue::Extended).await.context("read_mid Extended")?;
-    let mut lt_snap = hub.read_mid(Venue::Lighter).await.context("read_mid Lighter")?;
+    let mut ext_snap = match hub.read_mid(Venue::Extended).await {
+        Ok(s) => {
+            warmup.mark_ready(Venue::Extended);
+            s
+        }
+        Err(e) if !warmup.is_ready(Venue::Extended) => {
+            log::debug!(
+                "[XVENUE] read_mid Extended pending (WS warm-up): {:?}",
+                e
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(e).context("read_mid Extended"),
+    };
+    let mut lt_snap = match hub.read_mid(Venue::Lighter).await {
+        Ok(s) => {
+            warmup.mark_ready(Venue::Lighter);
+            s
+        }
+        Err(e) if !warmup.is_ready(Venue::Lighter) => {
+            log::debug!(
+                "[XVENUE] read_mid Lighter pending (WS warm-up): {:?}",
+                e
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(e).context("read_mid Lighter"),
+    };
 
     // Reference guard cross-check (#244 C). Reads the latest Binance
     // 1m mid and suppresses each venue's book_ok when its mid drifts
@@ -579,7 +639,7 @@ fn paper_qty(notional_usd: f64, mid: Decimal) -> Result<Decimal> {
 mod tests {
     use super::*;
     use crate::risk::manager::{RiskConfig, RiskManager};
-    use crate::xvenue::test_helpers::{mid, stale_mid, ScriptedHub};
+    use crate::xvenue::test_helpers::{mid, stale_mid, ScriptedHub, WarmupHub};
     use tokio::time::timeout;
 
     /// Test fixture: build a paused (manual) ReferenceGuard so unit
@@ -683,6 +743,7 @@ max_hold_sec: 60
         let (_rm_dir, mut rm) = test_risk_manager();
         let mut rg = test_reference_guard();
         let (_st_dir, mut stuck) = test_stuck();
+        let mut warmup = VenueWarmup::default();
         run_one_tick(
             &cfg,
             &*hub,
@@ -695,6 +756,7 @@ max_hold_sec: 60
             &mut rm,
             &mut rg,
             &mut stuck,
+            &mut warmup,
         )
         .await
         .unwrap();
@@ -716,6 +778,7 @@ max_hold_sec: 60
         let (_rm_dir, mut rm) = test_risk_manager();
         let mut rg = test_reference_guard();
         let (_st_dir, mut stuck) = test_stuck();
+        let mut warmup = VenueWarmup::default();
         run_one_tick(
             &cfg,
             &*hub,
@@ -728,6 +791,7 @@ max_hold_sec: 60
             &mut rm,
             &mut rg,
             &mut stuck,
+            &mut warmup,
         )
         .await
         .unwrap();
@@ -778,6 +842,7 @@ max_hold_sec: 60
         let (_rm_dir, mut rm) = test_risk_manager();
         let mut rg = test_reference_guard();
         let (_st_dir, mut stuck) = test_stuck();
+        let mut warmup = VenueWarmup::default();
         for _ in 0..total_ticks {
             run_one_tick(
                 &cfg,
@@ -791,6 +856,7 @@ max_hold_sec: 60
                 &mut rm,
                 &mut rg,
                 &mut stuck,
+                &mut warmup,
             )
             .await
             .unwrap();
@@ -849,6 +915,7 @@ max_hold_sec: 60
         let (_rm_dir, mut rm) = test_risk_manager();
         let mut rg = test_reference_guard();
         let (_st_dir, mut stuck) = test_stuck();
+        let mut warmup = VenueWarmup::default();
         for _ in 0..(warm_n + breach_n) {
             run_one_tick(
                 &cfg,
@@ -862,6 +929,7 @@ max_hold_sec: 60
                 &mut rm,
                 &mut rg,
                 &mut stuck,
+                &mut warmup,
             )
             .await
             .unwrap();
@@ -914,6 +982,7 @@ max_hold_sec: 60
         let (_rm_dir, mut rm) = test_risk_manager();
         let mut rg = test_reference_guard();
         let (_st_dir, mut stuck) = test_stuck();
+        let mut warmup = VenueWarmup::default();
         for _ in 0..(warm_n + breach_n) {
             run_one_tick(
                 &cfg,
@@ -927,6 +996,7 @@ max_hold_sec: 60
                 &mut rm,
                 &mut rg,
                 &mut stuck,
+                &mut warmup,
             )
             .await
             .unwrap();
@@ -978,6 +1048,7 @@ max_hold_sec: 60
 
         let mut rg = test_reference_guard();
         let (_st_dir, mut stuck) = test_stuck();
+        let mut warmup = VenueWarmup::default();
         for _ in 0..(warm_n + breach_n) {
             run_one_tick(
                 &cfg,
@@ -991,6 +1062,7 @@ max_hold_sec: 60
                 &mut rm,
                 &mut rg,
                 &mut stuck,
+                &mut warmup,
             )
             .await
             .unwrap();
@@ -1038,6 +1110,182 @@ max_hold_sec: 60
             summary.ticks >= 3,
             "expected at least 3 ticks, got {}",
             summary.ticks
+        );
+    }
+
+    #[tokio::test]
+    async fn read_mid_errors_during_warmup_skip_tick_silently() {
+        // Simulates the WS warm-up window (#248): each venue's first 2
+        // read_mid calls return Err — same shape as the live
+        // "order book snapshot unavailable (no recent update)" — and
+        // subsequent calls succeed via the inner ScriptedHub. We expect
+        // run_one_tick to swallow the warm-up errors with Ok(()) so the
+        // outer loop's WARN never fires, and to commit a sample once
+        // both venues have produced their first successful read.
+        let scripted = ScriptedHub::new(
+            vec![mid(1000, 2000.0), mid(2000, 2001.0)],
+            vec![mid(1000, 2000.0), mid(2000, 2000.5)],
+        );
+        let hub = Arc::new(WarmupHub::new(scripted, 2));
+        let cfg = min_cfg();
+        let mut spread = SpreadEngine::new(cfg.spread_config());
+        let mut signal = SignalEngine::new(cfg.signal_config());
+        let mut machine = PositionMachine::new();
+        let mut summary = LivePaperSummary::default();
+        let mut open_qty = None;
+        let (_rm_dir, mut rm) = test_risk_manager();
+        let mut rg = test_reference_guard();
+        let (_st_dir, mut stuck) = test_stuck();
+        let mut warmup = VenueWarmup::default();
+
+        // First two ticks: Extended fails before Lighter is even
+        // attempted (run_one_tick reads Extended first), so neither
+        // venue is marked ready.
+        for _ in 0..2 {
+            run_one_tick(
+                &cfg,
+                &*hub,
+                &mut spread,
+                &mut signal,
+                &mut machine,
+                &mut summary,
+                &mut open_qty,
+                None,
+                &mut rm,
+                &mut rg,
+                &mut stuck,
+                &mut warmup,
+            )
+            .await
+            .expect("warm-up errors must not propagate");
+        }
+        assert!(!warmup.ext_ready);
+        assert!(!warmup.lt_ready);
+        assert_eq!(summary.samples_committed, 0);
+
+        // Third tick: Extended OK → flips ext_ready, then Lighter still
+        // has 2 fails left (only Extended was ever attempted in the
+        // first two ticks since reads are sequential), so Lighter
+        // returns Err. Because lt_ready is still false, run_one_tick
+        // again returns Ok(()) silently.
+        run_one_tick(
+            &cfg,
+            &*hub,
+            &mut spread,
+            &mut signal,
+            &mut machine,
+            &mut summary,
+            &mut open_qty,
+            None,
+            &mut rm,
+            &mut rg,
+            &mut stuck,
+            &mut warmup,
+        )
+        .await
+        .expect("warm-up errors must not propagate");
+        assert!(warmup.ext_ready);
+        assert!(!warmup.lt_ready);
+
+        // Two more ticks drain Lighter's fail counter; the next tick
+        // after that produces a successful read on both legs.
+        for _ in 0..2 {
+            run_one_tick(
+                &cfg,
+                &*hub,
+                &mut spread,
+                &mut signal,
+                &mut machine,
+                &mut summary,
+                &mut open_qty,
+                None,
+                &mut rm,
+                &mut rg,
+                &mut stuck,
+                &mut warmup,
+            )
+            .await
+            .expect("warm-up errors must not propagate");
+        }
+        run_one_tick(
+            &cfg,
+            &*hub,
+            &mut spread,
+            &mut signal,
+            &mut machine,
+            &mut summary,
+            &mut open_qty,
+            None,
+            &mut rm,
+            &mut rg,
+            &mut stuck,
+            &mut warmup,
+        )
+        .await
+        .expect("post-warmup tick must succeed");
+        assert!(warmup.ext_ready);
+        assert!(warmup.lt_ready);
+        assert_eq!(summary.samples_committed, 1);
+    }
+
+    #[tokio::test]
+    async fn read_mid_errors_after_warmup_propagate_as_warn() {
+        // Once a venue has been marked ready, subsequent read_mid
+        // failures must surface as Err so the outer loop's WARN line
+        // fires (WS genuinely went stale).
+        struct AlwaysFailHub;
+        #[async_trait::async_trait]
+        impl VenueHub for AlwaysFailHub {
+            async fn read_mid(&self, _venue: Venue) -> Result<MidSnapshot> {
+                Err(anyhow::anyhow!(
+                    "order book snapshot unavailable (no recent update)"
+                ))
+            }
+            async fn read_equity_usd(
+                &self,
+                _venue: Venue,
+            ) -> Result<Option<Decimal>> {
+                Ok(None)
+            }
+        }
+
+        let cfg = min_cfg();
+        let mut spread = SpreadEngine::new(cfg.spread_config());
+        let mut signal = SignalEngine::new(cfg.signal_config());
+        let mut machine = PositionMachine::new();
+        let mut summary = LivePaperSummary::default();
+        let mut open_qty = None;
+        let (_rm_dir, mut rm) = test_risk_manager();
+        let mut rg = test_reference_guard();
+        let (_st_dir, mut stuck) = test_stuck();
+        // Pre-arm warmup as if a successful read has already happened
+        // on both venues; the failing hub now drives the post-warmup
+        // path where errors must propagate.
+        let mut warmup = VenueWarmup {
+            ext_ready: true,
+            lt_ready: true,
+        };
+        let hub = AlwaysFailHub;
+        let err = run_one_tick(
+            &cfg,
+            &hub,
+            &mut spread,
+            &mut signal,
+            &mut machine,
+            &mut summary,
+            &mut open_qty,
+            None,
+            &mut rm,
+            &mut rg,
+            &mut stuck,
+            &mut warmup,
+        )
+        .await
+        .expect_err("post-warmup read_mid Err must propagate as Err");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("read_mid Extended"),
+            "expected context-wrapped error, got: {chain}"
         );
     }
 }

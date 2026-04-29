@@ -10,9 +10,10 @@
 
 #![cfg(test)]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -87,6 +88,64 @@ impl VenueHub for ScriptedHub {
             Venue::Extended => self.equity_ext,
             Venue::Lighter => self.equity_lt,
         }))
+    }
+}
+
+/// VenueHub mock that fails the first `fail_n_per_venue` calls per
+/// venue with `Err`, then delegates to a wrapped [`ScriptedHub`].
+/// Used to exercise the WS warm-up suppression path (bot-strategy#248).
+pub struct WarmupHub {
+    inner: ScriptedHub,
+    ext_remaining: AtomicUsize,
+    lt_remaining: AtomicUsize,
+}
+
+impl WarmupHub {
+    pub fn new(inner: ScriptedHub, fail_n_per_venue: usize) -> Self {
+        Self {
+            inner,
+            ext_remaining: AtomicUsize::new(fail_n_per_venue),
+            lt_remaining: AtomicUsize::new(fail_n_per_venue),
+        }
+    }
+
+    fn consume_or_pass(counter: &AtomicUsize) -> bool {
+        // Returns true when this call should fail (warm-up window),
+        // false once the counter has been drained and we should
+        // delegate to the inner hub.
+        loop {
+            let cur = counter.load(Ordering::Relaxed);
+            if cur == 0 {
+                return false;
+            }
+            if counter
+                .compare_exchange(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl VenueHub for WarmupHub {
+    async fn read_mid(&self, venue: Venue) -> Result<MidSnapshot> {
+        let counter = match venue {
+            Venue::Extended => &self.ext_remaining,
+            Venue::Lighter => &self.lt_remaining,
+        };
+        if Self::consume_or_pass(counter) {
+            return Err(anyhow!(
+                "get_order_book({:?}, 1): Other(\"order book snapshot unavailable (no recent update)\")",
+                venue
+            ));
+        }
+        self.inner.read_mid(venue).await
+    }
+
+    async fn read_equity_usd(&self, venue: Venue) -> Result<Option<Decimal>> {
+        self.inner.read_equity_usd(venue).await
     }
 }
 
