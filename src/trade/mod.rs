@@ -1,4 +1,2 @@
-pub mod execution {
-    pub mod dex_connector_box;
-}
+pub mod execution;
 pub use execution::dex_connector_box;

@@ -37,6 +37,10 @@ dex-connector = { path = "../dex-connector", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
+# `tokio::test(start_paused = true)` + `tokio::time::pause()` for the
+# extended_maker / lighter_fill chase-loop unit tests. Not part of
+# tokio's `full` feature, hence the explicit dev-dep.
+tokio = { version = "1.0", features = ["full", "test-util"] }
 
 [features]
 # xvenue-arb runs both venues from a single Tokyo instance, so both SDKs
