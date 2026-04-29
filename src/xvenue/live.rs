@@ -34,6 +34,7 @@ use super::spread::SpreadEngine;
 use super::state::{Event, PositionMachine};
 use super::status::{equity_decimal_to_f64, StatusReporter};
 use crate::risk::manager::{BlockReason, RiskManager};
+use crate::risk::reference_guard::{RefCheckOutcome, ReferenceGuard};
 
 /// Which venue an operation targets. Avoids leaking the underlying
 /// DexConnector type into the runner core so the mock in
@@ -96,6 +97,12 @@ pub struct LivePaperSummary {
     pub entries_blocked_by_daily_dd: u64,
     pub entries_blocked_by_session_dd: u64,
     pub entries_blocked_by_circuit_breaker: u64,
+    /// Number of ticks where the reference guard suppressed the
+    /// Extended book (`book_ok` flipped to false). Bucketed per
+    /// venue so a sustained one-sided stuck quote is visible
+    /// without leaving the bot's own logs.
+    pub ext_book_suppressed_by_ref_guard: u64,
+    pub lt_book_suppressed_by_ref_guard: u64,
 }
 
 /// Control surface for the run loop.
@@ -134,6 +141,11 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
     let mut risk_manager = RiskManager::new(
         cfg.risk_config(),
         cfg.agent_name.clone(),
+    );
+    let mut reference_guard = ReferenceGuard::spawn(
+        cfg.binance_reference_symbol.clone(),
+        cfg.reference_max_dev_bps,
+        cfg.reference_consec_buckets_for_halt,
     );
     if let Some(r) = reporter.as_ref() {
         log::info!(
@@ -202,6 +214,7 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                     &mut open_qty,
                     reporter.as_mut(),
                     &mut risk_manager,
+                    &mut reference_guard,
                 ).await {
                     // Read-mid / decision errors are logged but don't
                     // terminate the loop. Phase 3 will add a consec-fail
@@ -213,7 +226,8 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
             _ = status_ivl.tick() => {
                 log::info!(
                     "[STATUS] ticks={} samples={} hold={} enter_l={} enter_s={} exit={} \
-                     ks_blocked={} dd_blocked={} sd_blocked={} cb_blocked={} dev_bps={:?}",
+                     ks_blocked={} dd_blocked={} sd_blocked={} cb_blocked={} \
+                     ref_supp_ext={} ref_supp_lt={} dev_bps={:?}",
                     summary.ticks,
                     summary.samples_committed,
                     summary.decisions_hold,
@@ -224,6 +238,8 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                     summary.entries_blocked_by_daily_dd,
                     summary.entries_blocked_by_session_dd,
                     summary.entries_blocked_by_circuit_breaker,
+                    summary.ext_book_suppressed_by_ref_guard,
+                    summary.lt_book_suppressed_by_ref_guard,
                     summary.last_dev_bps,
                 );
                 if let Some(r) = reporter.as_mut() {
@@ -311,9 +327,50 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
     open_qty: &mut Option<Decimal>,
     mut reporter: Option<&mut StatusReporter>,
     risk_manager: &mut RiskManager,
+    reference_guard: &mut ReferenceGuard,
 ) -> Result<()> {
-    let ext_snap = hub.read_mid(Venue::Extended).await.context("read_mid Extended")?;
-    let lt_snap = hub.read_mid(Venue::Lighter).await.context("read_mid Lighter")?;
+    let mut ext_snap = hub.read_mid(Venue::Extended).await.context("read_mid Extended")?;
+    let mut lt_snap = hub.read_mid(Venue::Lighter).await.context("read_mid Lighter")?;
+
+    // Reference guard cross-check (#244 C). Reads the latest Binance
+    // 1m mid and suppresses each venue's book_ok when its mid drifts
+    // past `reference_max_dev_bps` for `reference_consec_buckets_for_halt`
+    // consecutive minutes. Mirrors the BT pre-filter, so live and BT
+    // see the same suppression behavior on stuck quotes.
+    let ref_state = reference_guard.current_reference().await;
+    if let (Some(ext_mid_f), Some(lt_mid_f)) = (
+        rust_decimal::prelude::ToPrimitive::to_f64(&ext_snap.mid),
+        rust_decimal::prelude::ToPrimitive::to_f64(&lt_snap.mid),
+    ) {
+        let now_ts_secs = now_unix_secs();
+        let (ext_oc, lt_oc) = reference_guard.evaluate(
+            ext_snap.ts_ms.min(lt_snap.ts_ms),
+            ext_mid_f,
+            lt_mid_f,
+            ref_state.as_ref(),
+            now_ts_secs,
+        );
+        if ext_oc == RefCheckOutcome::Suppress && ext_snap.book_ok {
+            log::warn!(
+                "[XVENUE] reference_guard suppressing Extended book: \
+                 venue_mid={:.4} ref_mid={:?}",
+                ext_mid_f,
+                ref_state.as_ref().map(|r| r.mid)
+            );
+            ext_snap.book_ok = false;
+            summary.ext_book_suppressed_by_ref_guard += 1;
+        }
+        if lt_oc == RefCheckOutcome::Suppress && lt_snap.book_ok {
+            log::warn!(
+                "[XVENUE] reference_guard suppressing Lighter book: \
+                 venue_mid={:.4} ref_mid={:?}",
+                lt_mid_f,
+                ref_state.as_ref().map(|r| r.mid)
+            );
+            lt_snap.book_ok = false;
+            summary.lt_book_suppressed_by_ref_guard += 1;
+        }
+    }
 
     if let Some(r) = reporter.as_deref_mut() {
         r.record_book_ok(
@@ -486,6 +543,13 @@ mod tests {
     use crate::xvenue::test_helpers::{mid, stale_mid, ScriptedHub};
     use tokio::time::timeout;
 
+    /// Test fixture: build a paused (manual) ReferenceGuard so unit
+    /// tests don't spawn a real polling task / hit the network. The
+    /// guard returns NoReference until a test injects a mid.
+    fn test_reference_guard() -> ReferenceGuard {
+        ReferenceGuard::manual(100.0, 3)
+    }
+
     /// Builds a RiskManager pointing at a fresh temp dir so each test
     /// owns its own risk_state.json / RISK_ACK paths and parallel
     /// execution doesn't fight over /var/lib.
@@ -562,6 +626,7 @@ max_hold_sec: 60
         let mut summary = LivePaperSummary::default();
         let mut open_qty = None;
         let (_rm_dir, mut rm) = test_risk_manager();
+        let mut rg = test_reference_guard();
         run_one_tick(
             &cfg,
             &*hub,
@@ -572,6 +637,7 @@ max_hold_sec: 60
             &mut open_qty,
             None,
             &mut rm,
+            &mut rg,
         )
         .await
         .unwrap();
@@ -591,6 +657,7 @@ max_hold_sec: 60
         let mut summary = LivePaperSummary::default();
         let mut open_qty = None;
         let (_rm_dir, mut rm) = test_risk_manager();
+        let mut rg = test_reference_guard();
         run_one_tick(
             &cfg,
             &*hub,
@@ -601,6 +668,7 @@ max_hold_sec: 60
             &mut open_qty,
             None,
             &mut rm,
+            &mut rg,
         )
         .await
         .unwrap();
@@ -649,6 +717,7 @@ max_hold_sec: 60
         // Drive ticks through the entire scripted sequence.
         let total_ticks = warm_n + breach_n;
         let (_rm_dir, mut rm) = test_risk_manager();
+        let mut rg = test_reference_guard();
         for _ in 0..total_ticks {
             run_one_tick(
                 &cfg,
@@ -660,6 +729,7 @@ max_hold_sec: 60
                 &mut open_qty,
                 None,
                 &mut rm,
+                &mut rg,
             )
             .await
             .unwrap();
@@ -716,6 +786,7 @@ max_hold_sec: 60
         let mut open_qty = None;
 
         let (_rm_dir, mut rm) = test_risk_manager();
+        let mut rg = test_reference_guard();
         for _ in 0..(warm_n + breach_n) {
             run_one_tick(
                 &cfg,
@@ -727,6 +798,7 @@ max_hold_sec: 60
                 &mut open_qty,
                 None,
                 &mut rm,
+                &mut rg,
             )
             .await
             .unwrap();
@@ -777,6 +849,7 @@ max_hold_sec: 60
         let mut open_qty = None;
 
         let (_rm_dir, mut rm) = test_risk_manager();
+        let mut rg = test_reference_guard();
         for _ in 0..(warm_n + breach_n) {
             run_one_tick(
                 &cfg,
@@ -788,6 +861,7 @@ max_hold_sec: 60
                 &mut open_qty,
                 None,
                 &mut rm,
+                &mut rg,
             )
             .await
             .unwrap();
@@ -837,6 +911,7 @@ max_hold_sec: 60
             "test pre-arm: session-DD halt did not activate"
         );
 
+        let mut rg = test_reference_guard();
         for _ in 0..(warm_n + breach_n) {
             run_one_tick(
                 &cfg,
@@ -848,6 +923,7 @@ max_hold_sec: 60
                 &mut open_qty,
                 None,
                 &mut rm,
+                &mut rg,
             )
             .await
             .unwrap();

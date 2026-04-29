@@ -11,3 +11,4 @@
 //! sprint plan in #244.
 
 pub mod manager;
+pub mod reference_guard;

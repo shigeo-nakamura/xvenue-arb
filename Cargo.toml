@@ -27,6 +27,11 @@ libc = "0.2"
 rayon = "1.10"
 
 debot-utils = "1.0.*"
+# Binance 1m kline polling for the live reference_guard (#244 D / #166
+# part 1 — already wired into BT). default-features=false + json keeps
+# the dep small; TLS comes via dex-connector's rustls already in the
+# tree.
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 
 dex-connector = { path = "../dex-connector", default-features = false }
 
