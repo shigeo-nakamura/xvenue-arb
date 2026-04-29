@@ -33,9 +33,11 @@ use super::signal::{Decision, ExitReason, SignalEngine, SpreadDirection};
 use super::spread::SpreadEngine;
 use super::state::{Event, PositionMachine};
 use super::status::{equity_decimal_to_f64, StatusReporter};
-use crate::risk::kill_switch::StuckTripwire;
+use crate::risk::kill_switch::{StuckTripwire, VenueLabel};
 use crate::risk::manager::{BlockReason, RiskManager};
 use crate::risk::reference_guard::{RefCheckOutcome, ReferenceGuard};
+use crate::risk::skew_monitor::{SkewMonitor, SkewOutcome};
+use crate::risk::ws_health::{WsHealthMonitor, WsHealthOutcome};
 
 /// Which venue an operation targets. Avoids leaking the underlying
 /// DexConnector type into the runner core so the mock in
@@ -138,6 +140,22 @@ pub struct LivePaperSummary {
     /// Number of new entries suppressed because the STUCK file is
     /// armed (REST consec-fail / reduce-only consec-fail / SIGUSR1).
     pub entries_blocked_by_stuck_file: u64,
+    /// Number of ticks where the WS staleness watchdog flipped to
+    /// `Stale` (#244 Group C / `risk::ws_health`). Counts the trip,
+    /// not every tick the latch stays armed — the runner emits one
+    /// `Emergency{WsStale}` per trip and the state machine's
+    /// `Phase::EmergencyFlattening` is sticky from there.
+    pub ws_stale_emergencies_emitted: u64,
+    /// Number of new entries blocked because the bot is in
+    /// `Phase::Flat` but the WS staleness latch is still armed (we
+    /// haven't seen a healthy book within `ws_stale_emergency_ms`).
+    /// Distinct from `ws_stale_emergencies_emitted` which only fires
+    /// for non-Flat phases.
+    pub entries_blocked_by_ws_stale: u64,
+    /// Number of ticks where the inventory-skew watchdog escalated
+    /// to `Emergency{SkewBreach}` (#244 Group C / `risk::skew_monitor`).
+    /// Counts trips, not ticks the latch stays armed.
+    pub skew_emergencies_emitted: u64,
 }
 
 /// Control surface for the run loop.
@@ -189,6 +207,8 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
             cfg.reference_consec_buckets_for_halt,
         )
     };
+    let mut ws_health = WsHealthMonitor::new(cfg.ws_stale_emergency_ms);
+    let mut skew_monitor = SkewMonitor::new(cfg.max_inventory_skew_usd);
     let mut stuck = StuckTripwire::new(cfg.stuck_tripwire_config());
     if stuck.is_stuck() {
         log::warn!(
@@ -268,6 +288,8 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                     &mut reference_guard,
                     &mut stuck,
                     &mut warmup,
+                    &mut ws_health,
+                    &mut skew_monitor,
                 ).await {
                     // Read-mid / decision errors are logged but don't
                     // terminate the loop. Phase 3 will add a consec-fail
@@ -277,9 +299,11 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
             }
 
             _ = status_ivl.tick() => {
+                let ws_age = ws_health.ws_age(wall_clock_ms());
                 log::info!(
                     "[STATUS] ticks={} samples={} hold={} enter_l={} enter_s={} exit={} \
                      ks_blocked={} stuck_blocked={} dd_blocked={} sd_blocked={} cb_blocked={} \
+                     ws_blocked={} ws_emerg={} skew_emerg={} ws_age_ext={:?} ws_age_lt={:?} \
                      ref_supp_ext={} ref_supp_lt={} dev_bps={:?}",
                     summary.ticks,
                     summary.samples_committed,
@@ -292,6 +316,11 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                     summary.entries_blocked_by_daily_dd,
                     summary.entries_blocked_by_session_dd,
                     summary.entries_blocked_by_circuit_breaker,
+                    summary.entries_blocked_by_ws_stale,
+                    summary.ws_stale_emergencies_emitted,
+                    summary.skew_emergencies_emitted,
+                    ws_age.ext_age_ms,
+                    ws_age.lt_age_ms,
                     summary.ext_book_suppressed_by_ref_guard,
                     summary.lt_book_suppressed_by_ref_guard,
                     summary.last_dev_bps,
@@ -384,9 +413,106 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
     reference_guard: &mut ReferenceGuard,
     stuck: &mut StuckTripwire,
     warmup: &mut VenueWarmup,
+    ws_health: &mut WsHealthMonitor,
+    skew_monitor: &mut SkewMonitor,
 ) -> Result<()> {
     // Drain any pending SIGUSR1 — arms the STUCK file if needed.
     let _ = stuck.poll_sigusr1();
+
+    // WS staleness check (#244 Group C). Runs *before* the read_mid
+    // calls so a sustained venue outage that prevents read_mid from
+    // returning fresh data still surfaces — `evaluate` uses the last
+    // recorded healthy-book timestamp, not this tick's reads.
+    //
+    // Decision policy:
+    //   - Position open: emit Event::Emergency{WsStale} → state
+    //     machine routes to EmergencyFlattening. One event per trip;
+    //     the latch keeps the runner from re-emitting on subsequent
+    //     ticks while still flattening.
+    //   - Flat (no position): just block any new entry by short-
+    //     circuiting the rest of the tick. Counters bump so the
+    //     operator can see the suppression in [STATUS].
+    //   - NotReady (warm-up): proceed normally; the read_mid warm-up
+    //     gate handles the "no data yet" case.
+    let now_wall_ms = wall_clock_ms();
+    let ws_outcome = ws_health.evaluate(now_wall_ms);
+    if let WsHealthOutcome::Stale(stale_venue) = ws_outcome {
+        if machine.summary().is_some() {
+            // Only emit the event if it hasn't already been latched
+            // *and* applied. The latch flips when evaluate sees stale,
+            // but the state machine may already be in
+            // EmergencyFlattening from a prior tick — Emergency from
+            // that phase is rejected by the state machine. So we
+            // count the emit only when it actually goes through.
+            let event = Event::Emergency {
+                reason: super::state::EmergencyReason::WsStale,
+            };
+            match machine.apply(now_wall_ms, event) {
+                Ok(()) => {
+                    log::error!(
+                        "[XVENUE] WS staleness emergency: venue={:?} threshold_ms={} \
+                         → flattening",
+                        stale_venue,
+                        ws_health.ws_stale_emergency_ms()
+                    );
+                    summary.ws_stale_emergencies_emitted += 1;
+
+                    // Paper-mode short-circuit: Group B (real orders +
+                    // emergency-flatten loop) is not yet wired, so
+                    // there is no producer of `EmergencyComplete` in
+                    // dry-run. Without this, a transient WS hiccup
+                    // would dead-end the state machine in
+                    // EmergencyFlattening and block all future
+                    // entries until restart. Synthesise the exit
+                    // fills + EmergencyComplete so the paper loop
+                    // recovers and the operator can keep observing.
+                    // Live mode (Group B once it lands) MUST NOT take
+                    // this path — the real flatten orders drive
+                    // `EmergencyComplete`.
+                    if cfg.dry_run {
+                        if let Some(qty) = open_qty.take() {
+                            let _ = machine.apply(
+                                now_wall_ms,
+                                Event::ExtendedExitFilled { qty },
+                            );
+                            let _ = machine.apply(
+                                now_wall_ms,
+                                Event::LighterExitFilled { qty },
+                            );
+                        }
+                        let _ = machine.apply(now_wall_ms, Event::EmergencyComplete);
+                        ws_health.reset_after_recovery();
+                        log::warn!(
+                            "[XVENUE] paper-mode WS-stale recovery: synthesised \
+                             EmergencyComplete (Group B will replace this in live)"
+                        );
+                    }
+                }
+                Err(e) => {
+                    // Either Phase::Flat or already EmergencyFlattening.
+                    // Both are fine — log at debug level so we don't
+                    // spam WARN every tick during a sustained outage.
+                    log::debug!(
+                        "[XVENUE] WS stale ignored by state machine \
+                         (likely already flattening): {:?}",
+                        e
+                    );
+                }
+            }
+        } else {
+            log::warn!(
+                "[XVENUE] WS staleness latched: venue={:?} threshold_ms={} \
+                 (Flat — blocking new entries until a healthy book lands)",
+                stale_venue,
+                ws_health.ws_stale_emergency_ms()
+            );
+            summary.entries_blocked_by_ws_stale += 1;
+        }
+        // Skip the rest of the tick — we don't want to feed stale
+        // mid into the spread engine or evaluate signals from it.
+        return Ok(());
+    }
+
     let mut ext_snap = match hub.read_mid(Venue::Extended).await {
         Ok(s) => {
             warmup.mark_ready(Venue::Extended);
@@ -415,6 +541,19 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
         }
         Err(e) => return Err(e).context("read_mid Lighter"),
     };
+
+    // Record successful book observations for WS health tracking. We
+    // only count `book_ok = true` reads — a one-sided book is a
+    // "venue alive but unfit to trade" state, which the watchdog
+    // *should* eventually escalate. The wall-clock ts is the same
+    // clock `evaluate` runs on so the age math stays monotonic.
+    let now_wall_ms_after_reads = wall_clock_ms();
+    if ext_snap.book_ok {
+        ws_health.record_book_update(VenueLabel::Extended, now_wall_ms_after_reads);
+    }
+    if lt_snap.book_ok {
+        ws_health.record_book_update(VenueLabel::Lighter, now_wall_ms_after_reads);
+    }
 
     // Reference guard cross-check (#244 C). Reads the latest Binance
     // 1m mid and suppresses each venue's book_ok when its mid drifts
@@ -478,6 +617,67 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
     summary.samples_committed = spread.samples_committed();
 
     let position = machine.summary();
+
+    // Inventory-skew watchdog (#244 Group C). Only meaningful when a
+    // position is open — `machine.inventory_skew_usd` returns 0 in
+    // Flat, which `skew_monitor.evaluate` short-circuits to Disabled.
+    // Runs *after* the spread update so the spread engine still sees
+    // this tick's data (we don't want a recovery tick discarded just
+    // because the previous trip is still in flight).
+    if position.is_some() {
+        let skew_dec = machine.inventory_skew_usd(ext_snap.mid, lt_snap.mid);
+        let skew_f = rust_decimal::prelude::ToPrimitive::to_f64(&skew_dec).unwrap_or(0.0);
+        match skew_monitor.evaluate(skew_f) {
+            SkewOutcome::Breach { skew_usd, threshold_usd } => {
+                let event = Event::Emergency {
+                    reason: super::state::EmergencyReason::SkewBreach,
+                };
+                match machine.apply(now_ts_ms, event) {
+                    Ok(()) => {
+                        log::error!(
+                            "[XVENUE] inventory skew breach: skew_usd={:.2} \
+                             threshold_usd={:.2} → flattening",
+                            skew_usd,
+                            threshold_usd,
+                        );
+                        summary.skew_emergencies_emitted += 1;
+
+                        // Same paper-mode short-circuit as ws_health —
+                        // Group B will replace this with real flatten
+                        // orders driving EmergencyComplete.
+                        if cfg.dry_run {
+                            if let Some(qty) = open_qty.take() {
+                                let _ = machine.apply(
+                                    now_ts_ms,
+                                    Event::ExtendedExitFilled { qty },
+                                );
+                                let _ = machine.apply(
+                                    now_ts_ms,
+                                    Event::LighterExitFilled { qty },
+                                );
+                            }
+                            let _ = machine.apply(now_ts_ms, Event::EmergencyComplete);
+                            skew_monitor.reset_after_recovery();
+                            log::warn!(
+                                "[XVENUE] paper-mode skew recovery: synthesised \
+                                 EmergencyComplete (Group B will replace this in live)"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        log::debug!(
+                            "[XVENUE] skew breach ignored by state machine \
+                             (likely already flattening): {:?}",
+                            e
+                        );
+                    }
+                }
+                return Ok(());
+            }
+            SkewOutcome::Ok { .. } | SkewOutcome::Disabled => {}
+        }
+    }
+
     let evaluate = committed || position.is_some();
     if !evaluate {
         return Ok(());
@@ -744,6 +944,8 @@ max_hold_sec: 60
         let mut rg = test_reference_guard();
         let (_st_dir, mut stuck) = test_stuck();
         let mut warmup = VenueWarmup::default();
+        let mut ws_health = WsHealthMonitor::new(0);
+        let mut skew_monitor = SkewMonitor::new(0.0);
         run_one_tick(
             &cfg,
             &*hub,
@@ -757,6 +959,8 @@ max_hold_sec: 60
             &mut rg,
             &mut stuck,
             &mut warmup,
+            &mut ws_health,
+            &mut skew_monitor,
         )
         .await
         .unwrap();
@@ -779,6 +983,8 @@ max_hold_sec: 60
         let mut rg = test_reference_guard();
         let (_st_dir, mut stuck) = test_stuck();
         let mut warmup = VenueWarmup::default();
+        let mut ws_health = WsHealthMonitor::new(0);
+        let mut skew_monitor = SkewMonitor::new(0.0);
         run_one_tick(
             &cfg,
             &*hub,
@@ -792,6 +998,8 @@ max_hold_sec: 60
             &mut rg,
             &mut stuck,
             &mut warmup,
+            &mut ws_health,
+            &mut skew_monitor,
         )
         .await
         .unwrap();
@@ -843,6 +1051,8 @@ max_hold_sec: 60
         let mut rg = test_reference_guard();
         let (_st_dir, mut stuck) = test_stuck();
         let mut warmup = VenueWarmup::default();
+        let mut ws_health = WsHealthMonitor::new(0);
+        let mut skew_monitor = SkewMonitor::new(0.0);
         for _ in 0..total_ticks {
             run_one_tick(
                 &cfg,
@@ -857,6 +1067,8 @@ max_hold_sec: 60
                 &mut rg,
                 &mut stuck,
                 &mut warmup,
+                &mut ws_health,
+                &mut skew_monitor,
             )
             .await
             .unwrap();
@@ -916,6 +1128,8 @@ max_hold_sec: 60
         let mut rg = test_reference_guard();
         let (_st_dir, mut stuck) = test_stuck();
         let mut warmup = VenueWarmup::default();
+        let mut ws_health = WsHealthMonitor::new(0);
+        let mut skew_monitor = SkewMonitor::new(0.0);
         for _ in 0..(warm_n + breach_n) {
             run_one_tick(
                 &cfg,
@@ -930,6 +1144,8 @@ max_hold_sec: 60
                 &mut rg,
                 &mut stuck,
                 &mut warmup,
+                &mut ws_health,
+                &mut skew_monitor,
             )
             .await
             .unwrap();
@@ -983,6 +1199,8 @@ max_hold_sec: 60
         let mut rg = test_reference_guard();
         let (_st_dir, mut stuck) = test_stuck();
         let mut warmup = VenueWarmup::default();
+        let mut ws_health = WsHealthMonitor::new(0);
+        let mut skew_monitor = SkewMonitor::new(0.0);
         for _ in 0..(warm_n + breach_n) {
             run_one_tick(
                 &cfg,
@@ -997,6 +1215,8 @@ max_hold_sec: 60
                 &mut rg,
                 &mut stuck,
                 &mut warmup,
+                &mut ws_health,
+                &mut skew_monitor,
             )
             .await
             .unwrap();
@@ -1049,6 +1269,8 @@ max_hold_sec: 60
         let mut rg = test_reference_guard();
         let (_st_dir, mut stuck) = test_stuck();
         let mut warmup = VenueWarmup::default();
+        let mut ws_health = WsHealthMonitor::new(0);
+        let mut skew_monitor = SkewMonitor::new(0.0);
         for _ in 0..(warm_n + breach_n) {
             run_one_tick(
                 &cfg,
@@ -1063,6 +1285,8 @@ max_hold_sec: 60
                 &mut rg,
                 &mut stuck,
                 &mut warmup,
+                &mut ws_health,
+                &mut skew_monitor,
             )
             .await
             .unwrap();
@@ -1137,6 +1361,8 @@ max_hold_sec: 60
         let mut rg = test_reference_guard();
         let (_st_dir, mut stuck) = test_stuck();
         let mut warmup = VenueWarmup::default();
+        let mut ws_health = WsHealthMonitor::new(0);
+        let mut skew_monitor = SkewMonitor::new(0.0);
 
         // First two ticks: Extended fails before Lighter is even
         // attempted (run_one_tick reads Extended first), so neither
@@ -1155,6 +1381,8 @@ max_hold_sec: 60
                 &mut rg,
                 &mut stuck,
                 &mut warmup,
+                &mut ws_health,
+                &mut skew_monitor,
             )
             .await
             .expect("warm-up errors must not propagate");
@@ -1181,6 +1409,8 @@ max_hold_sec: 60
             &mut rg,
             &mut stuck,
             &mut warmup,
+            &mut ws_health,
+            &mut skew_monitor,
         )
         .await
         .expect("warm-up errors must not propagate");
@@ -1203,6 +1433,8 @@ max_hold_sec: 60
                 &mut rg,
                 &mut stuck,
                 &mut warmup,
+                &mut ws_health,
+                &mut skew_monitor,
             )
             .await
             .expect("warm-up errors must not propagate");
@@ -1220,6 +1452,8 @@ max_hold_sec: 60
             &mut rg,
             &mut stuck,
             &mut warmup,
+            &mut ws_health,
+            &mut skew_monitor,
         )
         .await
         .expect("post-warmup tick must succeed");
@@ -1265,6 +1499,8 @@ max_hold_sec: 60
             ext_ready: true,
             lt_ready: true,
         };
+        let mut ws_health = WsHealthMonitor::new(0);
+        let mut skew_monitor = SkewMonitor::new(0.0);
         let hub = AlwaysFailHub;
         let err = run_one_tick(
             &cfg,
@@ -1279,6 +1515,8 @@ max_hold_sec: 60
             &mut rg,
             &mut stuck,
             &mut warmup,
+            &mut ws_health,
+            &mut skew_monitor,
         )
         .await
         .expect_err("post-warmup read_mid Err must propagate as Err");
