@@ -20,6 +20,7 @@ use serde::Deserialize;
 
 use super::signal::SignalConfig;
 use super::spread::SpreadConfig;
+use crate::risk::kill_switch::StuckTripwireConfig;
 use crate::risk::manager::RiskConfig;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -216,6 +217,14 @@ impl XvenueConfig {
             bucket_ms: self.spread_bucket_ms,
             rolling_window_sec: self.rolling_window_sec,
             max_abs_spread_bps: self.max_abs_spread_bps,
+        }
+    }
+
+    pub fn stuck_tripwire_config(&self) -> StuckTripwireConfig {
+        StuckTripwireConfig {
+            stuck_file: self.stuck_file.clone().into(),
+            rest_consec_fail_to_escalate: self.rest_consec_fail_to_escalate,
+            reduce_only_consec_fail_to_kill: self.reduce_only_consec_fail_to_kill,
         }
     }
 

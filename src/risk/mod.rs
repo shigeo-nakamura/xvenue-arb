@@ -10,5 +10,6 @@
 //! `ws_health`, `skew_monitor`) land in subsequent commits per the
 //! sprint plan in #244.
 
+pub mod kill_switch;
 pub mod manager;
 pub mod reference_guard;

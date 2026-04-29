@@ -33,6 +33,7 @@ use super::signal::{Decision, ExitReason, SignalEngine, SpreadDirection};
 use super::spread::SpreadEngine;
 use super::state::{Event, PositionMachine};
 use super::status::{equity_decimal_to_f64, StatusReporter};
+use crate::risk::kill_switch::StuckTripwire;
 use crate::risk::manager::{BlockReason, RiskManager};
 use crate::risk::reference_guard::{RefCheckOutcome, ReferenceGuard};
 
@@ -103,6 +104,9 @@ pub struct LivePaperSummary {
     /// without leaving the bot's own logs.
     pub ext_book_suppressed_by_ref_guard: u64,
     pub lt_book_suppressed_by_ref_guard: u64,
+    /// Number of new entries suppressed because the STUCK file is
+    /// armed (REST consec-fail / reduce-only consec-fail / SIGUSR1).
+    pub entries_blocked_by_stuck_file: u64,
 }
 
 /// Control surface for the run loop.
@@ -142,11 +146,26 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
         cfg.risk_config(),
         cfg.agent_name.clone(),
     );
-    let mut reference_guard = ReferenceGuard::spawn(
-        cfg.binance_reference_symbol.clone(),
-        cfg.reference_max_dev_bps,
-        cfg.reference_consec_buckets_for_halt,
-    );
+    let mut reference_guard = if cfg.binance_reference_symbol.trim().is_empty() {
+        ReferenceGuard::disabled(
+            cfg.reference_max_dev_bps,
+            cfg.reference_consec_buckets_for_halt,
+        )
+    } else {
+        ReferenceGuard::spawn(
+            cfg.binance_reference_symbol.clone(),
+            cfg.reference_max_dev_bps,
+            cfg.reference_consec_buckets_for_halt,
+        )
+    };
+    let mut stuck = StuckTripwire::new(cfg.stuck_tripwire_config());
+    if stuck.is_stuck() {
+        log::warn!(
+            "[KILL_SWITCH] STUCK file present at boot ({}) — entries blocked. \
+             Operator must inspect and `rm` the file to resume.",
+            stuck.stuck_file_path().display()
+        );
+    }
     if let Some(r) = reporter.as_ref() {
         log::info!(
             "[STATUS] writing snapshots to {} (cadence ≥ 60s)",
@@ -215,6 +234,7 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                     reporter.as_mut(),
                     &mut risk_manager,
                     &mut reference_guard,
+                    &mut stuck,
                 ).await {
                     // Read-mid / decision errors are logged but don't
                     // terminate the loop. Phase 3 will add a consec-fail
@@ -226,7 +246,7 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
             _ = status_ivl.tick() => {
                 log::info!(
                     "[STATUS] ticks={} samples={} hold={} enter_l={} enter_s={} exit={} \
-                     ks_blocked={} dd_blocked={} sd_blocked={} cb_blocked={} \
+                     ks_blocked={} stuck_blocked={} dd_blocked={} sd_blocked={} cb_blocked={} \
                      ref_supp_ext={} ref_supp_lt={} dev_bps={:?}",
                     summary.ticks,
                     summary.samples_committed,
@@ -235,6 +255,7 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                     summary.decisions_enter_short,
                     summary.decisions_exit,
                     summary.entries_blocked_by_kill_switch,
+                    summary.entries_blocked_by_stuck_file,
                     summary.entries_blocked_by_daily_dd,
                     summary.entries_blocked_by_session_dd,
                     summary.entries_blocked_by_circuit_breaker,
@@ -328,7 +349,10 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
     mut reporter: Option<&mut StatusReporter>,
     risk_manager: &mut RiskManager,
     reference_guard: &mut ReferenceGuard,
+    stuck: &mut StuckTripwire,
 ) -> Result<()> {
+    // Drain any pending SIGUSR1 — arms the STUCK file if needed.
+    let _ = stuck.poll_sigusr1();
     let mut ext_snap = hub.read_mid(Venue::Extended).await.context("read_mid Extended")?;
     let mut lt_snap = hub.read_mid(Venue::Lighter).await.context("read_mid Lighter")?;
 
@@ -423,6 +447,21 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
             cfg.kill_switch_file
         );
         summary.entries_blocked_by_kill_switch += 1;
+        decision = Decision::Hold;
+    }
+
+    // STUCK file (#244 C / #102 P2). Runner-written tripwire from
+    // sustained REST failures, reduce-only failures, or SIGUSR1.
+    // Distinct from KILL_SWITCH: STUCK is "something is very wrong"
+    // and requires manual `rm` to clear; KILL_SWITCH is just a
+    // vacation pause that auto-clears on file removal.
+    if matches!(decision, Decision::Enter(_)) && stuck.is_stuck() {
+        log::warn!(
+            "[XVENUE] STUCK file present ({}); blocking new entry. \
+             Operator must inspect and `rm` to resume.",
+            stuck.stuck_file_path().display()
+        );
+        summary.entries_blocked_by_stuck_file += 1;
         decision = Decision::Hold;
     }
 
@@ -550,6 +589,22 @@ mod tests {
         ReferenceGuard::manual(100.0, 3)
     }
 
+    /// Test fixture: STUCK tripwire pointing at a temp dir with no
+    /// SIGUSR1 handler installed (so the unit tests don't fight over
+    /// the global signal mask).
+    fn test_stuck() -> (tempfile::TempDir, crate::risk::kill_switch::StuckTripwire) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = crate::risk::kill_switch::StuckTripwireConfig {
+            stuck_file: dir.path().join("STUCK"),
+            rest_consec_fail_to_escalate: 3,
+            reduce_only_consec_fail_to_kill: 5,
+        };
+        (
+            dir,
+            crate::risk::kill_switch::StuckTripwire::new_for_test(cfg),
+        )
+    }
+
     /// Builds a RiskManager pointing at a fresh temp dir so each test
     /// owns its own risk_state.json / RISK_ACK paths and parallel
     /// execution doesn't fight over /var/lib.
@@ -627,6 +682,7 @@ max_hold_sec: 60
         let mut open_qty = None;
         let (_rm_dir, mut rm) = test_risk_manager();
         let mut rg = test_reference_guard();
+        let (_st_dir, mut stuck) = test_stuck();
         run_one_tick(
             &cfg,
             &*hub,
@@ -638,6 +694,7 @@ max_hold_sec: 60
             None,
             &mut rm,
             &mut rg,
+            &mut stuck,
         )
         .await
         .unwrap();
@@ -658,6 +715,7 @@ max_hold_sec: 60
         let mut open_qty = None;
         let (_rm_dir, mut rm) = test_risk_manager();
         let mut rg = test_reference_guard();
+        let (_st_dir, mut stuck) = test_stuck();
         run_one_tick(
             &cfg,
             &*hub,
@@ -669,6 +727,7 @@ max_hold_sec: 60
             None,
             &mut rm,
             &mut rg,
+            &mut stuck,
         )
         .await
         .unwrap();
@@ -718,6 +777,7 @@ max_hold_sec: 60
         let total_ticks = warm_n + breach_n;
         let (_rm_dir, mut rm) = test_risk_manager();
         let mut rg = test_reference_guard();
+        let (_st_dir, mut stuck) = test_stuck();
         for _ in 0..total_ticks {
             run_one_tick(
                 &cfg,
@@ -730,6 +790,7 @@ max_hold_sec: 60
                 None,
                 &mut rm,
                 &mut rg,
+                &mut stuck,
             )
             .await
             .unwrap();
@@ -787,6 +848,7 @@ max_hold_sec: 60
 
         let (_rm_dir, mut rm) = test_risk_manager();
         let mut rg = test_reference_guard();
+        let (_st_dir, mut stuck) = test_stuck();
         for _ in 0..(warm_n + breach_n) {
             run_one_tick(
                 &cfg,
@@ -799,6 +861,7 @@ max_hold_sec: 60
                 None,
                 &mut rm,
                 &mut rg,
+                &mut stuck,
             )
             .await
             .unwrap();
@@ -850,6 +913,7 @@ max_hold_sec: 60
 
         let (_rm_dir, mut rm) = test_risk_manager();
         let mut rg = test_reference_guard();
+        let (_st_dir, mut stuck) = test_stuck();
         for _ in 0..(warm_n + breach_n) {
             run_one_tick(
                 &cfg,
@@ -862,6 +926,7 @@ max_hold_sec: 60
                 None,
                 &mut rm,
                 &mut rg,
+                &mut stuck,
             )
             .await
             .unwrap();
@@ -912,6 +977,7 @@ max_hold_sec: 60
         );
 
         let mut rg = test_reference_guard();
+        let (_st_dir, mut stuck) = test_stuck();
         for _ in 0..(warm_n + breach_n) {
             run_one_tick(
                 &cfg,
@@ -924,6 +990,7 @@ max_hold_sec: 60
                 None,
                 &mut rm,
                 &mut rg,
+                &mut stuck,
             )
             .await
             .unwrap();
@@ -952,7 +1019,11 @@ max_hold_sec: 60
             lt.push(mid(i * 1000, 2000.0));
         }
         let hub = Arc::new(ScriptedHub::new(ext, lt));
-        let cfg = min_cfg();
+        // Disable the live reference_guard HTTP poll for the test —
+        // we don't want a real network request firing during a 80 ms
+        // tick benchmark. Empty symbol triggers ReferenceGuard::disabled.
+        let mut cfg = min_cfg();
+        cfg.binance_reference_symbol = String::new();
         let loop_cfg = LiveLoopConfig {
             tick_interval_ms: 5,
             status_log_interval_ms: 10_000,

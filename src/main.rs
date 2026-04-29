@@ -198,7 +198,7 @@ async fn run() -> anyhow::Result<()> {
         let summary = run_paper_loop(cfg, loop_cfg, hub, shutdown_rx).await?;
         log::info!(
             "[EXIT] ticks={} samples={} hold={} enter_l={} enter_s={} exit={} \
-             ks_blocked={} dd_blocked={} sd_blocked={} cb_blocked={}",
+             ks_blocked={} stuck_blocked={} dd_blocked={} sd_blocked={} cb_blocked={}",
             summary.ticks,
             summary.samples_committed,
             summary.decisions_hold,
@@ -206,6 +206,7 @@ async fn run() -> anyhow::Result<()> {
             summary.decisions_enter_short,
             summary.decisions_exit,
             summary.entries_blocked_by_kill_switch,
+            summary.entries_blocked_by_stuck_file,
             summary.entries_blocked_by_daily_dd,
             summary.entries_blocked_by_session_dd,
             summary.entries_blocked_by_circuit_breaker,

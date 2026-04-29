@@ -117,6 +117,21 @@ impl ReferenceGuard {
         }
     }
 
+    /// Production short-circuit when no reference symbol is
+    /// configured (or the operator wants to opt out). No background
+    /// task; `evaluate()` always returns `NoReference`.
+    pub fn disabled(threshold_bps: f64, consec_buckets: u32) -> Self {
+        Self {
+            state: Arc::new(RwLock::new(None)),
+            threshold_bps,
+            consec_buckets,
+            ext_bad_buckets: 0,
+            lt_bad_buckets: 0,
+            last_eval_minute: 0,
+            _poll_handle: None,
+        }
+    }
+
     /// Test / BT constructor. Caller drives the reference mid
     /// through `set_reference_mid` instead of the HTTP poll.
     #[cfg(test)]
