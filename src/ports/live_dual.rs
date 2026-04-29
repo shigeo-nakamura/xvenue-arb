@@ -76,14 +76,17 @@ impl VenueHub for LiveVenueHub {
     }
 
     async fn read_equity_usd(&self, venue: Venue) -> Result<Option<Decimal>> {
-        let (conn, sym) = match venue {
-            Venue::Extended => (&self.extended, self.symbol_extended.as_str()),
-            Venue::Lighter => (&self.lighter, self.symbol_lighter.as_str()),
+        let conn = match venue {
+            Venue::Extended => &self.extended,
+            Venue::Lighter => &self.lighter,
         };
 
-        // get_balance(None) returns whole-account equity on both connectors;
-        // pass the symbol explicitly only if the connector requires it.
-        let fut = conn.get_balance(Some(sym));
+        // `get_balance(None)` returns whole-account equity (collateral
+        // currency = USD on both venues). Passing the trading symbol
+        // makes Extended's REST endpoint reject with "Unsupported
+        // balance symbol …" — the symbol arg is for spot/multi-asset
+        // accounts, not the perp collateral query we want here.
+        let fut = conn.get_balance(None);
         let bal = tokio::time::timeout(
             std::time::Duration::from_millis(EQUITY_READ_TIMEOUT_MS),
             fut,
