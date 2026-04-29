@@ -36,7 +36,7 @@ set +a
 
 export DEBOT_STATUS_DIR="${DEBOT_STATUS_DIR:-/home/ec2-user/debot_status}"
 export DEBOT_STATUS_ID=debot-xvenue-arb
-export XVENUE_CONFIG_PATH=/opt/debot/configs/xvenue-arb/debot-xvenue-arb-btc.yaml
+export XVENUE_CONFIG_PATH=/opt/debot/configs/xvenue-arb/debot-xvenue-arb-eth.yaml
 
 # Suppress the per-connector startup random jitter. xvenue-arb hits each
 # venue exactly once at boot, so the jitter (meant for multi-variant
