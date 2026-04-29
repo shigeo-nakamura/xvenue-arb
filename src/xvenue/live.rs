@@ -781,6 +781,11 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
                 machine.apply(now_ts_ms, Event::LighterExitFilled { qty })?;
                 if let Some(r) = reporter.as_deref_mut() {
                     r.record_fill(true, true, now_ts_ms);
+                    // Paper PnL is 0 in DRY_RUN — Group B will replace
+                    // this with realized USD once orders flow. The call
+                    // ticks the round-trip counter so the dashboard's
+                    // `trade_stats.trades` advances during paper.
+                    r.record_close(0.0);
                 }
                 // Paper PnL is 0 in DRY_RUN — Group B will replace
                 // this with realized USD once orders flow. The

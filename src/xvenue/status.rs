@@ -94,6 +94,22 @@ pub struct SpreadPoint {
     pub dev_bps: f64,
 }
 
+/// Round-trip trade counter mirrored from pairtrade's `PairTradeStats`
+/// and the dashboard's `TradeStats` (debot-dashboard/main.go). Emitted
+/// only after the first close so a fresh boot doesn't surface "0
+/// trades" before any signal has fired. Paper round-trips count too —
+/// during DRY_RUN this surfaces the strategy's exit cadence on the
+/// dashboard. Group B will start passing realized USD into
+/// `record_close` once real fills land.
+#[derive(Debug, Clone, Serialize)]
+pub struct TradeStats {
+    pub trades: u64,
+    pub wins: u64,
+    pub win_rate: f64,
+    pub max_dd: f64,
+    pub pnl: f64,
+}
+
 /// Inline shape for the dashboard's StatusData. Only the fields Group A
 /// fills are present; risk gates / shutdown surface as `None` /
 /// `serde_skip_if_none` so they don't clutter the payload but stay
@@ -117,6 +133,8 @@ pub struct StatusSnapshot {
     pub pnl_total: f64,
     pub pnl_today: f64,
     pub pnl_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trade_stats: Option<TradeStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_summary: Option<ErrorSummary>,
 
@@ -181,6 +199,17 @@ pub struct StatusReporter {
     spread_series: VecDeque<SpreadPoint>,
     last_dev_bps: Option<f64>,
     samples_committed: u64,
+
+    // Round-trip trade counters surfaced as `trade_stats`. Cleared on
+    // boot — the dashboard treats an absent `trade_stats` field as
+    // "no data yet" so a fresh restart doesn't show 0/0/0%/$0 until the
+    // first close happens. Paper closes increment too; Group B replaces
+    // the 0.0 PnL passed by `record_close` with realized USD.
+    trades_count: u64,
+    wins_count: u64,
+    total_pnl: f64,
+    peak_pnl: f64,
+    max_dd: f64,
 
     last_snapshot: Option<Instant>,
 
@@ -247,6 +276,11 @@ impl StatusReporter {
             spread_series: VecDeque::with_capacity(SPREAD_SERIES_CAP),
             last_dev_bps: None,
             samples_committed: 0,
+            trades_count: 0,
+            wins_count: 0,
+            total_pnl: 0.0,
+            peak_pnl: 0.0,
+            max_dd: 0.0,
             last_snapshot: None,
             daily_risk: None,
             session_risk: None,
@@ -295,6 +329,25 @@ impl StatusReporter {
         }
         if lt {
             self.last_lt_fill_ts = Some(ts);
+        }
+    }
+
+    /// Records a round-trip close. `pnl` is realized USD for that
+    /// round-trip; in DRY_RUN the runner passes 0.0 today so the
+    /// counter still ticks while leaving paper PnL flat. Group B
+    /// passes realized USD once orders flow.
+    pub fn record_close(&mut self, pnl: f64) {
+        self.trades_count += 1;
+        self.total_pnl += pnl;
+        if pnl > 0.0 {
+            self.wins_count += 1;
+        }
+        if self.total_pnl > self.peak_pnl {
+            self.peak_pnl = self.total_pnl;
+        }
+        let dd = self.peak_pnl - self.total_pnl;
+        if dd > self.max_dd {
+            self.max_dd = dd;
         }
     }
 
@@ -426,6 +479,13 @@ impl StatusReporter {
             pnl_total: self.pnl_total,
             pnl_today: self.pnl_today,
             pnl_source: "equity".to_string(),
+            trade_stats: (self.trades_count > 0).then(|| TradeStats {
+                trades: self.trades_count,
+                wins: self.wins_count,
+                win_rate: self.wins_count as f64 / self.trades_count as f64 * 100.0,
+                max_dd: self.max_dd,
+                pnl: self.total_pnl,
+            }),
             error_summary: error_counter::global().map(|h| h.snapshot()),
             venues,
             recent_taker_fills: self.recent_taker_fills.iter().cloned().collect(),
@@ -670,6 +730,41 @@ reference_max_dev_bps: 100
         assert!(v.get("ts").is_some());
         assert!(v.get("updated_at").is_some());
         assert!(v.get("venues").is_some());
+    }
+
+    #[test]
+    fn trade_stats_absent_until_first_close_then_aggregates_pnl() {
+        let _g = env_guard();
+        let tmp = TempDir::new().unwrap();
+        let cfg = min_cfg();
+        let mut r = reporter_in(&tmp, &cfg);
+        let machine = PositionMachine::new();
+
+        // Pre-close: trade_stats omitted so the dashboard renders "no
+        // data yet" rather than 0/0/0%/$0 on a fresh boot.
+        r.write_snapshot(&machine, 0).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(r.path()).unwrap()).unwrap();
+        assert!(v.get("trade_stats").is_none());
+
+        // 3 wins + 1 loss interleaved so the running-peak max_dd is
+        // exercised: after the -1.5 close total dips to -0.5 from a
+        // peak of +1.0 → max_dd=1.5; subsequent wins lift past that
+        // peak but max_dd stays at the recorded high-water mark.
+        r.record_close(1.0);
+        r.record_close(-1.5);
+        r.record_close(2.0);
+        r.record_close(0.5);
+
+        r.write_snapshot(&machine, 1_000).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(r.path()).unwrap()).unwrap();
+        let ts = v.get("trade_stats").expect("trade_stats present");
+        assert_eq!(ts.get("trades").and_then(|x| x.as_u64()), Some(4));
+        assert_eq!(ts.get("wins").and_then(|x| x.as_u64()), Some(3));
+        assert_eq!(ts.get("win_rate").and_then(|x| x.as_f64()), Some(75.0));
+        assert_eq!(ts.get("pnl").and_then(|x| x.as_f64()), Some(2.0));
+        assert_eq!(ts.get("max_dd").and_then(|x| x.as_f64()), Some(1.5));
     }
 
     #[test]
