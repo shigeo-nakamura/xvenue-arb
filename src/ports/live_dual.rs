@@ -22,6 +22,11 @@ use rust_decimal::Decimal;
 
 use crate::xvenue::live::{MidSnapshot, Venue, VenueHub};
 
+/// Per-venue REST timeout for `get_balance` calls inside the status
+/// loop. Equity reads are advisory — losing them is preferable to
+/// stalling the snapshot cadence behind a hung venue.
+const EQUITY_READ_TIMEOUT_MS: u64 = 1_500;
+
 pub struct LiveVenueHub {
     pub extended: Arc<dyn DexConnector>,
     pub lighter: Arc<dyn DexConnector>,
@@ -68,5 +73,24 @@ impl VenueHub for LiveVenueHub {
             mid,
             book_ok,
         })
+    }
+
+    async fn read_equity_usd(&self, venue: Venue) -> Result<Option<Decimal>> {
+        let (conn, sym) = match venue {
+            Venue::Extended => (&self.extended, self.symbol_extended.as_str()),
+            Venue::Lighter => (&self.lighter, self.symbol_lighter.as_str()),
+        };
+
+        // get_balance(None) returns whole-account equity on both connectors;
+        // pass the symbol explicitly only if the connector requires it.
+        let fut = conn.get_balance(Some(sym));
+        let bal = tokio::time::timeout(
+            std::time::Duration::from_millis(EQUITY_READ_TIMEOUT_MS),
+            fut,
+        )
+        .await
+        .map_err(|_| anyhow!("get_balance({:?}) timed out", venue))?
+        .map_err(|e| anyhow!("get_balance({:?}): {:?}", venue, e))?;
+        Ok(Some(bal.equity))
     }
 }

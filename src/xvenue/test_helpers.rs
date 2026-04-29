@@ -26,6 +26,11 @@ use super::live::{MidSnapshot, Venue, VenueHub};
 pub struct ScriptedHub {
     ext: Mutex<Vec<MidSnapshot>>,
     lt: Mutex<Vec<MidSnapshot>>,
+    /// Equity returned by `read_equity_usd` — same value per call so
+    /// status-emitter tests assert PnL behavior against a known total
+    /// without juggling per-call sequences.
+    equity_ext: Decimal,
+    equity_lt: Decimal,
 }
 
 impl ScriptedHub {
@@ -40,7 +45,15 @@ impl ScriptedHub {
         Self {
             ext: Mutex::new(ext),
             lt: Mutex::new(lt),
+            equity_ext: dec!(500),
+            equity_lt: dec!(500),
         }
+    }
+
+    pub fn with_equity(mut self, ext: Decimal, lt: Decimal) -> Self {
+        self.equity_ext = ext;
+        self.equity_lt = lt;
+        self
     }
 
     /// Convenience: pop the next entry, or repeat the last one once the
@@ -67,6 +80,13 @@ impl VenueHub for ScriptedHub {
             Venue::Extended => Self::pop_or_last(&self.ext),
             Venue::Lighter => Self::pop_or_last(&self.lt),
         })
+    }
+
+    async fn read_equity_usd(&self, venue: Venue) -> Result<Option<Decimal>> {
+        Ok(Some(match venue {
+            Venue::Extended => self.equity_ext,
+            Venue::Lighter => self.equity_lt,
+        }))
     }
 }
 

@@ -32,6 +32,7 @@ use super::config::XvenueConfig;
 use super::signal::{Decision, ExitReason, SignalEngine, SpreadDirection};
 use super::spread::SpreadEngine;
 use super::state::{Event, PositionMachine};
+use super::status::{equity_decimal_to_f64, StatusReporter};
 
 /// Which venue an operation targets. Avoids leaking the underlying
 /// DexConnector type into the runner core so the mock in
@@ -60,6 +61,15 @@ pub trait VenueHub: Send + Sync {
     /// Read the current top-of-book mid for the venue, plus a
     /// `book_ok` flag (true iff both sides have positive size).
     async fn read_mid(&self, venue: Venue) -> Result<MidSnapshot>;
+
+    /// Read the venue's equity in USD. The status emitter sums both
+    /// venues to drive the dashboard's `pnl_total` / `pnl_today` line
+    /// (`pnl_source: "equity"`, matching pairtrade). Best-effort —
+    /// `Ok(None)` when the venue does not surface equity (e.g. the
+    /// replay BT hub) and lets the caller fall back to zero without
+    /// raising. Failures escalate to `Err` so the status loop can
+    /// log + skip without panicking.
+    async fn read_equity_usd(&self, venue: Venue) -> Result<Option<Decimal>>;
 }
 
 /// Per-loop diagnostic counters. Gets log-printed at
@@ -108,6 +118,13 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
     let mut signal = SignalEngine::new(cfg.signal_config());
     let mut machine = PositionMachine::new();
     let mut summary = LivePaperSummary::default();
+    let mut reporter = StatusReporter::from_env(&cfg);
+    if let Some(r) = reporter.as_ref() {
+        log::info!(
+            "[STATUS] writing snapshots to {} (cadence ≥ 60s)",
+            r.path().display()
+        );
+    }
 
     log::info!(
         "[XVENUE] live paper loop start agent={} ext={} lt={} dry_run={} bucket_ms={} \
@@ -129,6 +146,19 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
     status_ivl.tick().await; // discard the immediate-fire tick
     let mut open_qty: Option<Decimal> = None;
 
+    // Drop an initial snapshot so the dashboard sees the DRY_RUN pill /
+    // agent identity on boot instead of waiting for the first
+    // status_log_interval_ms (60 s default). Equity is best-effort —
+    // the first read may be Err while the WS is still warming, in
+    // which case PnL stays at zero until the next tick.
+    if let Some(r) = reporter.as_mut() {
+        refresh_equity(&*hub, r).await;
+        r.mark_dirty();
+        if let Err(e) = r.write_snapshot_if_due(&machine, wall_clock_ms()) {
+            log::warn!("[STATUS] initial snapshot write failed: {:?}", e);
+        }
+    }
+
     loop {
         tokio::select! {
             biased;
@@ -148,6 +178,7 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                     &mut machine,
                     &mut summary,
                     &mut open_qty,
+                    reporter.as_mut(),
                 ).await {
                     // Read-mid / decision errors are logged but don't
                     // terminate the loop. Phase 3 will add a consec-fail
@@ -167,11 +198,49 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                     summary.decisions_exit,
                     summary.last_dev_bps,
                 );
+                if let Some(r) = reporter.as_mut() {
+                    refresh_equity(&*hub, r).await;
+                    let now_ts_ms = wall_clock_ms();
+                    if let Err(e) = r.write_snapshot_if_due(&machine, now_ts_ms) {
+                        log::warn!("[STATUS] snapshot write failed: {:?}", e);
+                    }
+                }
             }
         }
     }
 
     Ok(summary)
+}
+
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Pulls equity from both venues and threads the sum into the reporter
+/// so the dashboard's `pnl_total` / `pnl_today` line tracks the live
+/// account. Best-effort: per-venue failures are logged and treated as
+/// zero so a hung venue doesn't stall the snapshot.
+async fn refresh_equity<H: VenueHub + ?Sized>(hub: &H, reporter: &mut StatusReporter) {
+    let mut total = Decimal::ZERO;
+    let mut any_ok = false;
+    for v in [Venue::Extended, Venue::Lighter] {
+        match hub.read_equity_usd(v).await {
+            Ok(Some(eq)) => {
+                total += eq;
+                any_ok = true;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                log::warn!("[STATUS] read_equity_usd({:?}) failed: {:?}", v, e);
+            }
+        }
+    }
+    if any_ok {
+        reporter.update_equity(equity_decimal_to_f64(total));
+    }
 }
 
 async fn run_one_tick<H: VenueHub + ?Sized>(
@@ -182,9 +251,17 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
     machine: &mut PositionMachine,
     summary: &mut LivePaperSummary,
     open_qty: &mut Option<Decimal>,
+    mut reporter: Option<&mut StatusReporter>,
 ) -> Result<()> {
     let ext_snap = hub.read_mid(Venue::Extended).await.context("read_mid Extended")?;
     let lt_snap = hub.read_mid(Venue::Lighter).await.context("read_mid Lighter")?;
+
+    if let Some(r) = reporter.as_deref_mut() {
+        r.record_book_ok(
+            if ext_snap.book_ok { Some(ext_snap.ts_ms) } else { None },
+            if lt_snap.book_ok { Some(lt_snap.ts_ms) } else { None },
+        );
+    }
 
     let prev_committed = spread.samples_committed();
     if ext_snap.book_ok {
@@ -208,6 +285,12 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
 
     let dev = spread.current_dev_bps();
     summary.last_dev_bps = dev;
+    if let (Some(r), Some(d)) = (reporter.as_deref_mut(), dev) {
+        if committed {
+            r.push_spread_point(now_ts_ms, d);
+        }
+        r.record_samples_committed(spread.samples_committed());
+    }
     let is_warm = spread.is_warm(cfg.min_warmup_samples);
 
     match signal.decide(now_ts_ms, dev, is_warm, position) {
@@ -232,6 +315,9 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
             machine.apply(now_ts_ms, Event::ExtendedFilled { qty })?;
             machine.apply(now_ts_ms, Event::LighterFilled { qty })?;
             *open_qty = Some(qty);
+            if let Some(r) = reporter.as_deref_mut() {
+                r.record_fill(true, true, now_ts_ms);
+            }
             summary.last_decision_ts_ms = Some(now_ts_ms);
             match dir {
                 SpreadDirection::Long => summary.decisions_enter_long += 1,
@@ -254,6 +340,9 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
             if qty > Decimal::ZERO {
                 machine.apply(now_ts_ms, Event::ExtendedExitFilled { qty })?;
                 machine.apply(now_ts_ms, Event::LighterExitFilled { qty })?;
+                if let Some(r) = reporter.as_deref_mut() {
+                    r.record_fill(true, true, now_ts_ms);
+                }
             }
             summary.last_decision_ts_ms = Some(now_ts_ms);
             summary.decisions_exit += 1;
@@ -352,6 +441,7 @@ max_hold_sec: 60
             &mut machine,
             &mut summary,
             &mut open_qty,
+            None,
         )
         .await
         .unwrap();
@@ -378,6 +468,7 @@ max_hold_sec: 60
             &mut machine,
             &mut summary,
             &mut open_qty,
+            None,
         )
         .await
         .unwrap();
@@ -434,6 +525,7 @@ max_hold_sec: 60
                 &mut machine,
                 &mut summary,
                 &mut open_qty,
+                None,
             )
             .await
             .unwrap();
