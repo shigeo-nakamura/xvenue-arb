@@ -512,4 +512,81 @@ mod tests {
         }
         assert!(!t.is_stuck());
     }
+
+    /// **Catalogue case 14 contract**: the runner-visible signal for
+    /// "this venue's read REST is dead — emit `Event::Emergency {
+    /// reason: KillSwitch }`" is `record_rest_failure` returning
+    /// `true`. Sprint 4 runner wiring will use exactly this pattern:
+    ///
+    /// ```ignore
+    /// let armed = tripwire.record_rest_failure(venue);
+    /// if armed {
+    ///     machine.apply(now, Event::Emergency { reason: KillSwitch })?;
+    /// }
+    /// ```
+    ///
+    /// This test pins that contract: the **first** call that returns
+    /// `true` is the one to map to an Emergency event. Subsequent
+    /// `record_rest_failure` calls also return `true` (counter stays
+    /// at-or-above threshold) — the runner must not double-emit; one
+    /// `is_stuck()` is sufficient because the state machine already
+    /// transitions to `EmergencyFlattening` on the first emit and
+    /// further attempts are no-ops.
+    #[test]
+    fn case14_runner_contract_arm_signal_for_emergency_event() {
+        let tmp = TempDir::new().unwrap();
+        let mut t = StuckTripwire::new_for_test(cfg_in(&tmp));
+        // Pre-arm streak — runner sees no Emergency event yet.
+        assert!(!t.record_rest_failure(VenueLabel::Lighter));
+        assert!(!t.record_rest_failure(VenueLabel::Lighter));
+        // Threshold-th call → arm; runner emits Emergency{KillSwitch}.
+        let armed_now = t.record_rest_failure(VenueLabel::Lighter);
+        assert!(armed_now, "runner reads this true to emit Emergency");
+        // Subsequent calls also return true (counter is sticky), but
+        // the runner uses `is_stuck` to dedupe so the state machine
+        // doesn't see the same event twice.
+        assert!(t.record_rest_failure(VenueLabel::Lighter));
+        assert!(t.is_stuck(), "is_stuck must remain true across calls");
+    }
+
+    /// **Case 14 SIGUSR1 path**: the operator-driven arm route also
+    /// flows through `is_stuck` so the runner converts it to
+    /// `Emergency{KillSwitch}` identically to the REST-fail path.
+    /// SIGUSR1 → `arm(StuckReason::Sigusr1)` → file present → runner
+    /// reads `is_stuck() == true` → Emergency event. Surface the
+    /// `current_reason` "ARMED" tag separately so the dashboard can
+    /// distinguish SIGUSR1 from REST counters even though both share
+    /// the same state-machine event.
+    #[test]
+    fn case14_sigusr1_arm_is_visible_via_is_stuck_and_current_reason() {
+        let tmp = TempDir::new().unwrap();
+        let mut t = StuckTripwire::new_for_test(cfg_in(&tmp));
+        assert!(!t.is_stuck());
+        assert_eq!(t.current_reason(), None);
+        t.arm(StuckReason::Sigusr1);
+        assert!(t.is_stuck(), "runner reads this to emit Emergency");
+        assert_eq!(t.current_reason(), Some("ARMED"));
+    }
+
+    /// **Case 14 cross-path**: REST counter armed for Extended does
+    /// NOT advance the Lighter counter, but `is_stuck` reflects the
+    /// global file. The runner should treat any `is_stuck` as a
+    /// reason to emit Emergency{KillSwitch} regardless of which
+    /// counter armed it; per-venue counters are operational
+    /// information for triage, not an event-routing decision.
+    #[test]
+    fn case14_per_venue_arm_still_surfaces_global_is_stuck() {
+        let tmp = TempDir::new().unwrap();
+        let mut t = StuckTripwire::new_for_test(cfg_in(&tmp));
+        // Extended arms.
+        for _ in 0..3 {
+            let _ = t.record_rest_failure(VenueLabel::Extended);
+        }
+        assert!(t.is_stuck());
+        // Lighter has zero failures — counter is at 0.
+        // But is_stuck is global → runner emits Emergency on next tick
+        // regardless of which side the venue health monitor was
+        // checking.
+        assert!(t.is_stuck());
+    }
 }
