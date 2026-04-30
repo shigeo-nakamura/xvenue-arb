@@ -614,4 +614,77 @@ mod tests {
             .unwrap();
         assert_eq!(m.summary().unwrap().direction, SpreadDirection::Long);
     }
+
+    /// Catalogue case 11 (`docs/execution_layer.md` §2): during a
+    /// parallel exit one leg fills before the timeout while the other
+    /// is still resting; runner-level `leg_mismatch_timeout_ms` fires
+    /// and emits `Emergency{LegMismatchTimeout}`. The state machine
+    /// must transition `Exiting` → `EmergencyFlattening`, preserve the
+    /// un-zeroed leg's qty (so the EmergencyFlattening loop knows
+    /// what to flatten), and record `LegMismatchTimeout` as the
+    /// reason.
+    #[test]
+    fn leg_mismatch_timeout_in_exiting_emergency_flattens_with_remaining_leg() {
+        let mut m = PositionMachine::new();
+        enter_short(&mut m, 1_000);
+        fill_to_held(&mut m, 1_500, dec!(0.0128));
+        m.apply(
+            60_000,
+            Event::ExitSignal {
+                reason: ExitReason::MeanCross,
+            },
+        )
+        .unwrap();
+        // Extended exit fills; Lighter exit is still pending.
+        m.apply(60_300, Event::ExtendedExitFilled { qty: dec!(0.0128) })
+            .unwrap();
+        assert_eq!(m.phase(), Phase::Exiting);
+        // Runner deadline trips → Emergency{LegMismatchTimeout}.
+        m.apply(
+            63_300,
+            Event::Emergency {
+                reason: EmergencyReason::LegMismatchTimeout,
+            },
+        )
+        .unwrap();
+        assert_eq!(m.phase(), Phase::EmergencyFlattening);
+        let p = m.position().unwrap();
+        assert_eq!(
+            p.last_emergency_reason,
+            Some(EmergencyReason::LegMismatchTimeout)
+        );
+        // Extended fully closed; Lighter still open and must be
+        // flattened by the emergency loop.
+        assert_eq!(p.extended_open_qty, Decimal::ZERO);
+        assert_eq!(p.lighter_open_qty, dec!(0.0128));
+    }
+
+    /// Catalogue case 13 reinforcement: `EmergencyComplete` is only
+    /// valid from `Phase::EmergencyFlattening`. The execution layer
+    /// must not emit it from `Held` / `Exiting` / etc. — this is the
+    /// guard that lets the state machine treat `EmergencyComplete` as
+    /// the explicit "skew + WS confirmed" handshake described in
+    /// `maybe_complete_flat`.
+    #[test]
+    fn emergency_complete_outside_emergency_flattening_is_invalid() {
+        let mut m = PositionMachine::new();
+        enter_short(&mut m, 1_000);
+        fill_to_held(&mut m, 1_500, dec!(0.0128));
+        // From Held: invalid.
+        let err = m.apply(2_000, Event::EmergencyComplete).unwrap_err();
+        assert_eq!(err.phase, Phase::Held);
+        assert_eq!(err.event_kind, "EmergencyComplete");
+        // Phase didn't change.
+        assert_eq!(m.phase(), Phase::Held);
+        // From Exiting: also invalid.
+        m.apply(
+            3_000,
+            Event::ExitSignal {
+                reason: ExitReason::MeanCross,
+            },
+        )
+        .unwrap();
+        let err = m.apply(3_100, Event::EmergencyComplete).unwrap_err();
+        assert_eq!(err.phase, Phase::Exiting);
+    }
 }

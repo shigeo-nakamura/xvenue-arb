@@ -423,4 +423,93 @@ mod tests {
         t.arm(StuckReason::RestFailLimit);
         assert_eq!(t.current_reason(), Some("ARMED"));
     }
+
+    /// Catalogue case 14 (`docs/execution_layer.md` §2): Lighter REST
+    /// `get_positions` fails N times in a row → `Emergency{KillSwitch}`
+    /// regardless of Extended-side state. Existing
+    /// `per_venue_counters_independent` only walked both venues to
+    /// `threshold-1`; this asserts the cross-venue independence holds
+    /// when one side actually crosses the threshold while the other
+    /// has been failing intermittently.
+    #[test]
+    fn rest_consec_fail_for_lighter_arms_independently_of_extended() {
+        let tmp = TempDir::new().unwrap();
+        let mut t = StuckTripwire::new_for_test(cfg_in(&tmp));
+        // Extended noise: one fail, success, one more fail. Counter
+        // bounces around but never reaches threshold=3.
+        t.record_rest_failure(VenueLabel::Extended);
+        t.record_rest_success(VenueLabel::Extended);
+        t.record_rest_failure(VenueLabel::Extended);
+        assert!(!t.is_stuck());
+        // Lighter: 3 consecutive fails — must arm.
+        let armed_at_third = (0..3)
+            .map(|_| t.record_rest_failure(VenueLabel::Lighter))
+            .last()
+            .unwrap();
+        assert!(armed_at_third, "Lighter must arm independently of Extended");
+        assert!(t.is_stuck());
+        let body = std::fs::read_to_string(t.stuck_file_path()).unwrap();
+        assert!(body.contains("REST_FAIL_LIMIT"));
+    }
+
+    /// Boundary check for case 14: only the threshold-th call returns
+    /// `true` from `record_rest_failure`. Documents the off-by-one
+    /// contract that the runner's escalation logic relies on.
+    #[test]
+    fn rest_progression_returns_true_only_at_threshold() {
+        let tmp = TempDir::new().unwrap();
+        let mut t = StuckTripwire::new_for_test(cfg_in(&tmp));
+        let returns: Vec<bool> = (0..3)
+            .map(|_| t.record_rest_failure(VenueLabel::Extended))
+            .collect();
+        assert_eq!(returns, vec![false, false, true]);
+    }
+
+    /// `is_stuck` must always re-read the filesystem so an operator
+    /// `rm $STUCK` clears the halt without needing a restart. Source
+    /// of truth contract per `docs/execution_layer.md` §4.
+    #[test]
+    fn is_stuck_re_reads_filesystem_after_removal() {
+        let tmp = TempDir::new().unwrap();
+        let mut t = StuckTripwire::new_for_test(cfg_in(&tmp));
+        t.arm(StuckReason::Sigusr1);
+        assert!(t.is_stuck());
+        // Operator clears.
+        std::fs::remove_file(t.stuck_file_path()).unwrap();
+        assert!(!t.is_stuck());
+    }
+
+    /// Catalogue case 12 boundary: only the kill-th `record_reduce_only_failure`
+    /// returns `true`; the prior K-1 calls return `false`. This is the
+    /// signal the `EmergencyFlattening` retry loop uses to decide
+    /// "this attempt was the one that crossed the line — write STUCK".
+    #[test]
+    fn reduce_only_progression_returns_true_only_at_threshold() {
+        let tmp = TempDir::new().unwrap();
+        let mut t = StuckTripwire::new_for_test(cfg_in(&tmp));
+        let returns: Vec<bool> = (0..5)
+            .map(|_| t.record_reduce_only_failure())
+            .collect();
+        assert_eq!(returns, vec![false, false, false, false, true]);
+    }
+
+    /// Case 12 consecutive-only contract: a successful close-all in
+    /// the middle of a fail sequence resets the kill counter so the
+    /// runner doesn't trip on transient venue blips.
+    #[test]
+    fn reduce_only_success_resets_counter_mid_sequence() {
+        let tmp = TempDir::new().unwrap();
+        let mut t = StuckTripwire::new_for_test(cfg_in(&tmp));
+        // Four fails — one short of kill threshold (5).
+        for _ in 0..4 {
+            assert!(!t.record_reduce_only_failure());
+        }
+        // A successful close-all attempt resets the counter.
+        t.record_reduce_only_success();
+        // Four more fails must NOT arm (counter restarts at 0).
+        for _ in 0..4 {
+            assert!(!t.record_reduce_only_failure());
+        }
+        assert!(!t.is_stuck());
+    }
 }
