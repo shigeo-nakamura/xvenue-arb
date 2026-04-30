@@ -30,6 +30,13 @@ pub fn global() -> Option<&'static ErrorCounterHandle> {
 /// between polls. 1800 (30 min) absorbs typical drift.
 const ROLLING_WINDOW_SECS: i64 = 1800;
 
+/// Defer-window for transient WebSocket reset events. A WS reset that
+/// auto-recovers within this window does not contribute to the rolling
+/// counts (see bot-strategy#261). Sized for typical Lighter / Extended
+/// reconnect cycles (~5–30s observed); 60s gives headroom for slow
+/// reconnects without ageing out a real persistent disconnect.
+const WS_DEFER_WINDOW_SECS: i64 = 60;
+
 /// Keep the last error message truncated to this many chars so the
 /// dashboard can display it without blowing up the JSON payload.
 const LAST_ERROR_MAX_CHARS: usize = 200;
@@ -56,6 +63,39 @@ struct Counters {
     last_warn: Mutex<Option<(i64, String)>>,
     error_total: AtomicU64,
     warn_total: AtomicU64,
+    /// Transient WS-reset events queued for deferred commit. Each entry
+    /// stays here until either (a) a recovery log line drains it before
+    /// `WS_DEFER_WINDOW_SECS` elapses, or (b) `snapshot()` flushes it into
+    /// `recent` once its deadline passes. See bot-strategy#261.
+    pending_ws: Mutex<VecDeque<PendingWsEntry>>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingWsEntry {
+    ts: i64,
+    level: Level,
+    message: String,
+}
+
+/// Match log lines that signal a transient connectivity event whose effect
+/// should be suppressed if the bot recovers within `WS_DEFER_WINDOW_SECS`.
+/// Covers (1) the connector ERROR raised by the tungstenite WS layer when
+/// the upstream RST-resets, and (2) the WARN downstream of that — the
+/// xvenue-arb tick error and the pairtrade orderbook-stale signals — that
+/// fire while the reconnect is in progress.
+fn is_ws_transient_event(msg: &str) -> bool {
+    msg.starts_with("WebSocket error:")
+        || msg.starts_with("WebSocket IO error detail:")
+        || msg.contains("tick error: read_mid")
+        || msg.contains("order book snapshot unavailable")
+        || msg.contains("waiting for websocket data")
+}
+
+/// Match log lines that signal a successful WS reconnect. Drains pending
+/// transient entries logged within the past `WS_DEFER_WINDOW_SECS`.
+fn is_ws_recovery_event(msg: &str) -> bool {
+    msg.starts_with("WebSocket connected successfully")
+        || msg.contains("WebSocket subscriptions sent successfully")
 }
 
 #[derive(Clone)]
@@ -66,6 +106,10 @@ pub struct ErrorCounterHandle {
 impl ErrorCounterHandle {
     pub fn snapshot(&self) -> ErrorSummary {
         let now = chrono::Utc::now().timestamp();
+        // Flush any pending WS-defer entries whose recovery window has
+        // expired. Lock order: pending_ws → recent → last_error/last_warn,
+        // matching the order in `log()` so no deadlock is possible.
+        flush_expired_pending_ws(&self.counters, now);
         let cutoff = now - ROLLING_WINDOW_SECS;
         let (err_window, warn_window) = {
             let mut recent = self.counters.recent.lock().unwrap();
@@ -121,11 +165,51 @@ impl ErrorCountingLogger {
             last_warn: Mutex::new(None),
             error_total: AtomicU64::new(0),
             warn_total: AtomicU64::new(0),
+            pending_ws: Mutex::new(VecDeque::new()),
         });
         let handle = ErrorCounterHandle {
             counters: Arc::clone(&counters),
         };
         (Self { counters, inner }, handle)
+    }
+}
+
+/// Move pending WS-defer entries whose recovery window has expired into
+/// the durable `recent` queue (and update last_error/last_warn + totals).
+/// Called from both `snapshot()` and `log()` so the counts stay current
+/// regardless of whether the dashboard is polling.
+fn flush_expired_pending_ws(counters: &Counters, now: i64) {
+    let cutoff = now - WS_DEFER_WINDOW_SECS;
+    let mut pending = counters.pending_ws.lock().unwrap();
+    let mut to_commit: Vec<PendingWsEntry> = Vec::new();
+    while let Some(front) = pending.front() {
+        if front.ts <= cutoff {
+            to_commit.push(pending.pop_front().unwrap());
+        } else {
+            break;
+        }
+    }
+    drop(pending);
+    if to_commit.is_empty() {
+        return;
+    }
+    let mut recent = counters.recent.lock().unwrap();
+    for entry in &to_commit {
+        recent.push_back((entry.ts, entry.level));
+    }
+    drop(recent);
+    for entry in to_commit {
+        match entry.level {
+            Level::Error => {
+                counters.error_total.fetch_add(1, Ordering::Relaxed);
+                *counters.last_error.lock().unwrap() = Some((entry.ts, entry.message));
+            }
+            Level::Warn => {
+                counters.warn_total.fetch_add(1, Ordering::Relaxed);
+                *counters.last_warn.lock().unwrap() = Some((entry.ts, entry.message));
+            }
+            _ => {}
+        }
     }
 }
 
@@ -136,22 +220,51 @@ impl Log for ErrorCountingLogger {
 
     fn log(&self, record: &Record) {
         if self.enabled(record.metadata()) {
+            let ts = chrono::Utc::now().timestamp();
+            let msg = record.args().to_string();
+            // Recovery markers fire at INFO; check before the level gate so
+            // they can drain pending entries from any preceding WS reset.
+            if is_ws_recovery_event(&msg) {
+                let cutoff = ts - WS_DEFER_WINDOW_SECS;
+                self.counters
+                    .pending_ws
+                    .lock()
+                    .unwrap()
+                    .retain(|e| e.ts < cutoff);
+            }
+            // Always flush any pending entries whose deadline passed before
+            // we count anything new — keeps the counter monotone in real
+            // time even when snapshot() isn't being called (e.g. dashboard
+            // poll lag).
+            flush_expired_pending_ws(&self.counters, ts);
             let level = record.level();
             if level == Level::Error || level == Level::Warn {
-                let ts = chrono::Utc::now().timestamp();
-                self.counters.recent.lock().unwrap().push_back((ts, level));
-                let msg = record.args().to_string();
                 let truncated = if msg.chars().count() > LAST_ERROR_MAX_CHARS {
                     msg.chars().take(LAST_ERROR_MAX_CHARS).collect::<String>() + "…"
                 } else {
                     msg
                 };
-                if level == Level::Error {
-                    self.counters.error_total.fetch_add(1, Ordering::Relaxed);
-                    *self.counters.last_error.lock().unwrap() = Some((ts, truncated));
+                if is_ws_transient_event(&truncated) {
+                    // Defer: held in pending_ws until either drained by a
+                    // recovery marker or expired by flush_expired_pending_ws.
+                    self.counters
+                        .pending_ws
+                        .lock()
+                        .unwrap()
+                        .push_back(PendingWsEntry {
+                            ts,
+                            level,
+                            message: truncated,
+                        });
                 } else {
-                    self.counters.warn_total.fetch_add(1, Ordering::Relaxed);
-                    *self.counters.last_warn.lock().unwrap() = Some((ts, truncated));
+                    self.counters.recent.lock().unwrap().push_back((ts, level));
+                    if level == Level::Error {
+                        self.counters.error_total.fetch_add(1, Ordering::Relaxed);
+                        *self.counters.last_error.lock().unwrap() = Some((ts, truncated));
+                    } else {
+                        self.counters.warn_total.fetch_add(1, Ordering::Relaxed);
+                        *self.counters.last_warn.lock().unwrap() = Some((ts, truncated));
+                    }
                 }
             }
         }
@@ -160,5 +273,141 @@ impl Log for ErrorCountingLogger {
 
     fn flush(&self) {
         self.inner.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    fn make_counters() -> Arc<Counters> {
+        Arc::new(Counters {
+            recent: Mutex::new(VecDeque::new()),
+            last_error: Mutex::new(None),
+            last_warn: Mutex::new(None),
+            error_total: AtomicU64::new(0),
+            warn_total: AtomicU64::new(0),
+            pending_ws: Mutex::new(VecDeque::new()),
+        })
+    }
+
+    fn fake_log(counters: &Counters, ts: i64, level: Level, msg: &str) {
+        if is_ws_recovery_event(msg) {
+            let cutoff = ts - WS_DEFER_WINDOW_SECS;
+            counters.pending_ws.lock().unwrap().retain(|e| e.ts < cutoff);
+        }
+        flush_expired_pending_ws(counters, ts);
+        if level != Level::Error && level != Level::Warn {
+            return;
+        }
+        let truncated = msg.to_string();
+        if is_ws_transient_event(&truncated) {
+            counters.pending_ws.lock().unwrap().push_back(PendingWsEntry {
+                ts,
+                level,
+                message: truncated,
+            });
+        } else {
+            counters.recent.lock().unwrap().push_back((ts, level));
+            if level == Level::Error {
+                counters.error_total.fetch_add(1, Ordering::Relaxed);
+                *counters.last_error.lock().unwrap() = Some((ts, truncated));
+            } else {
+                counters.warn_total.fetch_add(1, Ordering::Relaxed);
+                *counters.last_warn.lock().unwrap() = Some((ts, truncated));
+            }
+        }
+    }
+
+    fn snap_counts(counters: &Counters, now: i64) -> (u64, u64) {
+        flush_expired_pending_ws(counters, now);
+        let recent = counters.recent.lock().unwrap();
+        let cutoff = now - ROLLING_WINDOW_SECS;
+        let mut e = 0u64;
+        let mut w = 0u64;
+        for &(ts, lvl) in recent.iter() {
+            if ts < cutoff {
+                continue;
+            }
+            match lvl {
+                Level::Error => e += 1,
+                Level::Warn => w += 1,
+                _ => {}
+            }
+        }
+        (e, w)
+    }
+
+    fn _serialize() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        let m = LOCK.get_or_init(|| StdMutex::new(()));
+        match m.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    // bot-strategy#261: WS reset that auto-recovers within
+    // WS_DEFER_WINDOW_SECS must NOT inflate the rolling counter (#260
+    // was the trigger case — single Lighter WS RST produced 2 ERROR + 2
+    // WARN, tripping auto-error workflow despite 27s clean reconnect).
+
+    #[test]
+    fn ws_reset_with_recovery_within_60s_is_suppressed() {
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 1_000_000;
+        // Simulate the #260 sequence verbatim (~27s window).
+        fake_log(&c, t0, Level::Error, "WebSocket error: IO error: Connection reset by peer (os error 104)");
+        fake_log(&c, t0, Level::Error, "WebSocket IO error detail: kind=ConnectionReset, error=Connection reset by peer");
+        fake_log(&c, t0 + 18, Level::Warn, "[XVENUE] tick error: read_mid Lighter\n\nCaused by:\n    get_order_book(ETH, 1): Other(\"order book snapshot unavailable (no recent update)\")");
+        fake_log(&c, t0 + 23, Level::Warn, "[XVENUE] tick error: read_mid Lighter");
+        fake_log(&c, t0 + 27, Level::Info, "WebSocket connected successfully: ...");
+        fake_log(&c, t0 + 27, Level::Info, "WebSocket subscriptions sent successfully");
+        assert!(
+            c.pending_ws.lock().unwrap().is_empty(),
+            "recovery within window must drain pending WS entries"
+        );
+        let (e, w) = snap_counts(&c, t0 + 30);
+        assert_eq!(e, 0, "transient WS errors must not commit");
+        assert_eq!(w, 0, "transient WS warns must not commit");
+    }
+
+    #[test]
+    fn ws_reset_without_recovery_commits_after_deadline() {
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 2_000_000;
+        fake_log(&c, t0, Level::Error, "WebSocket error: IO error: Connection reset by peer (os error 104)");
+        fake_log(&c, t0 + 5, Level::Warn, "[XVENUE] tick error: read_mid Lighter");
+        let (e0, w0) = snap_counts(&c, t0 + 30);
+        assert_eq!((e0, w0), (0, 0), "pre-deadline must not commit");
+        let (e1, w1) = snap_counts(&c, t0 + WS_DEFER_WINDOW_SECS + 10);
+        assert_eq!(e1, 1, "post-deadline ERROR commits");
+        assert_eq!(w1, 1, "post-deadline WARN commits");
+    }
+
+    #[test]
+    fn ws_reset_with_late_recovery_does_not_uncommit() {
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 3_000_000;
+        fake_log(&c, t0, Level::Error, "WebSocket error: IO error: Connection reset by peer");
+        let (e0, _) = snap_counts(&c, t0 + WS_DEFER_WINDOW_SECS + 1);
+        assert_eq!(e0, 1, "post-deadline ERROR commits");
+        fake_log(&c, t0 + 120, Level::Info, "WebSocket connected successfully: ...");
+        let (e1, _) = snap_counts(&c, t0 + 130);
+        assert_eq!(e1, 1, "late recovery cannot uncommit");
+    }
+
+    #[test]
+    fn non_ws_error_commits_immediately() {
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 4_000_000;
+        fake_log(&c, t0, Level::Error, "Some other ERROR unrelated to WS");
+        let (e, _) = snap_counts(&c, t0 + 1);
+        assert_eq!(e, 1, "non-WS errors must not be deferred");
     }
 }
