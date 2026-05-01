@@ -1102,27 +1102,41 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
                 let live = live_exec.expect(
                     "go_live = !cfg.dry_run && live_exec.is_some(); checked above",
                 );
-                // Capture position direction + qty BEFORE applying
-                // ExitSignal — `summary()` returns `None` once we
-                // leave Held.
-                let position_dir = match machine.summary() {
-                    Some(p) => p.direction,
+                // Read direction + per-venue open qty from the
+                // state machine's `Position` (#268 S5-2). The
+                // machine is the source of truth: each venue's
+                // qty is updated independently as `*Filled` events
+                // land during entry, so an asymmetric entry (e.g.
+                // Extended partial-fill + Lighter full-fill)
+                // surfaces here as ext_qty != lt_qty. The runner-
+                // level `open_qty` cache is no longer consulted on
+                // exit — but kept because the paper-mode WS-stale
+                // / skew short-circuits still use it.
+                let (position_dir, ext_qty, lt_qty) = match machine.position() {
+                    Some(p) => (p.direction, p.extended_open_qty, p.lighter_open_qty),
                     None => {
                         log::warn!(
-                            "[XVENUE] LIVE EXIT skipped: no position summary in phase {:?}",
+                            "[XVENUE] LIVE EXIT skipped: no position in phase {:?}",
                             machine.phase()
                         );
                         return Ok(());
                     }
                 };
-                let qty = open_qty.take().unwrap_or(Decimal::ZERO);
-                if qty <= Decimal::ZERO {
+                if ext_qty <= Decimal::ZERO && lt_qty <= Decimal::ZERO {
+                    // No legs to close — log + skip. Don't touch
+                    // open_qty (leave its existing value alone for
+                    // paper-mode short-circuits).
                     log::warn!(
-                        "[XVENUE] LIVE EXIT skipped: open_qty zero or unset in phase {:?}",
+                        "[XVENUE] LIVE EXIT skipped: both legs already zero in phase {:?}",
                         machine.phase()
                     );
                     return Ok(());
                 }
+                // Clear the runner-level cache so a subsequent paper-
+                // mode short-circuit doesn't synthesise stale
+                // ExitFilled events. Live mode no longer reads it
+                // post-S5-2.
+                let _ = open_qty.take();
                 machine.apply(now_ts_ms, Event::ExitSignal { reason })?;
                 summary.last_decision_ts_ms = Some(now_ts_ms);
                 summary.decisions_exit += 1;
@@ -1134,11 +1148,13 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
                     SpreadDirection::Short => (DcOrderSide::Long, DcOrderSide::Short),
                 };
                 log::info!(
-                    "[XVENUE] LIVE EXIT start reason={:?} dev_bps={:?} dir={:?} qty={}",
+                    "[XVENUE] LIVE EXIT start reason={:?} dev_bps={:?} dir={:?} \
+                     ext_qty={} lt_qty={}",
                     reason,
                     dev,
                     position_dir,
-                    qty,
+                    ext_qty,
+                    lt_qty,
                 );
                 let outcome = ParallelExitLoop::new(
                     &*live.ext_ops,
@@ -1151,14 +1167,14 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
                     ExtendedEntryRequest {
                         symbol: live.ext_symbol.clone(),
                         side: ext_exit_side,
-                        target_qty: qty,
+                        target_qty: ext_qty,
                         dust_qty: live.dust_qty,
                         reduce_only: true,
                     },
                     LighterFillRequest {
                         symbol: live.lt_symbol.clone(),
                         side: lt_exit_side,
-                        target_qty: qty,
+                        target_qty: lt_qty,
                         dust_qty: live.dust_qty,
                         reduce_only: true,
                     },
@@ -3165,5 +3181,71 @@ leg_mismatch_timeout_ms: 100
             "dry_run must not dispatch real orders even on exit"
         );
         assert!(lt_vops.snapshot_takers().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_exit_per_venue_qty_diverges_when_entry_was_asymmetric() {
+        // S5-2: when entry produces different per-venue fills (e.g.
+        // Extended partial-fill 0.5 + Lighter full-fill 1.0), the
+        // exit MUST close each venue's actual open qty, not a single
+        // cached value. Pre-S5-2 both legs would have used the same
+        // `open_qty` cache, over- or under-targeting one leg.
+        let mut cfg = live_test_cfg();
+        cfg.dry_run = false;
+        let (ext_seq, lt_seq) = breach_then_hold_sequence(70);
+        let total = ext_seq.len() as u64;
+        let hub = Arc::new(ScriptedHub::new(ext_seq, lt_seq));
+        let ext_vops = Arc::new(ScriptedVenueOps::new());
+        ext_vops.with_state(|s| {
+            // Asymmetric fills: Extended 0.5, Lighter 1.0. Both
+            // terminal so the chase loops short-circuit on first
+            // poll — keeps the test deterministic without juggling
+            // queues.
+            s.default_fill = OrderFillStatus {
+                filled_qty: dec!(0.5),
+                terminal: true,
+                cancelled: false,
+            };
+        });
+        let lt_vops = Arc::new(ScriptedVenueOps::new());
+        lt_vops.with_state(|s| {
+            s.default_fill = OrderFillStatus {
+                filled_qty: dec!(1.0),
+                terminal: true,
+                cancelled: false,
+            };
+        });
+        let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
+        let (machine, summary, _open_qty) =
+            drive_live_ticks(&cfg, &*hub, &live, total).await;
+        assert!(summary.decisions_enter_short >= 1);
+        assert!(summary.decisions_exit >= 1);
+        assert_eq!(
+            machine.phase(),
+            Phase::Flat,
+            "exit completes even on asymmetric fills"
+        );
+        // Two takers per venue: one entry, one exit.
+        let ext_takers = ext_vops.snapshot_takers();
+        let lt_takers = lt_vops.snapshot_takers();
+        assert_eq!(ext_takers.len(), 2, "ext takers: entry + exit");
+        assert_eq!(lt_takers.len(), 2, "lt takers: entry + exit");
+        // Exit (index 1) must use per-venue qty matching what each
+        // venue actually has open. The position machine recorded
+        // ExtendedFilled{0.5} + LighterFilled{1.0} during entry,
+        // so the exit's target_qty diverges per leg.
+        assert_eq!(
+            ext_takers[1].2,
+            dec!(0.5),
+            "ext exit qty must match position.extended_open_qty (0.5)"
+        );
+        assert_eq!(
+            lt_takers[1].2,
+            dec!(1.0),
+            "lt exit qty must match position.lighter_open_qty (1.0)"
+        );
+        // Both exit takers reduce_only=true.
+        assert!(ext_takers[1].3, "ext exit must be reduce_only");
+        assert!(lt_takers[1].3, "lt exit must be reduce_only");
     }
 }
