@@ -13,8 +13,11 @@ use std::sync::Arc;
 use chrono::{DateTime, FixedOffset, Utc};
 use debot::error_counter::{self, ErrorCountingLogger};
 use debot::ports::live_dual::LiveVenueHub;
+use debot::trade::execution::live_venue_ops::LiveVenueOps;
+use debot::trade::execution::venue_ops::VenueOps;
 use debot::xvenue::config::XvenueConfig;
 use debot::xvenue::live::{run_paper_loop, LiveLoopConfig};
+use debot::xvenue::live_exec::LiveExecution;
 use dex_connector::DexConnector;
 use env_logger::Builder;
 use log::LevelFilter;
@@ -182,6 +185,15 @@ async fn run() -> anyhow::Result<()> {
             symbol_lighter: cfg.symbol_lt.clone(),
         });
 
+        // Build LiveExecution by wrapping each connector in
+        // LiveVenueOps (#244 Sprint 4 plumbing). When `cfg.dry_run`
+        // is true the runner ignores it and stays on the synthetic-
+        // fill paper path; only `dry_run = false` actually exercises
+        // the executors.
+        let ext_ops: Arc<dyn VenueOps> = Arc::new(LiveVenueOps::new(extended.clone()));
+        let lt_ops: Arc<dyn VenueOps> = Arc::new(LiveVenueOps::new(lighter.clone()));
+        let live_exec = Arc::new(LiveExecution::from_config(&cfg, ext_ops, lt_ops)?);
+
         // Wire SIGTERM + SIGINT to a oneshot so the loop exits cleanly.
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         tokio::spawn(async move {
@@ -195,7 +207,7 @@ async fn run() -> anyhow::Result<()> {
         });
 
         let loop_cfg = LiveLoopConfig::from_xvenue(&cfg);
-        let summary = run_paper_loop(cfg, loop_cfg, hub, shutdown_rx).await?;
+        let summary = run_paper_loop(cfg, loop_cfg, hub, Some(live_exec), shutdown_rx).await?;
         log::info!(
             "[EXIT] ticks={} samples={} hold={} enter_l={} enter_s={} exit={} \
              ks_blocked={} stuck_blocked={} dd_blocked={} sd_blocked={} cb_blocked={}",

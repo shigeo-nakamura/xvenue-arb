@@ -8,6 +8,7 @@ pub mod bt;
 pub mod bt_grid;
 pub mod config;
 pub mod live;
+pub mod live_exec;
 pub mod signal;
 pub mod sizing;
 pub mod spread;

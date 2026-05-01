@@ -25,11 +25,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use dex_connector::OrderSide as DcOrderSide;
 use rust_decimal::Decimal;
 use tokio::sync::oneshot;
 
 use super::config::XvenueConfig;
+use super::live_exec::LiveExecution;
 use super::signal::{Decision, ExitReason, SignalEngine, SpreadDirection};
+use super::sizing::{compute_notional_usd, notional_to_qty, SizeOutcome};
 use super::spread::SpreadEngine;
 use super::state::{Event, PositionMachine};
 use super::status::{equity_decimal_to_f64, StatusReporter};
@@ -38,6 +41,9 @@ use crate::risk::manager::{BlockReason, RiskManager};
 use crate::risk::reference_guard::{RefCheckOutcome, ReferenceGuard};
 use crate::risk::skew_monitor::{SkewMonitor, SkewOutcome};
 use crate::risk::ws_health::{WsHealthMonitor, WsHealthOutcome};
+use crate::trade::execution::extended_maker::{ExtendedEntryRequest, ExtendedMakerLoop};
+use crate::trade::execution::lighter_fill::{LighterFillLoop, LighterFillRequest};
+use crate::trade::execution::types::{ExtendedTerminal, LighterTerminal};
 
 /// Which venue an operation targets. Avoids leaking the underlying
 /// DexConnector type into the runner core so the mock in
@@ -156,6 +162,26 @@ pub struct LivePaperSummary {
     /// to `Emergency{SkewBreach}` (#244 Group C / `risk::skew_monitor`).
     /// Counts trips, not ticks the latch stays armed.
     pub skew_emergencies_emitted: u64,
+    /// Live-mode `Decision::Enter` outcomes that were skipped because
+    /// equity-driven sizing fell below `min_notional_usd`. Distinct
+    /// from the risk-gate counters: the strategy *would* enter, but
+    /// the position would be too small to bother with.
+    pub live_entries_skipped_size_below_min: u64,
+    /// Live-mode `Decision::Enter` outcomes that were skipped because
+    /// one or both venue equity reads returned `None` / non-positive.
+    /// Common during connector warm-up.
+    pub live_entries_skipped_equity_unavailable: u64,
+    /// Live-mode `Decision::Enter` cycles where the Extended leg's
+    /// executor returned `Failed` (post-only exhausted, taker
+    /// rejected, etc.) before any fill landed. State machine
+    /// transitions back to `Flat`.
+    pub live_entries_extended_failed: u64,
+    /// Live-mode `Decision::Enter` cycles where Extended filled but
+    /// Lighter's executor returned `Failed`. The state machine
+    /// transitions to `EmergencyFlattening` to clean up the open
+    /// Extended leg (Sprint 4 emergency_loop wiring will drive the
+    /// reduce-only flatten).
+    pub live_entries_lighter_failed_after_extended: u64,
 }
 
 /// Control surface for the run loop.
@@ -180,10 +206,20 @@ impl LiveLoopConfig {
 /// Run the paper-trading loop until `shutdown` resolves. The caller wires
 /// `shutdown` to SIGTERM / SIGINT; on resolution we exit cleanly with
 /// the latest counters.
+///
+/// `live_exec`:
+/// - `None` (or `cfg.dry_run = true`): runner stays on the synthetic
+///   paper-fill path used by Phase 2. Existing tests / BT replay path
+///   pass `None` so behaviour is unchanged.
+/// - `Some(_)` with `dry_run = false`: `Decision::Enter` /
+///   `Decision::Exit` dispatch real orders via the executors held in
+///   [`LiveExecution`]. Sprint 4 wiring lands the Enter path first;
+///   Exit and EmergencyFlattening will follow in subsequent commits.
 pub async fn run_paper_loop<H: VenueHub + ?Sized>(
     cfg: XvenueConfig,
     loop_cfg: LiveLoopConfig,
     hub: Arc<H>,
+    live_exec: Option<Arc<LiveExecution>>,
     mut shutdown: oneshot::Receiver<()>,
 ) -> Result<LivePaperSummary> {
     let mut spread = SpreadEngine::new(cfg.spread_config());
@@ -290,6 +326,7 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                     &mut warmup,
                     &mut ws_health,
                     &mut skew_monitor,
+                    live_exec.as_deref(),
                 ).await {
                     // Read-mid / decision errors are logged but don't
                     // terminate the loop. Phase 3 will add a consec-fail
@@ -415,6 +452,7 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
     warmup: &mut VenueWarmup,
     ws_health: &mut WsHealthMonitor,
     skew_monitor: &mut SkewMonitor,
+    live_exec: Option<&LiveExecution>,
 ) -> Result<()> {
     // Drain any pending SIGUSR1 — arms the STUCK file if needed.
     let _ = stuck.poll_sigusr1();
@@ -707,6 +745,24 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
         decision = Decision::Hold;
     }
 
+    // Phase gate: signal.decide() only sees a position via
+    // `machine.summary()`, which is `Some` only in `Phase::Held`.
+    // During EnteringExtended / EnteringLighter / Exiting /
+    // EmergencyFlattening the strategy can re-emit Enter and the
+    // state machine would reject the resulting EntrySignal. Down-
+    // grade to Hold so a multi-tick failure mode (e.g. Lighter
+    // failed-after-Extended landing in EmergencyFlattening) doesn't
+    // panic the runner on the next tick's Decision::Enter.
+    if matches!(decision, Decision::Enter(_))
+        && !matches!(super::state::PositionMachine::phase(machine), super::state::Phase::Flat)
+    {
+        log::debug!(
+            "[XVENUE] Decision::Enter suppressed: phase={:?} (not Flat)",
+            super::state::PositionMachine::phase(machine),
+        );
+        decision = Decision::Hold;
+    }
+
     // Risk gates (#244 D-2..D-7). KILL_SWITCH ran first so the
     // operator-pause path doesn't burn a risk-gate counter; risk
     // gates fire only if the bot is otherwise willing to enter.
@@ -737,41 +793,210 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
             summary.decisions_hold += 1;
         }
         Decision::Enter(dir) => {
-            // Phase 2 paper: log the decision, walk the state machine
-            // through synthetic Filled events so the engine stays
-            // exercised end-to-end. Phase 3 replaces this with real
-            // order placement.
-            let qty = paper_qty(cfg.min_notional_usd, ext_snap.mid)?;
-            let notional = Decimal::from_f64_retain(cfg.min_notional_usd)
-                .unwrap_or(Decimal::ZERO);
-            machine.apply(
-                now_ts_ms,
-                Event::EntrySignal {
-                    direction: dir,
-                    notional_usd: notional,
-                },
-            )?;
-            machine.apply(now_ts_ms, Event::ExtendedFilled { qty })?;
-            machine.apply(now_ts_ms, Event::LighterFilled { qty })?;
-            *open_qty = Some(qty);
-            if let Some(r) = reporter.as_deref_mut() {
-                r.record_fill(true, true, now_ts_ms);
+            let go_live = !cfg.dry_run && live_exec.is_some();
+            if !go_live {
+                // Paper-mode synthetic fills: walk the state machine
+                // through one EntrySignal + both Filled events in
+                // series so the engine stays exercised end-to-end.
+                // Used in dry-run and by tests / BT replay paths.
+                let qty = paper_qty(cfg.min_notional_usd, ext_snap.mid)?;
+                let notional = Decimal::from_f64_retain(cfg.min_notional_usd)
+                    .unwrap_or(Decimal::ZERO);
+                machine.apply(
+                    now_ts_ms,
+                    Event::EntrySignal {
+                        direction: dir,
+                        notional_usd: notional,
+                    },
+                )?;
+                machine.apply(now_ts_ms, Event::ExtendedFilled { qty })?;
+                machine.apply(now_ts_ms, Event::LighterFilled { qty })?;
+                *open_qty = Some(qty);
+                if let Some(r) = reporter.as_deref_mut() {
+                    r.record_fill(true, true, now_ts_ms);
+                }
+                summary.last_decision_ts_ms = Some(now_ts_ms);
+                match dir {
+                    SpreadDirection::Long => summary.decisions_enter_long += 1,
+                    SpreadDirection::Short => summary.decisions_enter_short += 1,
+                }
+                log::info!(
+                    "[XVENUE] PAPER ENTER dir={:?} dev_bps={:?} ext_mid={} lt_mid={} \
+                     qty={} dry_run={}",
+                    dir,
+                    dev,
+                    ext_snap.mid,
+                    lt_snap.mid,
+                    qty,
+                    cfg.dry_run,
+                );
+            } else {
+                // Live mode: equity-driven sizing, real-order
+                // dispatch, single-tick failure-mode handling. Sprint
+                // 4 step 1/3.
+                let live = live_exec.expect(
+                    "go_live = !cfg.dry_run && live_exec.is_some(); checked above",
+                );
+                let ext_eq_opt = hub.read_equity_usd(Venue::Extended).await.ok().flatten();
+                let lt_eq_opt = hub.read_equity_usd(Venue::Lighter).await.ok().flatten();
+                let sized = compute_notional_usd(
+                    ext_eq_opt,
+                    lt_eq_opt,
+                    cfg.trade_size_pct,
+                    cfg.min_notional_usd,
+                    cfg.max_notional_usd,
+                );
+                let notional = match sized {
+                    SizeOutcome::Use(n) => n,
+                    SizeOutcome::BelowMin => {
+                        log::warn!(
+                            "[XVENUE] LIVE ENTER skipped: sized notional below \
+                             min_notional_usd (ext_eq={:?} lt_eq={:?} pct={} min={})",
+                            ext_eq_opt,
+                            lt_eq_opt,
+                            cfg.trade_size_pct,
+                            cfg.min_notional_usd,
+                        );
+                        summary.live_entries_skipped_size_below_min += 1;
+                        return Ok(());
+                    }
+                    SizeOutcome::EquityUnavailable => {
+                        log::warn!(
+                            "[XVENUE] LIVE ENTER skipped: equity unavailable \
+                             (ext_eq={:?} lt_eq={:?})",
+                            ext_eq_opt,
+                            lt_eq_opt,
+                        );
+                        summary.live_entries_skipped_equity_unavailable += 1;
+                        return Ok(());
+                    }
+                };
+                let Some(ext_qty) = notional_to_qty(notional, ext_snap.mid) else {
+                    log::warn!(
+                        "[XVENUE] LIVE ENTER skipped: ext mid non-positive ({})",
+                        ext_snap.mid
+                    );
+                    return Ok(());
+                };
+                let Some(lt_qty) = notional_to_qty(notional, lt_snap.mid) else {
+                    log::warn!(
+                        "[XVENUE] LIVE ENTER skipped: lt mid non-positive ({})",
+                        lt_snap.mid
+                    );
+                    return Ok(());
+                };
+                machine.apply(
+                    now_ts_ms,
+                    Event::EntrySignal {
+                        direction: dir,
+                        notional_usd: notional,
+                    },
+                )?;
+                summary.last_decision_ts_ms = Some(now_ts_ms);
+                match dir {
+                    SpreadDirection::Long => summary.decisions_enter_long += 1,
+                    SpreadDirection::Short => summary.decisions_enter_short += 1,
+                }
+                log::info!(
+                    "[XVENUE] LIVE ENTER start dir={:?} dev_bps={:?} ext_mid={} lt_mid={} \
+                     notional={} ext_qty={} lt_qty={}",
+                    dir,
+                    dev,
+                    ext_snap.mid,
+                    lt_snap.mid,
+                    notional,
+                    ext_qty,
+                    lt_qty,
+                );
+                let (ext_side, lt_side) = match dir {
+                    // Direction sign convention (cf. dev_breach test +
+                    // signal.rs): SpreadDirection::Long means the spread
+                    // is below mean and we expect mean reversion → buy
+                    // the cheap leg (Extended) and sell the rich leg
+                    // (Lighter). Short is symmetric.
+                    SpreadDirection::Long => (DcOrderSide::Long, DcOrderSide::Short),
+                    SpreadDirection::Short => (DcOrderSide::Short, DcOrderSide::Long),
+                };
+                // Sequential Extended-first dispatch per DESIGN.md
+                // §4.1. Lighter fires only after Extended terminates
+                // — a serial dispatch keeps the legged-exposure
+                // window bounded by Extended's chase × retries
+                // budget rather than the parallel max.
+                let ext_term = ExtendedMakerLoop::new(
+                    &*live.ext_ops,
+                    &live.extended_maker_cfg,
+                )
+                .run_entry(ExtendedEntryRequest {
+                    symbol: live.ext_symbol.clone(),
+                    side: ext_side,
+                    target_qty: ext_qty,
+                    dust_qty: live.dust_qty,
+                    reduce_only: false,
+                })
+                .await;
+                match ext_term {
+                    ExtendedTerminal::Filled { qty } => {
+                        machine.apply(now_ts_ms, Event::ExtendedFilled { qty })?;
+                        if let Some(r) = reporter.as_deref_mut() {
+                            r.record_fill(true, false, now_ts_ms);
+                        }
+                        log::info!("[XVENUE] LIVE ENTER ext filled qty={}", qty);
+                        let lt_term = LighterFillLoop::new(
+                            &*live.lt_ops,
+                            &live.lighter_fill_cfg,
+                        )
+                        .run(LighterFillRequest {
+                            symbol: live.lt_symbol.clone(),
+                            side: lt_side,
+                            target_qty: lt_qty,
+                            dust_qty: live.dust_qty,
+                            reduce_only: false,
+                        })
+                        .await;
+                        match lt_term {
+                            LighterTerminal::Filled { qty: lt_filled } => {
+                                machine.apply(
+                                    now_ts_ms,
+                                    Event::LighterFilled { qty: lt_filled },
+                                )?;
+                                *open_qty = Some(lt_filled);
+                                if let Some(r) = reporter.as_deref_mut() {
+                                    r.record_fill(false, true, now_ts_ms);
+                                }
+                                log::info!(
+                                    "[XVENUE] LIVE ENTER lt filled qty={} → Held",
+                                    lt_filled
+                                );
+                            }
+                            LighterTerminal::Failed { reason } => {
+                                log::error!(
+                                    "[XVENUE] LIVE ENTER lt failed reason={:?} → \
+                                     emergency (ext leg open qty={})",
+                                    reason,
+                                    qty,
+                                );
+                                machine.apply(now_ts_ms, Event::LighterFailed)?;
+                                summary.live_entries_lighter_failed_after_extended += 1;
+                                // open_qty intentionally stays None at
+                                // this layer; the open Extended leg
+                                // will be flattened by the
+                                // emergency_loop wiring (Sprint 4 step
+                                // 3/3). State machine has already
+                                // routed to EmergencyFlattening.
+                            }
+                        }
+                    }
+                    ExtendedTerminal::Failed { reason } => {
+                        log::error!(
+                            "[XVENUE] LIVE ENTER ext failed reason={:?} → state→Flat \
+                             (no fills landed)",
+                            reason,
+                        );
+                        machine.apply(now_ts_ms, Event::ExtendedFailed)?;
+                        summary.live_entries_extended_failed += 1;
+                    }
+                }
             }
-            summary.last_decision_ts_ms = Some(now_ts_ms);
-            match dir {
-                SpreadDirection::Long => summary.decisions_enter_long += 1,
-                SpreadDirection::Short => summary.decisions_enter_short += 1,
-            }
-            log::info!(
-                "[XVENUE] {} ENTER dir={:?} dev_bps={:?} ext_mid={} lt_mid={} qty={} dry_run={}",
-                if cfg.dry_run { "PAPER" } else { "LIVE" },
-                dir,
-                dev,
-                ext_snap.mid,
-                lt_snap.mid,
-                qty,
-                cfg.dry_run,
-            );
         }
         Decision::Exit(reason) => {
             let qty = open_qty.take().unwrap_or(Decimal::ZERO);
@@ -906,7 +1131,7 @@ max_hold_sec: 60
         let (tx, rx) = oneshot::channel();
         // Send shutdown immediately
         let _ = tx.send(());
-        let summary = timeout(Duration::from_secs(1), run_paper_loop(cfg, loop_cfg, hub, rx))
+        let summary = timeout(Duration::from_secs(1), run_paper_loop(cfg, loop_cfg, hub, None, rx))
             .await
             .expect("loop did not terminate")
             .unwrap();
@@ -948,6 +1173,7 @@ max_hold_sec: 60
             &mut warmup,
             &mut ws_health,
             &mut skew_monitor,
+            None,
         )
         .await
         .unwrap();
@@ -987,6 +1213,7 @@ max_hold_sec: 60
             &mut warmup,
             &mut ws_health,
             &mut skew_monitor,
+            None,
         )
         .await
         .unwrap();
@@ -1056,6 +1283,7 @@ max_hold_sec: 60
                 &mut warmup,
                 &mut ws_health,
                 &mut skew_monitor,
+                None,
             )
             .await
             .unwrap();
@@ -1133,6 +1361,7 @@ max_hold_sec: 60
                 &mut warmup,
                 &mut ws_health,
                 &mut skew_monitor,
+                None,
             )
             .await
             .unwrap();
@@ -1204,6 +1433,7 @@ max_hold_sec: 60
                 &mut warmup,
                 &mut ws_health,
                 &mut skew_monitor,
+                None,
             )
             .await
             .unwrap();
@@ -1274,6 +1504,7 @@ max_hold_sec: 60
                 &mut warmup,
                 &mut ws_health,
                 &mut skew_monitor,
+                None,
             )
             .await
             .unwrap();
@@ -1312,7 +1543,7 @@ max_hold_sec: 60
             status_log_interval_ms: 10_000,
         };
         let (tx, rx) = oneshot::channel();
-        let handle = tokio::spawn(run_paper_loop(cfg, loop_cfg, hub, rx));
+        let handle = tokio::spawn(run_paper_loop(cfg, loop_cfg, hub, None, rx));
         tokio::time::sleep(Duration::from_millis(80)).await;
         let _ = tx.send(());
         let summary = handle.await.unwrap().unwrap();
@@ -1370,6 +1601,7 @@ max_hold_sec: 60
                 &mut warmup,
                 &mut ws_health,
                 &mut skew_monitor,
+                None,
             )
             .await
             .expect("warm-up errors must not propagate");
@@ -1398,6 +1630,7 @@ max_hold_sec: 60
             &mut warmup,
             &mut ws_health,
             &mut skew_monitor,
+            None,
         )
         .await
         .expect("warm-up errors must not propagate");
@@ -1422,6 +1655,7 @@ max_hold_sec: 60
                 &mut warmup,
                 &mut ws_health,
                 &mut skew_monitor,
+                None,
             )
             .await
             .expect("warm-up errors must not propagate");
@@ -1441,6 +1675,7 @@ max_hold_sec: 60
             &mut warmup,
             &mut ws_health,
             &mut skew_monitor,
+            None,
         )
         .await
         .expect("post-warmup tick must succeed");
@@ -1504,6 +1739,7 @@ max_hold_sec: 60
             &mut warmup,
             &mut ws_health,
             &mut skew_monitor,
+            None,
         )
         .await
         .expect_err("post-warmup read_mid Err must propagate as Err");
@@ -1512,5 +1748,364 @@ max_hold_sec: 60
             chain.contains("read_mid Extended"),
             "expected context-wrapped error, got: {chain}"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Sprint 4 Decision::Enter live wiring (#244)
+    // ---------------------------------------------------------------
+
+    use crate::trade::execution::venue_ops::{OrderFillStatus, ScriptedVenueOps, VenueOps};
+    use crate::xvenue::live_exec::LiveExecution;
+    use crate::xvenue::state::Phase;
+    use rust_decimal_macros::dec;
+
+    /// Live-mode test config — overrides extended_post_only=false to
+    /// skip maker chase and go straight to taker, plus tight timeouts
+    /// so failure-path tests terminate quickly under
+    /// `tokio::test(start_paused = true)`. min_notional_usd=$50 so
+    /// the default `with_equity($500, $500)` ScriptedHub sizes
+    /// exactly at the minimum.
+    fn live_test_cfg() -> XvenueConfig {
+        let yaml = r#"
+agent_name: live-test
+symbol_ext: ETH-USD
+symbol_lt: ETH
+trade_size_pct: 0.05
+min_notional_usd: 50
+max_notional_usd: 1000
+binance_reference_symbol: ETHUSDT
+reference_max_dev_bps: 100
+spread_bucket_ms: 1000
+rolling_window_sec: 30
+min_warmup_samples: 3
+abs_threshold_bps: 5.0
+persistence_sec: 1
+max_hold_sec: 60
+extended_post_only: false
+extended_chase_retries: 1
+extended_chase_timeout_ms: 100
+extended_taker_fallback: true
+lighter_fill_timeout_ms: 100
+"#;
+        let c: XvenueConfig = serde_yaml::from_str(yaml).unwrap();
+        c.validate().unwrap();
+        c
+    }
+
+    /// Standard breach sequence: 30 buckets at zero spread, then 8
+    /// buckets at +30 bps. Persistence=1 fires `Decision::Enter(Short)`
+    /// near the start of the breach run.
+    fn breach_sequence() -> (Vec<MidSnapshot>, Vec<MidSnapshot>) {
+        let lt_mid = 2000.0;
+        let breach_ext = lt_mid * (1.0 + 30.0 / 10_000.0);
+        let mut ext = Vec::new();
+        let mut lt = Vec::new();
+        let warm_n = 30u64;
+        let breach_n = 8u64;
+        let t0 = 200_000u64;
+        for i in 0..warm_n {
+            ext.push(mid(t0 + i * 1000, lt_mid));
+            lt.push(mid(t0 + i * 1000, lt_mid));
+        }
+        for i in warm_n..(warm_n + breach_n) {
+            ext.push(mid(t0 + i * 1000, breach_ext));
+            lt.push(mid(t0 + i * 1000, lt_mid));
+        }
+        (ext, lt)
+    }
+
+    /// Drive `run_one_tick` through `iters` iterations against `hub`
+    /// + `live`, returning the populated machine + summary. Reduces
+    /// boilerplate across the live-mode tests (each test would
+    /// otherwise duplicate ~30 lines of state setup).
+    async fn drive_live_ticks<H: VenueHub + ?Sized>(
+        cfg: &XvenueConfig,
+        hub: &H,
+        live: &LiveExecution,
+        iters: u64,
+    ) -> (PositionMachine, LivePaperSummary, Option<Decimal>) {
+        let mut spread = SpreadEngine::new(cfg.spread_config());
+        let mut signal = SignalEngine::new(cfg.signal_config());
+        let mut machine = PositionMachine::new();
+        let mut summary = LivePaperSummary::default();
+        let mut open_qty: Option<Decimal> = None;
+        let (_rm_dir, mut rm) = test_risk_manager();
+        let mut rg = test_reference_guard();
+        let (_st_dir, mut stuck) = test_stuck();
+        let mut warmup = VenueWarmup::default();
+        let mut ws_health = WsHealthMonitor::new(0);
+        let mut skew_monitor = SkewMonitor::new(0.0);
+        for _ in 0..iters {
+            run_one_tick(
+                cfg,
+                hub,
+                &mut spread,
+                &mut signal,
+                &mut machine,
+                &mut summary,
+                &mut open_qty,
+                None,
+                &mut rm,
+                &mut rg,
+                &mut stuck,
+                &mut warmup,
+                &mut ws_health,
+                &mut skew_monitor,
+                Some(live),
+            )
+            .await
+            .unwrap();
+        }
+        (machine, summary, open_qty)
+    }
+
+    fn live_with_scripted(
+        cfg: &XvenueConfig,
+        ext: Arc<ScriptedVenueOps>,
+        lt: Arc<ScriptedVenueOps>,
+    ) -> LiveExecution {
+        let ext_dyn: Arc<dyn VenueOps> = ext;
+        let lt_dyn: Arc<dyn VenueOps> = lt;
+        LiveExecution::from_config(cfg, ext_dyn, lt_dyn).expect("live exec from cfg")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_enter_happy_path_walks_extended_then_lighter_to_held() {
+        let mut cfg = live_test_cfg();
+        cfg.dry_run = false;
+        let (ext_seq, lt_seq) = breach_sequence();
+        let hub = Arc::new(ScriptedHub::new(ext_seq, lt_seq));
+        let ext_vops = Arc::new(ScriptedVenueOps::new());
+        ext_vops.with_state(|s| {
+            // Generous default fill saturates whatever target_qty the
+            // sizing layer picks — terminal=true on the first poll so
+            // the run completes in O(1) polls.
+            s.default_fill = OrderFillStatus {
+                filled_qty: dec!(1),
+                terminal: true,
+                cancelled: false,
+            };
+        });
+        let lt_vops = Arc::new(ScriptedVenueOps::new());
+        lt_vops.with_state(|s| {
+            s.default_fill = OrderFillStatus {
+                filled_qty: dec!(1),
+                terminal: true,
+                cancelled: false,
+            };
+        });
+        let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
+        let (machine, summary, open_qty) =
+            drive_live_ticks(&cfg, &*hub, &live, 38).await;
+        assert!(
+            summary.decisions_enter_short >= 1,
+            "expected enter_short ≥ 1, got summary={:?}",
+            summary
+        );
+        assert_eq!(
+            machine.phase(),
+            Phase::Held,
+            "both legs filled → Held; got phase={:?}",
+            machine.phase()
+        );
+        assert!(open_qty.is_some(), "live happy path sets open_qty");
+        assert_eq!(summary.live_entries_extended_failed, 0);
+        assert_eq!(summary.live_entries_lighter_failed_after_extended, 0);
+        assert_eq!(summary.live_entries_skipped_size_below_min, 0);
+        assert_eq!(summary.live_entries_skipped_equity_unavailable, 0);
+        // post_only=false in the test cfg means Extended bypasses
+        // maker — both legs reach the venue via place_taker.
+        assert_eq!(ext_vops.snapshot_takers().len(), 1);
+        assert!(ext_vops.snapshot_posts().is_empty());
+        assert_eq!(lt_vops.snapshot_takers().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_enter_extended_failed_routes_to_flat_without_lighter_call() {
+        let mut cfg = live_test_cfg();
+        cfg.dry_run = false;
+        let (ext_seq, lt_seq) = breach_sequence();
+        let hub = Arc::new(ScriptedHub::new(ext_seq, lt_seq));
+        // Default fill is zero non-terminal → taker times out →
+        // ExtendedTerminal::Failed{Timeout}.
+        let ext_vops = Arc::new(ScriptedVenueOps::new());
+        let lt_vops = Arc::new(ScriptedVenueOps::new());
+        // Lighter is set up but should never be invoked — tests assert
+        // its call count stays zero.
+        lt_vops.with_state(|s| {
+            s.default_fill = OrderFillStatus {
+                filled_qty: dec!(1),
+                terminal: true,
+                cancelled: false,
+            };
+        });
+        let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
+        let (machine, summary, open_qty) =
+            drive_live_ticks(&cfg, &*hub, &live, 38).await;
+        assert!(summary.decisions_enter_short >= 1, "Enter must have fired");
+        assert_eq!(
+            machine.phase(),
+            Phase::Flat,
+            "ExtendedFailed with no fills lands back in Flat"
+        );
+        assert!(
+            open_qty.is_none(),
+            "Extended fail must not leave a phantom open_qty"
+        );
+        assert!(summary.live_entries_extended_failed >= 1);
+        assert_eq!(summary.live_entries_lighter_failed_after_extended, 0);
+        assert!(
+            lt_vops.snapshot_takers().is_empty(),
+            "Lighter executor must not run when Extended already failed"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_enter_lighter_failed_after_extended_routes_to_emergency() {
+        // The legged-exposure case the user emphasised — Extended
+        // filled, Lighter fails. State machine MUST transition to
+        // EmergencyFlattening so the open Extended leg gets cleaned
+        // up (Sprint 4 step 3/3).
+        let mut cfg = live_test_cfg();
+        cfg.dry_run = false;
+        let (ext_seq, lt_seq) = breach_sequence();
+        let hub = Arc::new(ScriptedHub::new(ext_seq, lt_seq));
+        let ext_vops = Arc::new(ScriptedVenueOps::new());
+        ext_vops.with_state(|s| {
+            s.default_fill = OrderFillStatus {
+                filled_qty: dec!(1),
+                terminal: true,
+                cancelled: false,
+            };
+        });
+        // Lighter default = zero non-terminal → times out → Failed{Timeout}.
+        let lt_vops = Arc::new(ScriptedVenueOps::new());
+        let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
+        let (machine, summary, open_qty) =
+            drive_live_ticks(&cfg, &*hub, &live, 38).await;
+        assert!(summary.decisions_enter_short >= 1);
+        assert_eq!(
+            machine.phase(),
+            Phase::EmergencyFlattening,
+            "Lighter fail after Extended fill MUST route to EmergencyFlattening"
+        );
+        assert!(
+            open_qty.is_none(),
+            "open_qty stays None on Lighter fail — emergency_loop drives flatten"
+        );
+        assert!(summary.live_entries_lighter_failed_after_extended >= 1);
+        assert_eq!(summary.live_entries_extended_failed, 0);
+        // Both executors invoked exactly once.
+        assert_eq!(ext_vops.snapshot_takers().len(), 1);
+        assert_eq!(lt_vops.snapshot_takers().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_enter_below_min_notional_skips_state_machine_unchanged() {
+        let mut cfg = live_test_cfg();
+        cfg.dry_run = false;
+        // Equity * pct ($100 * 0.05 = $5) < min_notional ($50) →
+        // SizeOutcome::BelowMin.
+        let (ext_seq, lt_seq) = breach_sequence();
+        let hub = Arc::new(
+            ScriptedHub::new(ext_seq, lt_seq).with_equity(dec!(50), dec!(50)),
+        );
+        let ext_vops = Arc::new(ScriptedVenueOps::new());
+        let lt_vops = Arc::new(ScriptedVenueOps::new());
+        let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
+        let (machine, summary, open_qty) =
+            drive_live_ticks(&cfg, &*hub, &live, 38).await;
+        // `decisions_enter_short` is gated on EntrySignal landing
+        // (mirrors the existing kill_switch / risk-gate pattern: a
+        // skipped Enter does NOT bump the success counter). Proof
+        // the strategy actually decided Enter is the size-skip
+        // counter being non-zero.
+        assert!(
+            summary.live_entries_skipped_size_below_min >= 1,
+            "size-below-min skip must increment its counter on every Enter \
+             that fails sizing; got summary={:?}",
+            summary
+        );
+        assert_eq!(machine.phase(), Phase::Flat, "state machine untouched on skip");
+        assert!(open_qty.is_none());
+        assert_eq!(summary.decisions_enter_short, 0);
+        assert!(
+            ext_vops.snapshot_takers().is_empty(),
+            "no orders flow when sizing is below min"
+        );
+        assert!(lt_vops.snapshot_takers().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_enter_equity_unavailable_skips_state_machine_unchanged() {
+        // Hub variant that returns None for read_equity_usd —
+        // simulates connector warm-up before the equity stream lands.
+        struct NoEquityHub {
+            inner: ScriptedHub,
+        }
+        #[async_trait::async_trait]
+        impl VenueHub for NoEquityHub {
+            async fn read_mid(&self, venue: Venue) -> Result<MidSnapshot> {
+                self.inner.read_mid(venue).await
+            }
+            async fn read_equity_usd(
+                &self,
+                _venue: Venue,
+            ) -> Result<Option<Decimal>> {
+                Ok(None)
+            }
+        }
+        let mut cfg = live_test_cfg();
+        cfg.dry_run = false;
+        let (ext_seq, lt_seq) = breach_sequence();
+        let hub = Arc::new(NoEquityHub {
+            inner: ScriptedHub::new(ext_seq, lt_seq),
+        });
+        let ext_vops = Arc::new(ScriptedVenueOps::new());
+        let lt_vops = Arc::new(ScriptedVenueOps::new());
+        let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
+        let (machine, summary, open_qty) =
+            drive_live_ticks(&cfg, &*hub, &live, 38).await;
+        // Same gating semantics as the size-below-min test: the
+        // counter we assert on is the explicit skip counter, not
+        // decisions_enter_short.
+        assert!(
+            summary.live_entries_skipped_equity_unavailable >= 1,
+            "equity-unavailable skip must increment its counter; got summary={:?}",
+            summary
+        );
+        assert_eq!(machine.phase(), Phase::Flat);
+        assert!(open_qty.is_none());
+        assert_eq!(summary.decisions_enter_short, 0);
+        assert!(ext_vops.snapshot_takers().is_empty());
+        assert!(lt_vops.snapshot_takers().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_enter_paper_path_unchanged_when_dry_run_true() {
+        // dry_run=true must keep the synthetic-fill path even when a
+        // LiveExecution is provided — guards against accidental live
+        // dispatch during BT replay or paper-mode testing.
+        let mut cfg = live_test_cfg();
+        cfg.dry_run = true;
+        let (ext_seq, lt_seq) = breach_sequence();
+        let hub = Arc::new(ScriptedHub::new(ext_seq, lt_seq));
+        let ext_vops = Arc::new(ScriptedVenueOps::new());
+        let lt_vops = Arc::new(ScriptedVenueOps::new());
+        let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
+        let (machine, summary, open_qty) =
+            drive_live_ticks(&cfg, &*hub, &live, 38).await;
+        assert!(summary.decisions_enter_short >= 1);
+        assert_eq!(
+            machine.phase(),
+            Phase::Held,
+            "paper path's synthetic fills land in Held"
+        );
+        assert!(open_qty.is_some());
+        assert!(
+            ext_vops.snapshot_takers().is_empty(),
+            "dry_run must not dispatch real orders"
+        );
+        assert!(lt_vops.snapshot_takers().is_empty());
     }
 }
