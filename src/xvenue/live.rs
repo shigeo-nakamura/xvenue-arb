@@ -193,6 +193,22 @@ pub struct LivePaperSummary {
     /// its own timeout, the other was still in flight when the
     /// `leg_mismatch_timeout_ms` deadline fired. Catalogue case 11.
     pub live_exits_leg_mismatch: u64,
+    /// Number of `Event::EmergencyComplete` transitions fired by
+    /// the runner's emergency-flatten handler (#244 Sprint 4 step
+    /// 3/3) — both legs reported zero open qty, position is closed.
+    pub emergency_completes: u64,
+    /// `close_all` calls inside the emergency handler that returned
+    /// `Err`. Fed into `StuckTripwire::record_reduce_only_failure`;
+    /// once the kill threshold is crossed the tripwire arms the
+    /// STUCK file and the handler stops attempting.
+    pub emergency_close_all_failures: u64,
+    /// Times the emergency handler observed `StuckTripwire::is_stuck()`
+    /// flip true mid-flatten (kill threshold crossed). Operator
+    /// must inspect + clear the STUCK file + drop a `RISK_ACK`.
+    pub emergency_stuck_armed: u64,
+    /// Defensive cap (`emergency_max_attempts`) reached. Should be
+    /// rare — usually the loop completes well before this.
+    pub emergency_max_attempts_exceeded: u64,
 }
 
 /// Control surface for the run loop.
@@ -291,6 +307,15 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
     status_ivl.tick().await; // discard the immediate-fire tick
     let mut open_qty: Option<Decimal> = None;
     let mut warmup = VenueWarmup::default();
+    // Emergency-flatten throttle state (#244 Sprint 4 step 3/3).
+    // Reset whenever phase != EmergencyFlattening so each entry into
+    // the flatten loop starts with a fresh attempt budget. The
+    // tripwire's reduce-only-fail counter is *not* reset here — it
+    // tracks the cross-phase reduce-only failure history and is
+    // cleared by `record_reduce_only_success` on each successful
+    // close_all (see emergency_loop docs §5).
+    let mut last_emergency_attempt_ms: Option<u64> = None;
+    let mut emergency_attempts: u32 = 0;
 
     // Drop an initial snapshot so the dashboard sees the DRY_RUN pill /
     // agent identity on boot instead of waiting for the first
@@ -343,6 +368,37 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                     // terminate the loop. Phase 3 will add a consec-fail
                     // counter that escalates to STUCK file.
                     log::warn!("[XVENUE] tick error: {:?}", e);
+                }
+
+                // Emergency-flatten round (#244 Sprint 4 step 3/3).
+                // Live mode only — paper mode synthesises
+                // EmergencyComplete inline in the WS-stale / skew
+                // handlers. Throttled inside the helper, so calling
+                // every tick is fine.
+                if let Some(live) = live_exec.as_deref() {
+                    if !cfg.dry_run
+                        && matches!(machine.phase(), super::state::Phase::EmergencyFlattening)
+                    {
+                        if let Err(e) = drive_emergency_flatten_round(
+                            live,
+                            &mut machine,
+                            &mut open_qty,
+                            &mut stuck,
+                            &mut summary,
+                            &mut last_emergency_attempt_ms,
+                            &mut emergency_attempts,
+                            wall_clock_ms(),
+                        )
+                        .await
+                        {
+                            log::warn!("[XVENUE] emergency-flatten round error: {:?}", e);
+                        }
+                    } else {
+                        // Reset throttle state so the *next* entry
+                        // into EmergencyFlattening starts fresh.
+                        last_emergency_attempt_ms = None;
+                        emergency_attempts = 0;
+                    }
                 }
             }
 
@@ -1224,6 +1280,159 @@ fn paper_qty(notional_usd: f64, mid: Decimal) -> Result<Decimal> {
     let n = Decimal::from_f64_retain(notional_usd)
         .ok_or_else(|| anyhow::anyhow!("notional_usd not representable"))?;
     Ok((n / mid).round_dp(8))
+}
+
+/// Run one emergency-flatten round (#244 Sprint 4 step 3/3).
+///
+/// Called from `run_paper_loop` on every tick where:
+/// - `cfg.dry_run = false` (paper-mode synthesises EmergencyComplete
+///   inline in the WS-stale / skew handlers, so the live emergency
+///   loop is the only producer of close_all calls).
+/// - `live_exec.is_some()`.
+/// - `machine.phase() == EmergencyFlattening`.
+///
+/// Throttled to `live.emergency_loop_cfg.retry_interval_ms` — the
+/// 30 s cadence is the slow-mm 167-min stuck precedent fix
+/// (`docs/execution_layer.md` §5). Without throttling the runner
+/// would hammer `close_all` every tick (~250 ms) and accumulate
+/// REST failures faster than they decay.
+///
+/// Distinct from `crate::trade::execution::emergency_loop::EmergencyLoop`:
+/// that module owns a self-contained loop with internal sleeps,
+/// suitable for a spawned task. This helper does **one** round per
+/// runner tick so the spread engine + risk monitors keep evaluating
+/// while the flatten is in progress. The kill semantics are
+/// identical (5 consec fails arm STUCK, max_attempts caps total).
+async fn drive_emergency_flatten_round(
+    live: &LiveExecution,
+    machine: &mut PositionMachine,
+    open_qty: &mut Option<Decimal>,
+    stuck: &mut StuckTripwire,
+    summary: &mut LivePaperSummary,
+    last_attempt_ms: &mut Option<u64>,
+    attempts: &mut u32,
+    now_ms: u64,
+) -> Result<()> {
+    // Throttle: skip if we attempted within the last
+    // `retry_interval_ms`. First call (last_attempt_ms = None) goes
+    // through immediately.
+    if let Some(last) = *last_attempt_ms {
+        if now_ms.saturating_sub(last) < live.emergency_loop_cfg.retry_interval_ms {
+            return Ok(());
+        }
+    }
+    // Defensive cap. Once exceeded, the handler stops attempting;
+    // operator inspects (the STUCK file may also be armed by then).
+    if *attempts >= live.emergency_loop_cfg.max_attempts {
+        // Increment once when the cap is first crossed (subsequent
+        // ticks short-circuit here without bumping the counter
+        // again until the phase resets).
+        if !matches!(*last_attempt_ms, None) {
+            // Already counted on the cap-crossing tick.
+        }
+        return Ok(());
+    }
+    // Once STUCK is armed (prior round crossed the kill threshold,
+    // or an operator dropped the file via SIGUSR1) we stop attempting
+    // — the operator must clear it and drop a RISK_ACK.
+    if stuck.is_stuck() {
+        return Ok(());
+    }
+    *attempts += 1;
+
+    // Read each venue's open qty.
+    let qtys = match live.leg_reader.read_leg_qtys().await {
+        Ok(q) => q,
+        Err(e) => {
+            log::warn!(
+                "[XVENUE/emerg] read_leg_qtys err={:?} (treating as still-open, retry next round)",
+                e
+            );
+            *last_attempt_ms = Some(now_ms);
+            return Ok(());
+        }
+    };
+
+    if qtys.both_zero() {
+        // Case 13 boundary — both venues report zero. Emit
+        // EmergencyComplete; state machine transitions back to
+        // Flat (or rejects with TransitionError if we're already
+        // out of EmergencyFlattening, in which case we log and
+        // continue).
+        match machine.apply(now_ms, Event::EmergencyComplete) {
+            Ok(()) => {
+                summary.emergency_completes += 1;
+                *open_qty = None;
+                log::info!(
+                    "[XVENUE/emerg] both legs zero → EmergencyComplete (attempts={})",
+                    *attempts
+                );
+            }
+            Err(e) => {
+                log::debug!(
+                    "[XVENUE/emerg] EmergencyComplete rejected (likely already Flat): {:?}",
+                    e
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    // At least one leg open — issue close_all on the non-zero
+    // venues. Sequential rather than parallel so a Lighter rejection
+    // doesn't mask the Extended-side counter or vice versa (mirrors
+    // EmergencyLoop's per-call kill counter).
+    if !qtys.ext.is_zero() {
+        match live.ext_ops.close_all(None).await {
+            Ok(()) => stuck.record_reduce_only_success(),
+            Err(e) => {
+                log::warn!("[XVENUE/emerg] close_all ext err={:?}", e);
+                summary.emergency_close_all_failures += 1;
+                let armed = stuck.record_reduce_only_failure();
+                if armed {
+                    summary.emergency_stuck_armed += 1;
+                    log::error!(
+                        "[XVENUE/emerg] STUCK armed after ext close_all failure — \
+                         operator must inspect + clear"
+                    );
+                    *last_attempt_ms = Some(now_ms);
+                    return Ok(());
+                }
+            }
+        }
+    }
+    if !qtys.lt.is_zero() {
+        match live.lt_ops.close_all(None).await {
+            Ok(()) => stuck.record_reduce_only_success(),
+            Err(e) => {
+                log::warn!("[XVENUE/emerg] close_all lt err={:?}", e);
+                summary.emergency_close_all_failures += 1;
+                let armed = stuck.record_reduce_only_failure();
+                if armed {
+                    summary.emergency_stuck_armed += 1;
+                    log::error!(
+                        "[XVENUE/emerg] STUCK armed after lt close_all failure — \
+                         operator must inspect + clear"
+                    );
+                    *last_attempt_ms = Some(now_ms);
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    *last_attempt_ms = Some(now_ms);
+
+    if *attempts >= live.emergency_loop_cfg.max_attempts {
+        summary.emergency_max_attempts_exceeded += 1;
+        log::warn!(
+            "[XVENUE/emerg] max_attempts ({}) reached without zeroing legs — \
+             handler will idle until phase resets",
+            live.emergency_loop_cfg.max_attempts
+        );
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2522,6 +2731,411 @@ leg_mismatch_timeout_ms: 100
             summary
         );
         assert_eq!(summary.live_exits_leg_mismatch, 0);
+    }
+
+    // ---------------------------------------------------------------
+    // Sprint 4 step 3/3 — drive_emergency_flatten_round helper
+    // ---------------------------------------------------------------
+
+    /// Scripted LegStateReader for unit tests. Each call to
+    /// `read_leg_qtys` pops the next entry; once drained it
+    /// repeats the last value. This lets a test say "first read
+    /// shows non-zero, after one close_all show zero, return
+    /// Complete" the same way the emergency_loop unit tests do.
+    struct ScriptedLegReader {
+        seq: std::sync::Mutex<std::collections::VecDeque<crate::trade::execution::emergency_loop::LegQtys>>,
+    }
+
+    impl ScriptedLegReader {
+        fn new(
+            seq: Vec<crate::trade::execution::emergency_loop::LegQtys>,
+        ) -> Self {
+            assert!(!seq.is_empty(), "ScriptedLegReader needs ≥1 entry");
+            Self {
+                seq: std::sync::Mutex::new(seq.into()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::trade::execution::emergency_loop::LegStateReader for ScriptedLegReader {
+        async fn read_leg_qtys(
+            &self,
+        ) -> anyhow::Result<crate::trade::execution::emergency_loop::LegQtys> {
+            let mut g = self.seq.lock().unwrap();
+            if g.len() > 1 {
+                Ok(g.pop_front().unwrap())
+            } else {
+                Ok(*g.front().expect("non-empty seq"))
+            }
+        }
+    }
+
+    /// LegStateReader that always returns Err. Distinct from
+    /// `NoopLegStateReader` (which lives in `live_exec`) — placed
+    /// here so the helper signature stays self-contained for tests.
+    struct ErrLegReader;
+    #[async_trait::async_trait]
+    impl crate::trade::execution::emergency_loop::LegStateReader for ErrLegReader {
+        async fn read_leg_qtys(
+            &self,
+        ) -> anyhow::Result<crate::trade::execution::emergency_loop::LegQtys> {
+            Err(anyhow::anyhow!("scripted: reader error"))
+        }
+    }
+
+    /// Helper: walk the position machine into `EmergencyFlattening`
+    /// via a Lighter-fail-after-Extended sequence. Returns the
+    /// machine ready to drive the emergency handler against.
+    fn machine_in_emergency_flattening() -> PositionMachine {
+        let mut m = PositionMachine::new();
+        m.apply(
+            0,
+            Event::EntrySignal {
+                direction: SpreadDirection::Long,
+                notional_usd: dec!(50),
+            },
+        )
+        .unwrap();
+        m.apply(100, Event::ExtendedFilled { qty: dec!(0.025) })
+            .unwrap();
+        // LighterFailed in EnteringLighter → EmergencyFlattening per
+        // state.rs's transition table (validated by the existing
+        // `lighter_failed_in_entering_lighter_emergency_flattens` test).
+        m.apply(200, Event::LighterFailed).unwrap();
+        assert_eq!(m.phase(), Phase::EmergencyFlattening);
+        m
+    }
+
+    /// StuckTripwire with a configurable kill threshold so a test can
+    /// arm STUCK after exactly N reduce-only failures.
+    fn test_stuck_with_kill_threshold(
+        kill_threshold: u32,
+    ) -> (tempfile::TempDir, crate::risk::kill_switch::StuckTripwire) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = crate::risk::kill_switch::StuckTripwireConfig {
+            stuck_file: dir.path().join("STUCK"),
+            rest_consec_fail_to_escalate: 3,
+            reduce_only_consec_fail_to_kill: kill_threshold,
+        };
+        (
+            dir,
+            crate::risk::kill_switch::StuckTripwire::new_for_test(cfg),
+        )
+    }
+
+    fn live_with_leg_reader(
+        cfg: &XvenueConfig,
+        ext: Arc<ScriptedVenueOps>,
+        lt: Arc<ScriptedVenueOps>,
+        reader: Arc<dyn crate::trade::execution::emergency_loop::LegStateReader>,
+    ) -> LiveExecution {
+        let ext_dyn: Arc<dyn VenueOps> = ext;
+        let lt_dyn: Arc<dyn VenueOps> = lt;
+        LiveExecution::from_config(cfg, ext_dyn, lt_dyn)
+            .expect("live exec from cfg")
+            .with_leg_reader(reader)
+    }
+
+    use crate::trade::execution::emergency_loop::LegQtys;
+
+    #[tokio::test]
+    async fn emergency_flatten_round_completes_when_both_legs_zero() {
+        let mut machine = machine_in_emergency_flattening();
+        let ext = Arc::new(ScriptedVenueOps::new());
+        let lt = Arc::new(ScriptedVenueOps::new());
+        let reader: Arc<dyn crate::trade::execution::emergency_loop::LegStateReader> =
+            Arc::new(ScriptedLegReader::new(vec![LegQtys {
+                ext: Decimal::ZERO,
+                lt: Decimal::ZERO,
+            }]));
+        let cfg = live_test_cfg();
+        let live = live_with_leg_reader(&cfg, ext.clone(), lt.clone(), reader);
+        let mut open_qty = Some(dec!(0.025));
+        let (_st_dir, mut stuck) = test_stuck();
+        let mut summary = LivePaperSummary::default();
+        let mut last = None;
+        let mut attempts = 0;
+
+        drive_emergency_flatten_round(
+            &live,
+            &mut machine,
+            &mut open_qty,
+            &mut stuck,
+            &mut summary,
+            &mut last,
+            &mut attempts,
+            1_000,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(machine.phase(), Phase::Flat);
+        assert!(open_qty.is_none(), "EmergencyComplete must clear open_qty");
+        assert_eq!(summary.emergency_completes, 1);
+        assert_eq!(summary.emergency_close_all_failures, 0);
+        assert!(
+            ext.snapshot_close_alls().is_empty(),
+            "no close_all needed when legs already zero"
+        );
+        assert!(lt.snapshot_close_alls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn emergency_flatten_round_calls_close_all_on_nonzero_legs() {
+        let mut machine = machine_in_emergency_flattening();
+        let ext = Arc::new(ScriptedVenueOps::new());
+        let lt = Arc::new(ScriptedVenueOps::new());
+        let reader: Arc<dyn crate::trade::execution::emergency_loop::LegStateReader> =
+            Arc::new(ScriptedLegReader::new(vec![LegQtys {
+                ext: dec!(0.01),
+                lt: dec!(0.01),
+            }]));
+        let cfg = live_test_cfg();
+        let live = live_with_leg_reader(&cfg, ext.clone(), lt.clone(), reader);
+        let mut open_qty = Some(dec!(0.01));
+        let (_st_dir, mut stuck) = test_stuck();
+        let mut summary = LivePaperSummary::default();
+        let mut last = None;
+        let mut attempts = 0;
+
+        drive_emergency_flatten_round(
+            &live,
+            &mut machine,
+            &mut open_qty,
+            &mut stuck,
+            &mut summary,
+            &mut last,
+            &mut attempts,
+            1_000,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            machine.phase(),
+            Phase::EmergencyFlattening,
+            "still flattening — close_all returned Ok but legs read non-zero"
+        );
+        assert_eq!(ext.snapshot_close_alls().len(), 1);
+        assert_eq!(lt.snapshot_close_alls().len(), 1);
+        assert_eq!(summary.emergency_completes, 0);
+        assert_eq!(summary.emergency_close_all_failures, 0);
+        assert_eq!(attempts, 1);
+        assert_eq!(last, Some(1_000));
+    }
+
+    #[tokio::test]
+    async fn emergency_flatten_round_skips_zero_leg_close_all() {
+        // Defensive: only Lighter has open qty → close_all only on
+        // Lighter, not Extended. Mirrors emergency_loop's case 13
+        // partial test.
+        let mut machine = machine_in_emergency_flattening();
+        let ext = Arc::new(ScriptedVenueOps::new());
+        let lt = Arc::new(ScriptedVenueOps::new());
+        let reader: Arc<dyn crate::trade::execution::emergency_loop::LegStateReader> =
+            Arc::new(ScriptedLegReader::new(vec![LegQtys {
+                ext: Decimal::ZERO,
+                lt: dec!(0.01),
+            }]));
+        let cfg = live_test_cfg();
+        let live = live_with_leg_reader(&cfg, ext.clone(), lt.clone(), reader);
+        let mut open_qty = None;
+        let (_st_dir, mut stuck) = test_stuck();
+        let mut summary = LivePaperSummary::default();
+        let mut last = None;
+        let mut attempts = 0;
+
+        drive_emergency_flatten_round(
+            &live,
+            &mut machine,
+            &mut open_qty,
+            &mut stuck,
+            &mut summary,
+            &mut last,
+            &mut attempts,
+            1_000,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            ext.snapshot_close_alls().is_empty(),
+            "Extended already zero — must not be touched"
+        );
+        assert_eq!(lt.snapshot_close_alls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn emergency_flatten_round_throttles_within_retry_interval() {
+        let mut machine = machine_in_emergency_flattening();
+        let ext = Arc::new(ScriptedVenueOps::new());
+        let lt = Arc::new(ScriptedVenueOps::new());
+        let reader: Arc<dyn crate::trade::execution::emergency_loop::LegStateReader> =
+            Arc::new(ScriptedLegReader::new(vec![LegQtys {
+                ext: dec!(0.01),
+                lt: dec!(0.01),
+            }]));
+        let cfg = live_test_cfg();
+        // emergency_retry_interval_ms defaults to 30_000.
+        let live = live_with_leg_reader(&cfg, ext.clone(), lt.clone(), reader);
+        let mut open_qty = None;
+        let (_st_dir, mut stuck) = test_stuck();
+        let mut summary = LivePaperSummary::default();
+        // Pretend we already did one round at t=1000.
+        let mut last = Some(1_000_u64);
+        let mut attempts = 1u32;
+
+        // Call at t=10_000 (only 9 s elapsed, < 30 s retry interval).
+        drive_emergency_flatten_round(
+            &live,
+            &mut machine,
+            &mut open_qty,
+            &mut stuck,
+            &mut summary,
+            &mut last,
+            &mut attempts,
+            10_000,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            ext.snapshot_close_alls().is_empty(),
+            "throttle must suppress close_all"
+        );
+        assert_eq!(attempts, 1, "throttled call must not bump attempt counter");
+        assert_eq!(last, Some(1_000), "throttled call must not advance last");
+
+        // Call at t=40_000 (39 s elapsed > 30 s) — now fires.
+        drive_emergency_flatten_round(
+            &live,
+            &mut machine,
+            &mut open_qty,
+            &mut stuck,
+            &mut summary,
+            &mut last,
+            &mut attempts,
+            40_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ext.snapshot_close_alls().len(), 1);
+        assert_eq!(attempts, 2);
+        assert_eq!(last, Some(40_000));
+    }
+
+    #[tokio::test]
+    async fn emergency_flatten_round_arms_stuck_after_kill_threshold_failures() {
+        let mut machine = machine_in_emergency_flattening();
+        let ext = Arc::new(ScriptedVenueOps::new());
+        // Five close_all rejections — equal to the kill threshold.
+        ext.with_state(|s| {
+            for _ in 0..5 {
+                s.close_all.push_back(
+                    crate::trade::execution::venue_ops::ScriptedResponse::Err(
+                        "reduce-only rejected".into(),
+                    ),
+                );
+            }
+        });
+        let lt = Arc::new(ScriptedVenueOps::new());
+        let reader: Arc<dyn crate::trade::execution::emergency_loop::LegStateReader> =
+            Arc::new(ScriptedLegReader::new(vec![LegQtys {
+                ext: dec!(0.01),
+                lt: Decimal::ZERO,
+            }]));
+        let cfg = live_test_cfg();
+        let live = live_with_leg_reader(&cfg, ext.clone(), lt.clone(), reader);
+        let mut open_qty = None;
+        let (_st_dir, mut stuck) = test_stuck_with_kill_threshold(5);
+        let mut summary = LivePaperSummary::default();
+        let mut last = None;
+        let mut attempts = 0;
+
+        // Drive 5 rounds, 60 s apart — well over the 30 s throttle.
+        for i in 0..5 {
+            drive_emergency_flatten_round(
+                &live,
+                &mut machine,
+                &mut open_qty,
+                &mut stuck,
+                &mut summary,
+                &mut last,
+                &mut attempts,
+                (i as u64) * 60_000,
+            )
+            .await
+            .unwrap();
+            // Stop iterating once stuck is armed — the helper itself
+            // short-circuits on subsequent calls.
+            if stuck.is_stuck() {
+                break;
+            }
+        }
+
+        assert!(stuck.is_stuck(), "STUCK file must be armed after 5 failures");
+        assert_eq!(summary.emergency_close_all_failures, 5);
+        assert_eq!(summary.emergency_stuck_armed, 1);
+
+        // Sanity: a 6th call after STUCK is armed must not attempt
+        // close_all (operator must clear before retries resume).
+        let prior = ext.snapshot_close_alls().len();
+        drive_emergency_flatten_round(
+            &live,
+            &mut machine,
+            &mut open_qty,
+            &mut stuck,
+            &mut summary,
+            &mut last,
+            &mut attempts,
+            10 * 60_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ext.snapshot_close_alls().len(),
+            prior,
+            "no close_all attempts after STUCK is armed"
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_flatten_round_skips_when_leg_reader_errors() {
+        let mut machine = machine_in_emergency_flattening();
+        let ext = Arc::new(ScriptedVenueOps::new());
+        let lt = Arc::new(ScriptedVenueOps::new());
+        let reader: Arc<dyn crate::trade::execution::emergency_loop::LegStateReader> =
+            Arc::new(ErrLegReader);
+        let cfg = live_test_cfg();
+        let live = live_with_leg_reader(&cfg, ext.clone(), lt.clone(), reader);
+        let mut open_qty = None;
+        let (_st_dir, mut stuck) = test_stuck();
+        let mut summary = LivePaperSummary::default();
+        let mut last = None;
+        let mut attempts = 0;
+
+        drive_emergency_flatten_round(
+            &live,
+            &mut machine,
+            &mut open_qty,
+            &mut stuck,
+            &mut summary,
+            &mut last,
+            &mut attempts,
+            1_000,
+        )
+        .await
+        .unwrap();
+
+        // Reader Err → handler logs and tries again next round; no
+        // close_all attempts, no EmergencyComplete.
+        assert!(ext.snapshot_close_alls().is_empty());
+        assert!(lt.snapshot_close_alls().is_empty());
+        assert_eq!(summary.emergency_completes, 0);
+        assert_eq!(machine.phase(), Phase::EmergencyFlattening);
+        assert_eq!(last, Some(1_000), "throttle clock must still advance");
+        assert_eq!(attempts, 1);
     }
 
     #[tokio::test(start_paused = true)]

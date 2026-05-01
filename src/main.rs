@@ -13,7 +13,8 @@ use std::sync::Arc;
 use chrono::{DateTime, FixedOffset, Utc};
 use debot::error_counter::{self, ErrorCountingLogger};
 use debot::ports::live_dual::LiveVenueHub;
-use debot::trade::execution::live_venue_ops::LiveVenueOps;
+use debot::trade::execution::emergency_loop::LegStateReader;
+use debot::trade::execution::live_venue_ops::{LiveLegStateReader, LiveVenueOps};
 use debot::trade::execution::venue_ops::VenueOps;
 use debot::xvenue::config::XvenueConfig;
 use debot::xvenue::live::{run_paper_loop, LiveLoopConfig};
@@ -192,7 +193,16 @@ async fn run() -> anyhow::Result<()> {
         // the executors.
         let ext_ops: Arc<dyn VenueOps> = Arc::new(LiveVenueOps::new(extended.clone()));
         let lt_ops: Arc<dyn VenueOps> = Arc::new(LiveVenueOps::new(lighter.clone()));
-        let live_exec = Arc::new(LiveExecution::from_config(&cfg, ext_ops, lt_ops)?);
+        let leg_reader: Arc<dyn LegStateReader> = Arc::new(LiveLegStateReader::new(
+            extended.clone(),
+            lighter.clone(),
+            cfg.symbol_ext.clone(),
+            cfg.symbol_lt.clone(),
+        ));
+        let live_exec = Arc::new(
+            LiveExecution::from_config(&cfg, ext_ops, lt_ops)?
+                .with_leg_reader(leg_reader),
+        );
 
         // Wire SIGTERM + SIGINT to a oneshot so the loop exits cleanly.
         let (shutdown_tx, shutdown_rx) = oneshot::channel();

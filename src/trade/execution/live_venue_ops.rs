@@ -39,6 +39,7 @@ use async_trait::async_trait;
 use dex_connector::{DexConnector, OrderSide};
 use rust_decimal::Decimal;
 
+use super::emergency_loop::{LegQtys, LegStateReader};
 use super::venue_ops::{OrderFillStatus, PlacedOrder, TopOfBook, VenueOps};
 
 /// Sentinel value Extended interprets as the post-only flag on
@@ -175,6 +176,63 @@ impl VenueOps for LiveVenueOps {
     }
 }
 
+/// Production [`LegStateReader`] sourcing per-venue open qty from
+/// each connector's `get_positions` call. Used by the emergency-
+/// flatten handler (#244 Sprint 4 step 3/3) to know whether a
+/// `close_all` round is still required, or whether both legs have
+/// already zeroed out (case 13 boundary).
+///
+/// Reads the two venues in parallel via `tokio::try_join!`. The
+/// production connectors back `get_positions` with WS-fed in-memory
+/// state, so the call is cheap on the emergency-retry cadence
+/// (default 30 s). A cache miss surfaces as `Err`; the emergency
+/// handler treats that as "still has open qty" and retries on the
+/// next round.
+pub struct LiveLegStateReader {
+    pub ext_conn: Arc<dyn DexConnector>,
+    pub lt_conn: Arc<dyn DexConnector>,
+    pub ext_symbol: String,
+    pub lt_symbol: String,
+}
+
+impl LiveLegStateReader {
+    pub fn new(
+        ext_conn: Arc<dyn DexConnector>,
+        lt_conn: Arc<dyn DexConnector>,
+        ext_symbol: String,
+        lt_symbol: String,
+    ) -> Self {
+        Self {
+            ext_conn,
+            lt_conn,
+            ext_symbol,
+            lt_symbol,
+        }
+    }
+}
+
+#[async_trait]
+impl LegStateReader for LiveLegStateReader {
+    async fn read_leg_qtys(&self) -> Result<LegQtys> {
+        let (ext_pos, lt_pos) = tokio::try_join!(
+            self.ext_conn.get_positions(),
+            self.lt_conn.get_positions(),
+        )
+        .map_err(|e| anyhow!("get_positions: {}", e))?;
+        let ext = ext_pos
+            .iter()
+            .find(|p| p.symbol == self.ext_symbol)
+            .map(|p| p.size)
+            .unwrap_or(Decimal::ZERO);
+        let lt = lt_pos
+            .iter()
+            .find(|p| p.symbol == self.lt_symbol)
+            .map(|p| p.size)
+            .unwrap_or(Decimal::ZERO);
+        Ok(LegQtys { ext, lt })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +272,8 @@ mod tests {
         filled_orders: Vec<FilledOrder>,
         canceled_orders: Vec<CanceledOrder>,
         open_orders: Vec<OpenOrder>,
+        positions: Vec<PositionSnapshot>,
+        positions_err: Option<String>,
 
         create_order_calls: Vec<CreateOrderCall>,
         cancel_order_calls: Vec<(String, String)>,
@@ -287,7 +347,11 @@ mod tests {
             Ok(CombinedBalanceResponse::default())
         }
         async fn get_positions(&self) -> Result<Vec<PositionSnapshot>, DexError> {
-            Ok(Vec::new())
+            let mut g = self.state.lock().unwrap();
+            if let Some(msg) = g.positions_err.take() {
+                return Err(DexError::Other(msg));
+            }
+            Ok(g.positions.clone())
         }
         async fn get_last_trades(&self, _: &str) -> Result<LastTradesResponse, DexError> {
             Ok(LastTradesResponse::default())
@@ -631,6 +695,76 @@ mod tests {
         assert_eq!(s.filled_qty, Decimal::ZERO);
         assert!(s.terminal);
         assert!(s.cancelled);
+    }
+
+    #[tokio::test]
+    async fn live_leg_state_reader_returns_open_qty_per_venue() {
+        let ext_stub = StubConnector::new();
+        let lt_stub = StubConnector::new();
+        ext_stub.state.lock().unwrap().positions = vec![PositionSnapshot {
+            symbol: "ETH-USD".into(),
+            size: dec!(0.42),
+            sign: 1,
+            entry_price: None,
+        }];
+        lt_stub.state.lock().unwrap().positions = vec![PositionSnapshot {
+            symbol: "ETH".into(),
+            size: dec!(0.42),
+            sign: -1,
+            entry_price: None,
+        }];
+        let reader = LiveLegStateReader::new(
+            ext_stub.arc(),
+            lt_stub.arc(),
+            "ETH-USD".into(),
+            "ETH".into(),
+        );
+        let qtys = reader.read_leg_qtys().await.unwrap();
+        assert_eq!(qtys.ext, dec!(0.42));
+        assert_eq!(qtys.lt, dec!(0.42));
+        assert!(!qtys.both_zero());
+    }
+
+    #[tokio::test]
+    async fn live_leg_state_reader_returns_zero_for_missing_symbol() {
+        // Connector has positions but for a different symbol — must
+        // return zero, not error. Mirrors the venue-side semantics
+        // where `get_positions` returns empty per-symbol when the
+        // bot is actually flat.
+        let ext_stub = StubConnector::new();
+        let lt_stub = StubConnector::new();
+        ext_stub.state.lock().unwrap().positions = vec![PositionSnapshot {
+            symbol: "BTC-USD".into(),
+            size: dec!(1),
+            sign: 1,
+            entry_price: None,
+        }];
+        let reader = LiveLegStateReader::new(
+            ext_stub.arc(),
+            lt_stub.arc(),
+            "ETH-USD".into(),
+            "ETH".into(),
+        );
+        let qtys = reader.read_leg_qtys().await.unwrap();
+        assert_eq!(qtys.ext, Decimal::ZERO);
+        assert_eq!(qtys.lt, Decimal::ZERO);
+        assert!(qtys.both_zero());
+    }
+
+    #[tokio::test]
+    async fn live_leg_state_reader_propagates_connector_error() {
+        let ext_stub = StubConnector::new();
+        let lt_stub = StubConnector::new();
+        ext_stub.state.lock().unwrap().positions_err = Some("ws stale".into());
+        let reader = LiveLegStateReader::new(
+            ext_stub.arc(),
+            lt_stub.arc(),
+            "ETH-USD".into(),
+            "ETH".into(),
+        );
+        let err = reader.read_leg_qtys().await.unwrap_err();
+        assert!(err.to_string().contains("get_positions"));
+        assert!(err.to_string().contains("ws stale"));
     }
 
     #[tokio::test]

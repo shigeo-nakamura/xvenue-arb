@@ -22,11 +22,12 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use async_trait::async_trait;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 use super::config::XvenueConfig;
-use crate::trade::execution::emergency_loop::EmergencyLoopConfig;
+use crate::trade::execution::emergency_loop::{EmergencyLoopConfig, LegQtys, LegStateReader};
 use crate::trade::execution::parallel_exit::ParallelExitConfig;
 use crate::trade::execution::types::{ExtendedMakerConfig, LighterFillConfig};
 use crate::trade::execution::venue_ops::VenueOps;
@@ -54,6 +55,12 @@ pub struct LiveExecution {
     /// Dust threshold passed into each executor cycle. The chase
     /// loop short-circuits on residuals below this.
     pub dust_qty: Decimal,
+    /// Reads each venue's open qty for the emergency-flatten round
+    /// (#244 Sprint 4 step 3/3). Defaults to a [`NoopLegStateReader`]
+    /// that surfaces an Err so the runner skips emergency rounds
+    /// without a real reader configured — production builds attach
+    /// `LiveLegStateReader` via [`Self::with_leg_reader`].
+    pub leg_reader: Arc<dyn LegStateReader>,
 }
 
 impl LiveExecution {
@@ -72,11 +79,40 @@ impl LiveExecution {
             ext_symbol: cfg.symbol_ext.clone(),
             lt_symbol: cfg.symbol_lt.clone(),
             dust_qty: default_dust_qty(),
+            leg_reader: Arc::new(NoopLegStateReader),
         };
         exec.validate()?;
         Ok(exec)
     }
 
+    /// Builder: replace the default [`NoopLegStateReader`] with a real
+    /// implementation. Production wires `LiveLegStateReader`; tests
+    /// build a scripted reader to drive the emergency-flatten round.
+    pub fn with_leg_reader(mut self, reader: Arc<dyn LegStateReader>) -> Self {
+        self.leg_reader = reader;
+        self
+    }
+
+}
+
+/// Default [`LegStateReader`] used when production hasn't wired
+/// [`crate::trade::execution::live_venue_ops::LiveLegStateReader`]
+/// yet. Returns Err so the emergency-flatten round logs a warning
+/// and skips, rather than silently flipping to `EmergencyComplete`
+/// on a fake "both legs zero" reading.
+pub struct NoopLegStateReader;
+
+#[async_trait]
+impl LegStateReader for NoopLegStateReader {
+    async fn read_leg_qtys(&self) -> Result<LegQtys> {
+        Err(anyhow::anyhow!(
+            "NoopLegStateReader: no production leg reader wired \
+             — use LiveExecution::with_leg_reader to install one"
+        ))
+    }
+}
+
+impl LiveExecution {
     pub fn validate(&self) -> Result<()> {
         self.extended_maker_cfg
             .validate()
