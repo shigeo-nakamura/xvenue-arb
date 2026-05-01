@@ -504,8 +504,31 @@ impl RiskManager {
         // Accept either a well-formed JSON ack or an empty / plain
         // file (which we treat as an unsigned ack from the
         // dashboard's flatten button — same convenience as pairtrade).
-        let parsed: serde_json::Value =
-            serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({"ack_by": "file"}));
+        //
+        // Heuristic for "intended JSON": content starts with `{`
+        // after stripping leading whitespace. If the operator meant
+        // JSON but typo'd it (e.g. unclosed brace), we refuse rather
+        // than silently fall back to the synthetic `"ack_by": "file"`
+        // stamp — better to surface the malformed input and let the
+        // operator fix it than to log a misleading audit line.
+        // (#244 D-5 / #268 S5-4.)
+        let trimmed = raw.trim_start();
+        let parsed: serde_json::Value = if trimmed.starts_with('{') {
+            match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!(
+                        "[RISK_ACK] {} appears to be JSON but fails to parse ({}); \
+                         refusing to clear halt — fix the file or replace with plain text",
+                        path.display(),
+                        e
+                    );
+                    return;
+                }
+            }
+        } else {
+            serde_json::json!({"ack_by": "file"})
+        };
         let ack_by = parsed
             .get("ack_by")
             .and_then(|v| v.as_str())
@@ -808,6 +831,87 @@ mod tests {
         // File consumed.
         assert!(!m.config.risk_ack_path.exists());
         assert_eq!(m.block_reason(120), None);
+    }
+
+    #[test]
+    fn risk_ack_plain_text_still_clears_halt() {
+        // Backwards-compat: a plain-text RISK_ACK (e.g. an empty
+        // `touch` from the dashboard's flatten button) clears the
+        // halt with `ack_by: "file"`. The malformed-JSON refusal
+        // (#268 S5-4) only kicks in when the file content looks
+        // like JSON but parses badly.
+        let tmp = TempDir::new().unwrap();
+        let mut m = mgr(&tmp);
+        m.record_equity_sample(1_000.0, 0);
+        m.record_equity_sample(940.0, 60);
+        assert!(m.state_for_test().session_halted);
+        std::fs::write(&m.config.risk_ack_path, "operator pressed flatten\n").unwrap();
+        m.tick(120);
+        assert!(!m.state_for_test().session_halted);
+        assert!(!m.config.risk_ack_path.exists());
+    }
+
+    #[test]
+    fn risk_ack_empty_file_clears_halt() {
+        // `sudo touch /opt/debot/RISK_ACK` is a documented operator
+        // shortcut (`runbook_xvenue_arb_risk.md` §3) — must keep
+        // working.
+        let tmp = TempDir::new().unwrap();
+        let mut m = mgr(&tmp);
+        m.record_equity_sample(1_000.0, 0);
+        m.record_equity_sample(940.0, 60);
+        std::fs::write(&m.config.risk_ack_path, "").unwrap();
+        m.tick(120);
+        assert!(!m.state_for_test().session_halted);
+        assert!(!m.config.risk_ack_path.exists());
+    }
+
+    #[test]
+    fn risk_ack_malformed_json_refused_and_halt_persists() {
+        // S5-4: file looks like JSON (starts with `{`) but parses
+        // badly → bot refuses to clear halt, leaves file on disk
+        // for the operator to fix. Better to surface the typo
+        // than silently fall through to a synthetic ack stamp.
+        let tmp = TempDir::new().unwrap();
+        let mut m = mgr(&tmp);
+        m.record_equity_sample(1_000.0, 0);
+        m.record_equity_sample(940.0, 60);
+        assert!(m.state_for_test().session_halted);
+        // Unclosed object — the kind of typo a hand-edited ack
+        // could plausibly produce.
+        std::fs::write(&m.config.risk_ack_path, r#"{"ack_by":"alice"#).unwrap();
+        m.tick(120);
+        assert!(
+            m.state_for_test().session_halted,
+            "malformed JSON must NOT clear the halt"
+        );
+        assert!(
+            m.config.risk_ack_path.exists(),
+            "malformed file must stay on disk for operator inspection"
+        );
+        // Sanity: replacing it with a well-formed payload clears.
+        let ack_payload = serde_json::json!({"ack_by": "alice"}).to_string();
+        std::fs::write(&m.config.risk_ack_path, ack_payload).unwrap();
+        m.tick(180);
+        assert!(!m.state_for_test().session_halted);
+        assert!(!m.config.risk_ack_path.exists());
+    }
+
+    #[test]
+    fn risk_ack_whitespace_prefixed_json_still_validated() {
+        // Edge case: the `{` heuristic must survive leading
+        // whitespace (an editor's auto-format could produce
+        // `  {"ack_by":...` with a leading newline). Both the
+        // happy path (valid) and the refused path (malformed)
+        // must respect the same trimming rule.
+        let tmp = TempDir::new().unwrap();
+        let mut m = mgr(&tmp);
+        m.record_equity_sample(1_000.0, 0);
+        m.record_equity_sample(940.0, 60);
+        // Valid JSON with leading whitespace — accepted.
+        std::fs::write(&m.config.risk_ack_path, "  \n{\"ack_by\":\"bob\"}\n").unwrap();
+        m.tick(120);
+        assert!(!m.state_for_test().session_halted);
     }
 
     #[test]
