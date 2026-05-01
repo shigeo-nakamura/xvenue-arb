@@ -17,6 +17,7 @@ pub mod dex_connector_box;
 pub mod emergency_loop;
 pub mod extended_maker;
 pub mod lighter_fill;
+pub mod live_venue_ops;
 pub mod parallel_exit;
 pub mod types;
 pub mod venue_ops;

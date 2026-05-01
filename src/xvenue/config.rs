@@ -22,6 +22,11 @@ use super::signal::SignalConfig;
 use super::spread::SpreadConfig;
 use crate::risk::kill_switch::StuckTripwireConfig;
 use crate::risk::manager::RiskConfig;
+use crate::trade::execution::emergency_loop::EmergencyLoopConfig;
+use crate::trade::execution::parallel_exit::ParallelExitConfig;
+use crate::trade::execution::types::{
+    parse_lighter_order_type, ExtendedMakerConfig, LighterFillConfig,
+};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct XvenueConfig {
@@ -118,6 +123,13 @@ pub struct XvenueConfig {
     /// See docs/execution_layer.md §5.
     #[serde(default = "default_emergency_retry_interval_ms")]
     pub emergency_retry_interval_ms: u64,
+    /// Defensive cap on emergency-flatten attempts. Stops a venue
+    /// that accepts `close_all` (Ok) but never zeros the leg from
+    /// looping forever. 100 × 30 s = 50 min worst case before the
+    /// loop yields `MaxAttemptsExceeded` and the runner re-enters
+    /// EmergencyFlattening on the next phase tick.
+    #[serde(default = "default_emergency_max_attempts")]
+    pub emergency_max_attempts: u32,
     #[serde(default = "default_rest_consec_fail_to_escalate")]
     pub rest_consec_fail_to_escalate: u32,
     #[serde(default = "default_reduce_only_consec_fail_to_kill")]
@@ -258,6 +270,51 @@ impl XvenueConfig {
             funding_lockout_post_sec: self.funding_lockout_post_sec,
         }
     }
+
+    /// Knobs for [`crate::trade::execution::extended_maker::ExtendedMakerLoop`].
+    /// Sprint 4 wiring will pass this into the chase loop on each
+    /// `Decision::Enter` / `Decision::Exit` for the Extended leg.
+    pub fn extended_maker_config(&self) -> ExtendedMakerConfig {
+        ExtendedMakerConfig {
+            chase_ticks: self.extended_chase_ticks,
+            chase_retries: self.extended_chase_retries,
+            chase_timeout_ms: self.extended_chase_timeout_ms,
+            taker_fallback: self.extended_taker_fallback,
+            post_only: self.extended_post_only,
+        }
+    }
+
+    /// Knobs for [`crate::trade::execution::lighter_fill::LighterFillLoop`].
+    /// `lighter_order_type` is validated as `"market"` or `"limit"`
+    /// at YAML load (see [`Self::validate`]); the helper still returns
+    /// `Result` so a bad value caught only at use-site surfaces an
+    /// error instead of panicking.
+    pub fn lighter_fill_config(&self) -> Result<LighterFillConfig> {
+        let order_type = parse_lighter_order_type(&self.lighter_order_type)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(LighterFillConfig {
+            order_type,
+            fill_timeout_ms: self.lighter_fill_timeout_ms,
+        })
+    }
+
+    /// Knobs for [`crate::trade::execution::parallel_exit::ParallelExitLoop`].
+    pub fn parallel_exit_config(&self) -> ParallelExitConfig {
+        ParallelExitConfig {
+            leg_mismatch_timeout_ms: self.leg_mismatch_timeout_ms,
+        }
+    }
+
+    /// Knobs for [`crate::trade::execution::emergency_loop::EmergencyLoop`].
+    /// `max_attempts` is YAML-driven (`emergency_max_attempts`,
+    /// default 100) so an operator can shorten the loop in a venue
+    /// that's known to ack-without-progress.
+    pub fn emergency_loop_config(&self) -> EmergencyLoopConfig {
+        EmergencyLoopConfig {
+            retry_interval_ms: self.emergency_retry_interval_ms,
+            max_attempts: self.emergency_max_attempts,
+        }
+    }
 }
 
 // ---- Default fns (serde requires fns, not literals) ----
@@ -333,6 +390,9 @@ fn default_stuck_file() -> String {
 fn default_emergency_retry_interval_ms() -> u64 {
     30_000
 }
+fn default_emergency_max_attempts() -> u32 {
+    100
+}
 fn default_rest_consec_fail_to_escalate() -> u32 {
     3
 }
@@ -407,6 +467,7 @@ reference_max_dev_bps: 100
         assert_eq!(cfg.persistence_sec, 15);
         assert_eq!(cfg.max_hold_sec, 600);
         assert_eq!(cfg.emergency_retry_interval_ms, 30_000);
+        assert_eq!(cfg.emergency_max_attempts, 100);
         assert_eq!(cfg.kill_switch_file, "/opt/debot/KILL_SWITCH");
         assert_eq!(cfg.stuck_file, "/var/run/xvenue-arb/STUCK");
         assert_eq!(cfg.lighter_order_type, "market");
@@ -528,5 +589,125 @@ reference_max_dev_bps: 100
         let cfg: XvenueConfig = serde_yaml::from_str(yaml).unwrap();
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("notional_usd"));
+    }
+
+    #[test]
+    fn extended_maker_config_round_trips_yaml_fields() {
+        let yaml = r#"
+agent_name: x
+symbol_ext: ETH-USD
+symbol_lt: ETH
+trade_size_pct: 0.05
+min_notional_usd: 20
+max_notional_usd: 1000
+binance_reference_symbol: ETHUSDT
+reference_max_dev_bps: 100
+extended_post_only: false
+extended_chase_ticks: 2
+extended_chase_retries: 5
+extended_chase_timeout_ms: 750
+extended_taker_fallback: false
+"#;
+        let cfg = parse(yaml);
+        let m = cfg.extended_maker_config();
+        assert_eq!(m.chase_ticks, 2);
+        assert_eq!(m.chase_retries, 5);
+        assert_eq!(m.chase_timeout_ms, 750);
+        assert!(!m.taker_fallback);
+        assert!(!m.post_only);
+        // Validation lives on ExtendedMakerConfig itself; the helper
+        // does not pre-validate (callers can choose to surface a
+        // YAML-vs-runtime error separately).
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn extended_maker_config_defaults_match_yaml_defaults() {
+        let cfg = parse(minimal_yaml());
+        let m = cfg.extended_maker_config();
+        assert_eq!(m.chase_ticks, 1);
+        assert_eq!(m.chase_retries, 3);
+        assert_eq!(m.chase_timeout_ms, 500);
+        assert!(m.taker_fallback);
+        assert!(m.post_only);
+    }
+
+    #[test]
+    fn lighter_fill_config_parses_market_and_limit() {
+        let cfg = parse(minimal_yaml());
+        let l = cfg.lighter_fill_config().unwrap();
+        assert!(matches!(
+            l.order_type,
+            crate::trade::execution::types::LighterOrderType::Market
+        ));
+        assert_eq!(l.fill_timeout_ms, 1_000);
+
+        let yaml = r#"
+agent_name: x
+symbol_ext: ETH-USD
+symbol_lt: ETH
+trade_size_pct: 0.05
+min_notional_usd: 20
+max_notional_usd: 1000
+binance_reference_symbol: ETHUSDT
+reference_max_dev_bps: 100
+lighter_order_type: limit
+lighter_fill_timeout_ms: 2500
+"#;
+        let cfg = parse(yaml);
+        let l = cfg.lighter_fill_config().unwrap();
+        assert!(matches!(
+            l.order_type,
+            crate::trade::execution::types::LighterOrderType::AggressiveLimit
+        ));
+        assert_eq!(l.fill_timeout_ms, 2500);
+    }
+
+    #[test]
+    fn parallel_exit_config_uses_yaml_field() {
+        let yaml = r#"
+agent_name: x
+symbol_ext: ETH-USD
+symbol_lt: ETH
+trade_size_pct: 0.05
+min_notional_usd: 20
+max_notional_usd: 1000
+binance_reference_symbol: ETHUSDT
+reference_max_dev_bps: 100
+leg_mismatch_timeout_ms: 5000
+"#;
+        let cfg = parse(yaml);
+        let p = cfg.parallel_exit_config();
+        assert_eq!(p.leg_mismatch_timeout_ms, 5_000);
+        assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn emergency_loop_config_round_trip_with_max_attempts() {
+        let yaml = r#"
+agent_name: x
+symbol_ext: ETH-USD
+symbol_lt: ETH
+trade_size_pct: 0.05
+min_notional_usd: 20
+max_notional_usd: 1000
+binance_reference_symbol: ETHUSDT
+reference_max_dev_bps: 100
+emergency_retry_interval_ms: 5000
+emergency_max_attempts: 25
+"#;
+        let cfg = parse(yaml);
+        let e = cfg.emergency_loop_config();
+        assert_eq!(e.retry_interval_ms, 5_000);
+        assert_eq!(e.max_attempts, 25);
+        assert!(e.validate().is_ok());
+    }
+
+    #[test]
+    fn emergency_loop_config_defaults_to_100_attempts() {
+        let cfg = parse(minimal_yaml());
+        let e = cfg.emergency_loop_config();
+        assert_eq!(e.retry_interval_ms, 30_000);
+        assert_eq!(e.max_attempts, 100);
     }
 }
