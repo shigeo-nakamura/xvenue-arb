@@ -39,7 +39,11 @@ funding_lockout_post_sec: 120
 # ---- Sizing ----
 trade_size_pct: 0.05          # 5% of (ext + lt) equity
 min_notional_usd: 20
-max_notional_usd: 1000        # raise after Phase 3 probe stabilises
+# Phase 3 small-notional probe cap (#166 / #244 Sprint 4 follow-up).
+# Lowered from 1000 so the eventual `dry_run: false` flip bounds
+# any first-day surprise to ≤$10 per cycle. Ramp toward 1000 once
+# trades clean up under real order flow.
+max_notional_usd: 100
 
 # ---- Execution: Extended (post-only with chase + taker fallback) ----
 extended_post_only: true
