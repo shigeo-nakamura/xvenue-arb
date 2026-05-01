@@ -193,6 +193,11 @@ pub struct LivePaperSummary {
     /// its own timeout, the other was still in flight when the
     /// `leg_mismatch_timeout_ms` deadline fired. Catalogue case 11.
     pub live_exits_leg_mismatch: u64,
+    /// Number of times the runner forced a flatten because the
+    /// session-DD halt latched while a position was open (#268
+    /// S5-3). Idempotency-guarded by the position machine's phase
+    /// check, so this counts trips, not ticks the latch stays armed.
+    pub live_session_dd_forced_flattens: u64,
     /// Number of `Event::EmergencyComplete` transitions fired by
     /// the runner's emergency-flatten handler (#244 Sprint 4 step
     /// 3/3) — both legs reported zero open qty, position is closed.
@@ -862,6 +867,51 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
                 return Ok(());
             }
             SkewOutcome::Ok { .. } | SkewOutcome::Disabled => {}
+        }
+    }
+
+    // S5-3 forced flatten on session DD (#268). Runs before
+    // signal.decide so a HALTed position routes to
+    // EmergencyFlattening rather than letting the strategy decide
+    // a natural exit (which could chase for seconds while the
+    // position bleeds). Idempotent via the phase check: once
+    // applied, machine.phase() leaves Held → subsequent ticks see
+    // the gate as already-fired without needing a separate flag.
+    // Live mode only; paper synthesises EmergencyComplete in the
+    // existing dry_run short-circuits.
+    let mut position = position;
+    if position.is_some() && !cfg.dry_run && live_exec.is_some() {
+        if matches!(
+            risk_manager.block_reason(now_unix_secs()),
+            Some(BlockReason::SessionDdHalted)
+        ) {
+            log::error!(
+                "[XVENUE] session_dd halt while position held → forced flatten \
+                 (machine→EmergencyFlattening; emergency_loop drives close_all)"
+            );
+            let event = Event::Emergency {
+                reason: super::state::EmergencyReason::SessionDdHalted,
+            };
+            match machine.apply(now_ts_ms, event) {
+                Ok(()) => {
+                    summary.live_session_dd_forced_flattens += 1;
+                    // Refresh the cached `position` snapshot —
+                    // signal.decide() further down would otherwise
+                    // see the pre-Emergency Some(_) and could fire
+                    // Decision::Exit, which the state machine then
+                    // rejects with `ExitSignal in EmergencyFlattening`.
+                    position = machine.summary();
+                }
+                Err(e) => {
+                    // Already in EmergencyFlattening (idempotent
+                    // re-fire) or other transient — debug-log and
+                    // continue.
+                    log::debug!(
+                        "[XVENUE] forced-flatten Emergency rejected: {:?}",
+                        e
+                    );
+                }
+            }
         }
     }
 
@@ -3628,5 +3678,236 @@ leg_mismatch_timeout_ms: 100
         // Both exit takers reduce_only=true.
         assert!(ext_takers[1].3, "ext exit must be reduce_only");
         assert!(lt_takers[1].3, "lt exit must be reduce_only");
+    }
+
+    // ---------------------------------------------------------------
+    // Sprint 5 step 3 — forced flatten on session DD halt (#268 S5-3)
+    // ---------------------------------------------------------------
+
+    /// Helper: drive a position machine into Held with given qtys
+    /// so the S5-3 check has something to flatten. Mirrors the
+    /// happy-path entry sequence the runner emits in live mode.
+    fn machine_in_held(qty: Decimal) -> PositionMachine {
+        let mut m = PositionMachine::new();
+        m.apply(
+            0,
+            Event::EntrySignal {
+                direction: SpreadDirection::Long,
+                notional_usd: dec!(50),
+            },
+        )
+        .unwrap();
+        m.apply(100, Event::ExtendedFilled { qty }).unwrap();
+        m.apply(200, Event::LighterFilled { qty }).unwrap();
+        assert_eq!(m.phase(), Phase::Held);
+        m
+    }
+
+    /// RiskManager pre-armed with a session-DD halt — feed two
+    /// equity samples a 6% apart so the rolling-peak check trips
+    /// the configured 500 bps threshold.
+    fn pre_armed_session_dd_manager() -> (tempfile::TempDir, RiskManager) {
+        let (dir, mut rm) = test_risk_manager();
+        rm.record_equity_sample(1_000.0, 0);
+        rm.record_equity_sample(940.0, 60);
+        assert_eq!(
+            rm.block_reason(60),
+            Some(BlockReason::SessionDdHalted),
+            "test pre-arm: session DD halt did not activate"
+        );
+        (dir, rm)
+    }
+
+    #[tokio::test]
+    async fn live_session_dd_halt_forces_flatten_when_held() {
+        let mut cfg = live_test_cfg();
+        cfg.dry_run = false;
+        let mut machine = machine_in_held(dec!(0.025));
+        // Single tick — the breach data doesn't matter because we
+        // expect the S5-3 check to fire Emergency before signal
+        // evaluation. Use a one-element ScriptedHub with a quiet
+        // mid pair so read_mid succeeds.
+        let hub = Arc::new(ScriptedHub::new(
+            vec![mid(1_000, 2_000.0)],
+            vec![mid(1_000, 2_000.0)],
+        ));
+        let ext_vops = Arc::new(ScriptedVenueOps::new());
+        let lt_vops = Arc::new(ScriptedVenueOps::new());
+        let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
+        let (_rm_dir, mut rm) = pre_armed_session_dd_manager();
+        let mut spread = SpreadEngine::new(cfg.spread_config());
+        let mut signal = SignalEngine::new(cfg.signal_config());
+        let mut summary = LivePaperSummary::default();
+        let mut open_qty = Some(dec!(0.025));
+        let mut rg = test_reference_guard();
+        let (_st_dir, mut stuck) = test_stuck();
+        let mut warmup = VenueWarmup {
+            ext_ready: true,
+            lt_ready: true,
+        };
+        let mut ws_health = WsHealthMonitor::new(0);
+        let mut skew_monitor = SkewMonitor::new(0.0);
+        let mut live_entry_ctx: Option<LiveEntryCtx> = None;
+
+        run_one_tick(
+            &cfg,
+            &*hub,
+            &mut spread,
+            &mut signal,
+            &mut machine,
+            &mut summary,
+            &mut open_qty,
+            None,
+            &mut rm,
+            &mut rg,
+            &mut stuck,
+            &mut warmup,
+            &mut ws_health,
+            &mut skew_monitor,
+            Some(&live),
+            &mut live_entry_ctx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            machine.phase(),
+            Phase::EmergencyFlattening,
+            "session_dd halt while held MUST force flatten"
+        );
+        assert_eq!(summary.live_session_dd_forced_flattens, 1);
+        assert_eq!(
+            machine.position().and_then(|p| p.last_emergency_reason),
+            Some(EmergencyReason::SessionDdHalted),
+            "position must record SessionDdHalted as the emergency reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_session_dd_halt_does_not_re_emergency_after_first_fire() {
+        // Drive 3 ticks with the halt persistently active. The S5-3
+        // counter should bump exactly once (first tick when phase
+        // was still Held); subsequent ticks see phase ==
+        // EmergencyFlattening and skip via the position-is-some
+        // gate. Idempotency by phase, not by an explicit flag.
+        let mut cfg = live_test_cfg();
+        cfg.dry_run = false;
+        let mut machine = machine_in_held(dec!(0.025));
+        let hub = Arc::new(ScriptedHub::new(
+            vec![mid(1_000, 2_000.0), mid(2_000, 2_000.0), mid(3_000, 2_000.0)],
+            vec![mid(1_000, 2_000.0), mid(2_000, 2_000.0), mid(3_000, 2_000.0)],
+        ));
+        let ext_vops = Arc::new(ScriptedVenueOps::new());
+        let lt_vops = Arc::new(ScriptedVenueOps::new());
+        let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
+        let (_rm_dir, mut rm) = pre_armed_session_dd_manager();
+        let mut spread = SpreadEngine::new(cfg.spread_config());
+        let mut signal = SignalEngine::new(cfg.signal_config());
+        let mut summary = LivePaperSummary::default();
+        let mut open_qty = Some(dec!(0.025));
+        let mut rg = test_reference_guard();
+        let (_st_dir, mut stuck) = test_stuck();
+        let mut warmup = VenueWarmup {
+            ext_ready: true,
+            lt_ready: true,
+        };
+        let mut ws_health = WsHealthMonitor::new(0);
+        let mut skew_monitor = SkewMonitor::new(0.0);
+        let mut live_entry_ctx: Option<LiveEntryCtx> = None;
+
+        for _ in 0..3 {
+            run_one_tick(
+                &cfg,
+                &*hub,
+                &mut spread,
+                &mut signal,
+                &mut machine,
+                &mut summary,
+                &mut open_qty,
+                None,
+                &mut rm,
+                &mut rg,
+                &mut stuck,
+                &mut warmup,
+                &mut ws_health,
+                &mut skew_monitor,
+                Some(&live),
+                &mut live_entry_ctx,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            summary.live_session_dd_forced_flattens, 1,
+            "forced-flatten counter must increment exactly once per halt entry"
+        );
+        assert_eq!(machine.phase(), Phase::EmergencyFlattening);
+    }
+
+    #[tokio::test]
+    async fn live_session_dd_halt_dry_run_does_not_force_flatten() {
+        // Paper mode — the S5-3 check must skip even with the halt
+        // armed and a position in Held. The existing dry_run
+        // synthesise paths handle paper-mode emergency flow.
+        let mut cfg = live_test_cfg();
+        cfg.dry_run = true;
+        let mut machine = machine_in_held(dec!(0.025));
+        let hub = Arc::new(ScriptedHub::new(
+            vec![mid(1_000, 2_000.0)],
+            vec![mid(1_000, 2_000.0)],
+        ));
+        let ext_vops = Arc::new(ScriptedVenueOps::new());
+        let lt_vops = Arc::new(ScriptedVenueOps::new());
+        let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
+        let (_rm_dir, mut rm) = pre_armed_session_dd_manager();
+        let mut spread = SpreadEngine::new(cfg.spread_config());
+        let mut signal = SignalEngine::new(cfg.signal_config());
+        let mut summary = LivePaperSummary::default();
+        let mut open_qty = Some(dec!(0.025));
+        let mut rg = test_reference_guard();
+        let (_st_dir, mut stuck) = test_stuck();
+        let mut warmup = VenueWarmup {
+            ext_ready: true,
+            lt_ready: true,
+        };
+        let mut ws_health = WsHealthMonitor::new(0);
+        let mut skew_monitor = SkewMonitor::new(0.0);
+        let mut live_entry_ctx: Option<LiveEntryCtx> = None;
+
+        run_one_tick(
+            &cfg,
+            &*hub,
+            &mut spread,
+            &mut signal,
+            &mut machine,
+            &mut summary,
+            &mut open_qty,
+            None,
+            &mut rm,
+            &mut rg,
+            &mut stuck,
+            &mut warmup,
+            &mut ws_health,
+            &mut skew_monitor,
+            Some(&live),
+            &mut live_entry_ctx,
+        )
+        .await
+        .unwrap();
+
+        // Paper mode never enters EmergencyFlattening via the S5-3
+        // path. The phase outcome here depends on whether signal
+        // happens to fire a synthetic Exit, which is incidental;
+        // what matters is the counter stays zero.
+        assert_eq!(
+            summary.live_session_dd_forced_flattens, 0,
+            "dry_run must not increment the forced-flatten counter"
+        );
+        assert_ne!(
+            machine.phase(),
+            Phase::EmergencyFlattening,
+            "S5-3 must not push paper mode into EmergencyFlattening"
+        );
     }
 }

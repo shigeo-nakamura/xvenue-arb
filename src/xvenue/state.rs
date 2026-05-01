@@ -34,6 +34,12 @@ pub enum EmergencyReason {
     ReferenceDeviation,
     ExtendedEntryFailed,
     LighterEntryFailed,
+    /// Session-DD halt while a position was open (#268 S5-3).
+    /// The runner forces a flatten so the open exposure cleans up
+    /// rather than waiting for the strategy's natural exit signal
+    /// (mean cross / max hold). Distinct from `LegMismatchTimeout`
+    /// — that's an exit-side failure; this is a risk-side halt.
+    SessionDdHalted,
 }
 
 #[derive(Debug, Clone)]
