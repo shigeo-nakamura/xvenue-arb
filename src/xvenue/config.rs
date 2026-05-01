@@ -99,6 +99,21 @@ pub struct XvenueConfig {
     #[serde(default = "default_lighter_fill_timeout_ms")]
     pub lighter_fill_timeout_ms: u64,
 
+    // ---- Realised PnL fees (#268 S5-1) ----
+    /// Per-side fee rate the realised-PnL helper subtracts on each
+    /// venue leg (entry + exit). Default 5 bps for Extended is the
+    /// conservative taker rate; the actual maker rate is ~2.5 bps
+    /// but the executor doesn't surface fill type to the runner, so
+    /// we use the worse of the two. Tune downward once the chase
+    /// loop reliably hits maker most of the time.
+    #[serde(default = "default_extended_fee_bps")]
+    pub extended_fee_bps: f64,
+    /// Lighter standard-tier fee. 0 bps in production today; left as
+    /// a YAML field so a future Lighter-Premium switch (or a
+    /// promotional rate change) doesn't require a code patch.
+    #[serde(default = "default_lighter_fee_bps")]
+    pub lighter_fee_bps: f64,
+
     // ---- Risk ----
     #[serde(default = "default_ws_stale_emergency_ms")]
     pub ws_stale_emergency_ms: u64,
@@ -369,6 +384,12 @@ fn default_lighter_order_type() -> String {
 }
 fn default_lighter_fill_timeout_ms() -> u64 {
     1_000
+}
+fn default_extended_fee_bps() -> f64 {
+    5.0
+}
+fn default_lighter_fee_bps() -> f64 {
+    0.0
 }
 fn default_ws_stale_emergency_ms() -> u64 {
     5_000

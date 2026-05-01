@@ -209,6 +209,87 @@ pub struct LivePaperSummary {
     /// Defensive cap (`emergency_max_attempts`) reached. Should be
     /// rare — usually the loop completes well before this.
     pub emergency_max_attempts_exceeded: u64,
+    /// USD PnL of the most recent live exit cycle (`Decision::Exit`
+    /// + `ParallelExitOutcome::Both { Filled, Filled }`). Computed
+    /// via [`compute_realised_pnl`] from entry/exit mids and
+    /// per-venue fee rates. `None` until the first live round-trip
+    /// completes; failed-exit / leg-mismatch cycles record `None`
+    /// rather than overwriting with zero.
+    pub last_realised_pnl_usd: Option<f64>,
+}
+
+/// Snapshot of an open live position needed to compute realised PnL
+/// at exit time (#268 S5-1). Populated in `Decision::Enter`'s live
+/// happy path once both legs have terminal-filled; consumed in the
+/// `Decision::Exit` `Both { Filled, Filled }` branch to feed
+/// [`compute_realised_pnl`]. Failure paths (Lighter-fail-after-ext,
+/// Both with at least one Failed, LegMismatchTimeout) consume the
+/// ctx via `take()` without computing PnL — partial-fill PnL is
+/// out of scope for Phase 3 (see #268 S5-1 'Out of scope').
+#[derive(Debug, Clone)]
+pub struct LiveEntryCtx {
+    pub direction: SpreadDirection,
+    /// Per-venue mid at the time the entry leg landed. Mid-based
+    /// approximation — actual fill prices would be slightly worse
+    /// (post-only at touch / taker crosses spread) but the
+    /// difference is absorbed into the fee rate (default 5 bps
+    /// covers typical maker/taker mix). Replace with real fill
+    /// prices in a Sprint 6 once the executor surfaces them.
+    pub ext_entry_mid: Decimal,
+    pub lt_entry_mid: Decimal,
+    pub ext_entry_qty: Decimal,
+    pub lt_entry_qty: Decimal,
+}
+
+/// Realised USD PnL for one live round-trip (#268 S5-1).
+///
+/// Gross: spread-direction-aware delta times the smaller of the two
+/// exit fill qtys (the truly delta-neutral portion of the round
+/// trip). For SpreadDirection::Long the position profits when the
+/// spread widens (`exit_spread > entry_spread`); Short is symmetric.
+///
+/// Fees: per-leg, per-side. Each leg's notional is `mid * qty`;
+/// the fee rate (`*_fee_bps`) applies to that notional. Entry +
+/// exit fees on both venues sum into the total.
+///
+/// Mid-based pricing is an approximation — actual fill prices on
+/// Lighter taker can be a tick worse than mid, and Extended
+/// post-only fills happen at the touch which is already at mid
+/// (zero spread cost). The fee-rate default (5 bps) is set
+/// conservatively to absorb this approximation.
+pub fn compute_realised_pnl(
+    direction: SpreadDirection,
+    ext_entry_mid: Decimal,
+    lt_entry_mid: Decimal,
+    ext_exit_mid: Decimal,
+    lt_exit_mid: Decimal,
+    ext_entry_qty: Decimal,
+    lt_entry_qty: Decimal,
+    ext_exit_qty: Decimal,
+    lt_exit_qty: Decimal,
+    ext_fee_bps: f64,
+    lt_fee_bps: f64,
+) -> Decimal {
+    let realised_qty = ext_exit_qty.min(lt_exit_qty);
+    if realised_qty <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    let entry_spread = ext_entry_mid - lt_entry_mid;
+    let exit_spread = ext_exit_mid - lt_exit_mid;
+    let gross = match direction {
+        SpreadDirection::Long => (exit_spread - entry_spread) * realised_qty,
+        SpreadDirection::Short => (entry_spread - exit_spread) * realised_qty,
+    };
+    let bps_div = Decimal::new(10_000, 0);
+    let ext_rate =
+        Decimal::from_f64_retain(ext_fee_bps).unwrap_or(Decimal::ZERO) / bps_div;
+    let lt_rate =
+        Decimal::from_f64_retain(lt_fee_bps).unwrap_or(Decimal::ZERO) / bps_div;
+    let ext_fees =
+        (ext_entry_mid * ext_entry_qty + ext_exit_mid * ext_exit_qty) * ext_rate;
+    let lt_fees =
+        (lt_entry_mid * lt_entry_qty + lt_exit_mid * lt_exit_qty) * lt_rate;
+    gross - ext_fees - lt_fees
 }
 
 /// Control surface for the run loop.
@@ -316,6 +397,13 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
     // close_all (see emergency_loop docs §5).
     let mut last_emergency_attempt_ms: Option<u64> = None;
     let mut emergency_attempts: u32 = 0;
+    // Entry-time mids + qtys captured at Decision::Enter happy
+    // landing for the realised-PnL helper at Decision::Exit (#268
+    // S5-1). Cleared whenever the position machine returns to Flat
+    // — covers normal exit (already taken inside Decision::Exit),
+    // EmergencyComplete (drive_emergency_flatten_round), and any
+    // operator-driven Reset. Stays None in paper mode.
+    let mut live_entry_ctx: Option<LiveEntryCtx> = None;
 
     // Drop an initial snapshot so the dashboard sees the DRY_RUN pill /
     // agent identity on boot instead of waiting for the first
@@ -363,6 +451,7 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                     &mut ws_health,
                     &mut skew_monitor,
                     live_exec.as_deref(),
+                    &mut live_entry_ctx,
                 ).await {
                     // Read-mid / decision errors are logged but don't
                     // terminate the loop. Phase 3 will add a consec-fail
@@ -399,6 +488,16 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                         last_emergency_attempt_ms = None;
                         emergency_attempts = 0;
                     }
+                }
+
+                // Drop a stale live_entry_ctx whenever the position
+                // machine has returned to Flat without a corresponding
+                // Decision::Exit Both{Filled,Filled} consume — covers
+                // EmergencyComplete (post-flatten cleanup), operator
+                // Reset, and any future failure path that lands in
+                // Flat. Idempotent if ctx is already None.
+                if matches!(machine.phase(), super::state::Phase::Flat) {
+                    live_entry_ctx = None;
                 }
             }
 
@@ -520,6 +619,7 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
     ws_health: &mut WsHealthMonitor,
     skew_monitor: &mut SkewMonitor,
     live_exec: Option<&LiveExecution>,
+    live_entry_ctx: &mut Option<LiveEntryCtx>,
 ) -> Result<()> {
     // Drain any pending SIGUSR1 — arms the STUCK file if needed.
     let _ = stuck.poll_sigusr1();
@@ -1027,6 +1127,19 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
                                     Event::LighterFilled { qty: lt_filled },
                                 )?;
                                 *open_qty = Some(lt_filled);
+                                // Capture entry context for the
+                                // realised-PnL helper at exit time
+                                // (#268 S5-1). Only set when BOTH
+                                // legs filled; failure paths leave
+                                // the ctx None so partial-fill PnL
+                                // is out of scope.
+                                *live_entry_ctx = Some(LiveEntryCtx {
+                                    direction: dir,
+                                    ext_entry_mid: ext_snap.mid,
+                                    lt_entry_mid: lt_snap.mid,
+                                    ext_entry_qty: qty,
+                                    lt_entry_qty: lt_filled,
+                                });
                                 if let Some(r) = reporter.as_deref_mut() {
                                     r.record_fill(false, true, now_ts_ms);
                                 }
@@ -1182,72 +1295,104 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
                 .await;
                 match outcome {
                     ParallelExitOutcome::Both { ext, lt } => {
-                        let ext_filled = match ext {
+                        let ext_exit_qty = match ext {
                             ExtendedTerminal::Filled { qty: q } => {
                                 machine.apply(
                                     now_ts_ms,
                                     Event::ExtendedExitFilled { qty: q },
                                 )?;
-                                true
+                                Some(q)
                             }
                             ExtendedTerminal::Failed { reason: r } => {
                                 log::error!(
                                     "[XVENUE] LIVE EXIT ext failed reason={:?}",
                                     r
                                 );
-                                false
+                                None
                             }
                         };
-                        let lt_filled = match lt {
+                        let lt_exit_qty = match lt {
                             LighterTerminal::Filled { qty: q } => {
                                 machine.apply(
                                     now_ts_ms,
                                     Event::LighterExitFilled { qty: q },
                                 )?;
-                                true
+                                Some(q)
                             }
                             LighterTerminal::Failed { reason: r } => {
                                 log::error!(
                                     "[XVENUE] LIVE EXIT lt failed reason={:?}",
                                     r
                                 );
-                                false
+                                None
                             }
                         };
-                        if ext_filled && lt_filled {
-                            if let Some(r) = reporter.as_deref_mut() {
-                                r.record_fill(true, true, now_ts_ms);
-                                // Realised PnL still 0 at this layer —
-                                // Sprint 5 will replace with the actual
-                                // USD delta computed from entry/exit
-                                // mids + fees.
-                                r.record_close(0.0);
+                        match (ext_exit_qty, lt_exit_qty) {
+                            (Some(ext_eq), Some(lt_eq)) => {
+                                // Happy path — compute realised PnL
+                                // (#268 S5-1). If the ctx is missing
+                                // (shouldn't happen but defensive),
+                                // fall back to 0.0 + log warn.
+                                let pnl = match live_entry_ctx.take() {
+                                    Some(ctx) => compute_realised_pnl(
+                                        ctx.direction,
+                                        ctx.ext_entry_mid,
+                                        ctx.lt_entry_mid,
+                                        ext_snap.mid,
+                                        lt_snap.mid,
+                                        ctx.ext_entry_qty,
+                                        ctx.lt_entry_qty,
+                                        ext_eq,
+                                        lt_eq,
+                                        cfg.extended_fee_bps,
+                                        cfg.lighter_fee_bps,
+                                    ),
+                                    None => {
+                                        log::warn!(
+                                            "[XVENUE] LIVE EXIT realised PnL: \
+                                             entry ctx missing, recording 0.0"
+                                        );
+                                        Decimal::ZERO
+                                    }
+                                };
+                                let pnl_f64 = rust_decimal::prelude::ToPrimitive::to_f64(&pnl)
+                                    .unwrap_or(0.0);
+                                summary.last_realised_pnl_usd = Some(pnl_f64);
+                                if let Some(r) = reporter.as_deref_mut() {
+                                    r.record_fill(true, true, now_ts_ms);
+                                    r.record_close(pnl_f64);
+                                }
+                                risk_manager.record_close(pnl_f64, now_unix_secs());
+                                log::info!(
+                                    "[XVENUE] LIVE EXIT both legs filled → Flat \
+                                     pnl_usd={:.4}",
+                                    pnl_f64
+                                );
                             }
-                            risk_manager.record_close(0.0, now_unix_secs());
-                            log::info!("[XVENUE] LIVE EXIT both legs filled → Flat");
-                        } else {
-                            // At least one leg failed. Route to
-                            // EmergencyFlattening — the emergency_loop
-                            // (Sprint 4 step 3/3) will keep retrying
-                            // reduce-only close until the leg is zero.
-                            // No dedicated `ExitFailed` reason in
-                            // EmergencyReason — `LegMismatchTimeout`
-                            // is the closest semantic fit since the
-                            // exit didn't terminate cleanly on one
-                            // side.
-                            machine.apply(
-                                now_ts_ms,
-                                Event::Emergency {
-                                    reason: EmergencyReason::LegMismatchTimeout,
-                                },
-                            )?;
-                            summary.live_exits_failed_legs += 1;
-                            log::error!(
-                                "[XVENUE] LIVE EXIT failed legs (ext_filled={}, \
-                                 lt_filled={}) → EmergencyFlattening",
-                                ext_filled,
-                                lt_filled,
-                            );
+                            (ext_filled, lt_filled) => {
+                                // Failure: at least one leg returned
+                                // Failed. Drop the entry ctx (no PnL
+                                // computation for partial trades —
+                                // out of scope per #268 S5-1) and
+                                // route to EmergencyFlattening. No
+                                // dedicated `ExitFailed` reason in
+                                // EmergencyReason — `LegMismatchTimeout`
+                                // is the closest semantic fit.
+                                let _ = live_entry_ctx.take();
+                                machine.apply(
+                                    now_ts_ms,
+                                    Event::Emergency {
+                                        reason: EmergencyReason::LegMismatchTimeout,
+                                    },
+                                )?;
+                                summary.live_exits_failed_legs += 1;
+                                log::error!(
+                                    "[XVENUE] LIVE EXIT failed legs \
+                                     (ext_filled={}, lt_filled={}) → EmergencyFlattening",
+                                    ext_filled.is_some(),
+                                    lt_filled.is_some(),
+                                );
+                            }
                         }
                     }
                     ParallelExitOutcome::LegMismatchTimeout { ext, lt } => {
@@ -1255,7 +1400,9 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
                         // the state machine has the latest open qty
                         // before transitioning to EmergencyFlattening
                         // (mirrors parallel_exit.rs's documented
-                        // contract for case 11).
+                        // contract for case 11). PnL is not computed
+                        // — see #268 S5-1 'Out of scope' for partial
+                        // trade PnL accounting.
                         if let Some(ExtendedTerminal::Filled { qty: q }) = ext {
                             machine.apply(
                                 now_ts_ms,
@@ -1268,6 +1415,7 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
                                 Event::LighterExitFilled { qty: q },
                             )?;
                         }
+                        let _ = live_entry_ctx.take();
                         machine.apply(
                             now_ts_ms,
                             Event::Emergency {
@@ -1578,6 +1726,7 @@ max_hold_sec: 60
             &mut ws_health,
             &mut skew_monitor,
             None,
+            &mut None,
         )
         .await
         .unwrap();
@@ -1618,6 +1767,7 @@ max_hold_sec: 60
             &mut ws_health,
             &mut skew_monitor,
             None,
+            &mut None,
         )
         .await
         .unwrap();
@@ -1688,6 +1838,7 @@ max_hold_sec: 60
                 &mut ws_health,
                 &mut skew_monitor,
                 None,
+                &mut None,
             )
             .await
             .unwrap();
@@ -1766,6 +1917,7 @@ max_hold_sec: 60
                 &mut ws_health,
                 &mut skew_monitor,
                 None,
+                &mut None,
             )
             .await
             .unwrap();
@@ -1838,6 +1990,7 @@ max_hold_sec: 60
                 &mut ws_health,
                 &mut skew_monitor,
                 None,
+                &mut None,
             )
             .await
             .unwrap();
@@ -1909,6 +2062,7 @@ max_hold_sec: 60
                 &mut ws_health,
                 &mut skew_monitor,
                 None,
+                &mut None,
             )
             .await
             .unwrap();
@@ -2006,6 +2160,7 @@ max_hold_sec: 60
                 &mut ws_health,
                 &mut skew_monitor,
                 None,
+                &mut None,
             )
             .await
             .expect("warm-up errors must not propagate");
@@ -2035,6 +2190,7 @@ max_hold_sec: 60
             &mut ws_health,
             &mut skew_monitor,
             None,
+            &mut None,
         )
         .await
         .expect("warm-up errors must not propagate");
@@ -2060,6 +2216,7 @@ max_hold_sec: 60
                 &mut ws_health,
                 &mut skew_monitor,
                 None,
+                &mut None,
             )
             .await
             .expect("warm-up errors must not propagate");
@@ -2080,6 +2237,7 @@ max_hold_sec: 60
             &mut ws_health,
             &mut skew_monitor,
             None,
+            &mut None,
         )
         .await
         .expect("post-warmup tick must succeed");
@@ -2144,6 +2302,7 @@ max_hold_sec: 60
             &mut ws_health,
             &mut skew_monitor,
             None,
+            &mut None,
         )
         .await
         .expect_err("post-warmup read_mid Err must propagate as Err");
@@ -2239,6 +2398,7 @@ lighter_fill_timeout_ms: 100
         let mut warmup = VenueWarmup::default();
         let mut ws_health = WsHealthMonitor::new(0);
         let mut skew_monitor = SkewMonitor::new(0.0);
+        let mut live_entry_ctx: Option<LiveEntryCtx> = None;
         for _ in 0..iters {
             run_one_tick(
                 cfg,
@@ -2256,9 +2416,16 @@ lighter_fill_timeout_ms: 100
                 &mut ws_health,
                 &mut skew_monitor,
                 Some(live),
+                &mut live_entry_ctx,
             )
             .await
             .unwrap();
+            // Mirror the run_paper_loop guard: drop stale ctx when
+            // the position machine is back to Flat. Tests that drive
+            // multi-cycle scenarios depend on this resetting.
+            if matches!(machine.phase(), Phase::Flat) {
+                live_entry_ctx = None;
+            }
         }
         (machine, summary, open_qty)
     }
@@ -3181,6 +3348,220 @@ leg_mismatch_timeout_ms: 100
             "dry_run must not dispatch real orders even on exit"
         );
         assert!(lt_vops.snapshot_takers().is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Sprint 5 step 1 — compute_realised_pnl helper (#268 S5-1)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn pnl_long_no_fees_profits_when_spread_widens() {
+        // Long: bought ext at 100, sold lt at 100 (spread 0).
+        // Exit at ext=110, lt=105 (spread +5). Profit per unit = 5.
+        let pnl = compute_realised_pnl(
+            SpreadDirection::Long,
+            dec!(100),
+            dec!(100),
+            dec!(110),
+            dec!(105),
+            dec!(1),
+            dec!(1),
+            dec!(1),
+            dec!(1),
+            0.0,
+            0.0,
+        );
+        assert_eq!(pnl, dec!(5));
+    }
+
+    #[test]
+    fn pnl_short_no_fees_profits_when_spread_compresses() {
+        // Short: sold ext at 110, bought lt at 100 (spread +10).
+        // Exit at ext=105, lt=100 (spread +5). Profit per unit = 5.
+        let pnl = compute_realised_pnl(
+            SpreadDirection::Short,
+            dec!(110),
+            dec!(100),
+            dec!(105),
+            dec!(100),
+            dec!(1),
+            dec!(1),
+            dec!(1),
+            dec!(1),
+            0.0,
+            0.0,
+        );
+        assert_eq!(pnl, dec!(5));
+    }
+
+    #[test]
+    fn pnl_long_no_fees_loses_when_spread_compresses() {
+        // Long bet but spread moved the wrong way.
+        let pnl = compute_realised_pnl(
+            SpreadDirection::Long,
+            dec!(100),
+            dec!(100),
+            dec!(105),
+            dec!(110),
+            dec!(1),
+            dec!(1),
+            dec!(1),
+            dec!(1),
+            0.0,
+            0.0,
+        );
+        assert_eq!(pnl, dec!(-5));
+    }
+
+    #[test]
+    fn pnl_fees_subtract_per_leg_per_side() {
+        // Spread unchanged → gross 0. Fees: 5 bps on Extended,
+        // 2 bps on Lighter. Each leg: notional = mid * qty per side
+        // (entry + exit).
+        // ext fee: (100 * 1 + 100 * 1) * 5 / 10000 = 0.1
+        // lt fee:  (100 * 1 + 100 * 1) * 2 / 10000 = 0.04
+        // pnl = 0 - 0.1 - 0.04 = -0.14
+        let pnl = compute_realised_pnl(
+            SpreadDirection::Long,
+            dec!(100),
+            dec!(100),
+            dec!(100),
+            dec!(100),
+            dec!(1),
+            dec!(1),
+            dec!(1),
+            dec!(1),
+            5.0,
+            2.0,
+        );
+        // Round to 4 dp to absorb f64-derived rate noise.
+        let rounded = pnl.round_dp(4);
+        assert_eq!(rounded, dec!(-0.14));
+    }
+
+    #[test]
+    fn pnl_zero_exit_qty_returns_zero() {
+        let pnl = compute_realised_pnl(
+            SpreadDirection::Long,
+            dec!(100),
+            dec!(100),
+            dec!(110),
+            dec!(105),
+            dec!(1),
+            dec!(1),
+            Decimal::ZERO,
+            dec!(1),
+            5.0,
+            0.0,
+        );
+        assert_eq!(pnl, Decimal::ZERO);
+    }
+
+    #[test]
+    fn pnl_uses_min_exit_qty_for_gross() {
+        // Asymmetric exit fills: ext=0.5, lt=1.0. The realised
+        // delta-neutral qty is min = 0.5. Gross = 5 * 0.5 = 2.5.
+        // Fees apply to each leg's ACTUAL exit qty (not the min).
+        let pnl = compute_realised_pnl(
+            SpreadDirection::Long,
+            dec!(100),
+            dec!(100),
+            dec!(110),
+            dec!(105),
+            dec!(1),
+            dec!(1),
+            dec!(0.5),
+            dec!(1),
+            0.0,
+            0.0,
+        );
+        assert_eq!(pnl, dec!(2.5));
+    }
+
+    #[test]
+    fn pnl_short_with_fees_realistic_scenario() {
+        // Realistic Phase 3 case: short ETH spread, +30 bps spread
+        // entry, +20 bps spread exit (10 bps compression), $50
+        // notional. The expected economics are a wash at 5 bps
+        // Extended fee: 10 bps gross × $50 = $0.05 ≈ Extended fees
+        // (5 bps × $50 × 2 sides = $0.05), so net ≈ 0.
+        //
+        // This is the threshold the strategy needs to clear: at
+        // ≥10 bps captured the per-trade economics are positive
+        // before slippage. Sub-10 bps captures will lose money.
+        let pnl = compute_realised_pnl(
+            SpreadDirection::Short,
+            dec!(2006),
+            dec!(2000),
+            dec!(2004),
+            dec!(2000),
+            dec!(0.025),
+            dec!(0.025),
+            dec!(0.025),
+            dec!(0.025),
+            5.0,
+            0.0,
+        );
+        let pnl_f64 = rust_decimal::prelude::ToPrimitive::to_f64(&pnl).unwrap();
+        // Expect roughly zero — bounded by typical f64-derived
+        // rounding noise (< $0.005 on a $50 notional).
+        assert!(
+            pnl_f64.abs() < 0.005,
+            "expected ~$0 (10 bps gross ≈ 5 bps × 2 sides fees); got {}",
+            pnl_f64
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_exit_happy_path_records_realised_pnl() {
+        // End-to-end: live happy path lands a non-zero PnL on
+        // summary.last_realised_pnl_usd. With sustained breach mids
+        // (entry and exit at the same +20 bps spread) the gross is
+        // zero, so the recorded PnL equals -fees ≈ -$0.20 with
+        // default 5 bps Extended + 0 bps Lighter and qty=1.
+        let mut cfg = live_test_cfg();
+        cfg.dry_run = false;
+        let (ext_seq, lt_seq) = breach_then_hold_sequence(70);
+        let total = ext_seq.len() as u64;
+        let hub = Arc::new(ScriptedHub::new(ext_seq, lt_seq));
+        let ext_vops = Arc::new(ScriptedVenueOps::new());
+        ext_vops.with_state(|s| {
+            s.default_fill = OrderFillStatus {
+                filled_qty: dec!(1),
+                terminal: true,
+                cancelled: false,
+            };
+        });
+        let lt_vops = Arc::new(ScriptedVenueOps::new());
+        lt_vops.with_state(|s| {
+            s.default_fill = OrderFillStatus {
+                filled_qty: dec!(1),
+                terminal: true,
+                cancelled: false,
+            };
+        });
+        let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
+        let (machine, summary, _) =
+            drive_live_ticks(&cfg, &*hub, &live, total).await;
+        assert_eq!(machine.phase(), Phase::Flat);
+        assert!(
+            summary.last_realised_pnl_usd.is_some(),
+            "live exit happy path must record realised PnL"
+        );
+        let pnl = summary.last_realised_pnl_usd.unwrap();
+        // Sustained breach → entry_spread == exit_spread → gross = 0.
+        // Fees consume the value: ext 5 bps × ~4004 notional × 1 qty
+        // = ~$2.0. Lighter free. Final PnL ≈ -$2.0.
+        assert!(
+            pnl < 0.0,
+            "fees should consume sustained-spread PnL → negative; got {}",
+            pnl
+        );
+        assert!(
+            pnl > -3.0,
+            "loss should be bounded by total fees (~$2 expected); got {}",
+            pnl
+        );
     }
 
     #[tokio::test(start_paused = true)]
