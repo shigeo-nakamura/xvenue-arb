@@ -34,7 +34,7 @@ use super::live_exec::LiveExecution;
 use super::signal::{Decision, ExitReason, SignalEngine, SpreadDirection};
 use super::sizing::{compute_notional_usd, notional_to_qty, SizeOutcome};
 use super::spread::SpreadEngine;
-use super::state::{Event, PositionMachine};
+use super::state::{EmergencyReason, Event, PositionMachine};
 use super::status::{equity_decimal_to_f64, StatusReporter};
 use crate::risk::kill_switch::{StuckTripwire, VenueLabel};
 use crate::risk::manager::{BlockReason, RiskManager};
@@ -43,6 +43,7 @@ use crate::risk::skew_monitor::{SkewMonitor, SkewOutcome};
 use crate::risk::ws_health::{WsHealthMonitor, WsHealthOutcome};
 use crate::trade::execution::extended_maker::{ExtendedEntryRequest, ExtendedMakerLoop};
 use crate::trade::execution::lighter_fill::{LighterFillLoop, LighterFillRequest};
+use crate::trade::execution::parallel_exit::{ParallelExitLoop, ParallelExitOutcome};
 use crate::trade::execution::types::{ExtendedTerminal, LighterTerminal};
 
 /// Which venue an operation targets. Avoids leaking the underlying
@@ -182,6 +183,16 @@ pub struct LivePaperSummary {
     /// Extended leg (Sprint 4 emergency_loop wiring will drive the
     /// reduce-only flatten).
     pub live_entries_lighter_failed_after_extended: u64,
+    /// Live-mode `Decision::Exit` cycles that completed with both
+    /// terminals present and at least one `Failed` (e.g. taker
+    /// rejected, market timeout). Routes via `Event::Emergency` →
+    /// `EmergencyFlattening`.
+    pub live_exits_failed_legs: u64,
+    /// Live-mode `Decision::Exit` cycles where the parallel exit
+    /// returned `LegMismatchTimeout` — one leg terminated within
+    /// its own timeout, the other was still in flight when the
+    /// `leg_mismatch_timeout_ms` deadline fired. Catalogue case 11.
+    pub live_exits_leg_mismatch: u64,
 }
 
 /// Control surface for the run loop.
@@ -999,40 +1010,208 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
             }
         }
         Decision::Exit(reason) => {
-            let qty = open_qty.take().unwrap_or(Decimal::ZERO);
-            machine.apply(now_ts_ms, Event::ExitSignal { reason })?;
-            if qty > Decimal::ZERO {
-                machine.apply(now_ts_ms, Event::ExtendedExitFilled { qty })?;
-                machine.apply(now_ts_ms, Event::LighterExitFilled { qty })?;
-                if let Some(r) = reporter.as_deref_mut() {
-                    r.record_fill(true, true, now_ts_ms);
-                    // Paper PnL is 0 in DRY_RUN — Group B will replace
-                    // this with realized USD once orders flow. The call
-                    // ticks the round-trip counter so the dashboard's
-                    // `trade_stats.trades` advances during paper.
-                    r.record_close(0.0);
+            let go_live = !cfg.dry_run && live_exec.is_some();
+            if !go_live {
+                // Paper-mode synthetic exit fills (existing behaviour).
+                let qty = open_qty.take().unwrap_or(Decimal::ZERO);
+                machine.apply(now_ts_ms, Event::ExitSignal { reason })?;
+                if qty > Decimal::ZERO {
+                    machine.apply(now_ts_ms, Event::ExtendedExitFilled { qty })?;
+                    machine.apply(now_ts_ms, Event::LighterExitFilled { qty })?;
+                    if let Some(r) = reporter.as_deref_mut() {
+                        r.record_fill(true, true, now_ts_ms);
+                        r.record_close(0.0);
+                    }
+                    risk_manager.record_close(0.0, now_unix_secs());
                 }
-                // Paper PnL is 0 in DRY_RUN — Group B will replace
-                // this with realized USD once orders flow. The
-                // record_close call exercises the risk path so the
-                // counters / persistence stay live during paper.
-                risk_manager.record_close(0.0, now_unix_secs());
+                summary.last_decision_ts_ms = Some(now_ts_ms);
+                summary.decisions_exit += 1;
+                log::info!(
+                    "[XVENUE] PAPER EXIT reason={:?} dev_bps={:?} ext_mid={} lt_mid={} \
+                     dry_run={}",
+                    reason,
+                    dev,
+                    ext_snap.mid,
+                    lt_snap.mid,
+                    cfg.dry_run,
+                );
+                let _ = ExitReason::MeanCross;
+            } else {
+                // Live mode: reduce-only parallel exit on both legs
+                // (#244 Sprint 4 step 2/3). DESIGN.md §4.2 specifies
+                // parallel exit (vs entry's serial Extended-first
+                // dispatch) — the legs are already balanced so we
+                // close both simultaneously to minimise the open-leg
+                // window if one venue lags.
+                let live = live_exec.expect(
+                    "go_live = !cfg.dry_run && live_exec.is_some(); checked above",
+                );
+                // Capture position direction + qty BEFORE applying
+                // ExitSignal — `summary()` returns `None` once we
+                // leave Held.
+                let position_dir = match machine.summary() {
+                    Some(p) => p.direction,
+                    None => {
+                        log::warn!(
+                            "[XVENUE] LIVE EXIT skipped: no position summary in phase {:?}",
+                            machine.phase()
+                        );
+                        return Ok(());
+                    }
+                };
+                let qty = open_qty.take().unwrap_or(Decimal::ZERO);
+                if qty <= Decimal::ZERO {
+                    log::warn!(
+                        "[XVENUE] LIVE EXIT skipped: open_qty zero or unset in phase {:?}",
+                        machine.phase()
+                    );
+                    return Ok(());
+                }
+                machine.apply(now_ts_ms, Event::ExitSignal { reason })?;
+                summary.last_decision_ts_ms = Some(now_ts_ms);
+                summary.decisions_exit += 1;
+                let (ext_exit_side, lt_exit_side) = match position_dir {
+                    // Reverse the entry sides — see Decision::Enter
+                    // for the entry sign convention. To close a
+                    // long leg we sell (Short), and vice versa.
+                    SpreadDirection::Long => (DcOrderSide::Short, DcOrderSide::Long),
+                    SpreadDirection::Short => (DcOrderSide::Long, DcOrderSide::Short),
+                };
+                log::info!(
+                    "[XVENUE] LIVE EXIT start reason={:?} dev_bps={:?} dir={:?} qty={}",
+                    reason,
+                    dev,
+                    position_dir,
+                    qty,
+                );
+                let outcome = ParallelExitLoop::new(
+                    &*live.ext_ops,
+                    &*live.lt_ops,
+                    &live.extended_maker_cfg,
+                    &live.lighter_fill_cfg,
+                    &live.parallel_exit_cfg,
+                )
+                .run(
+                    ExtendedEntryRequest {
+                        symbol: live.ext_symbol.clone(),
+                        side: ext_exit_side,
+                        target_qty: qty,
+                        dust_qty: live.dust_qty,
+                        reduce_only: true,
+                    },
+                    LighterFillRequest {
+                        symbol: live.lt_symbol.clone(),
+                        side: lt_exit_side,
+                        target_qty: qty,
+                        dust_qty: live.dust_qty,
+                        reduce_only: true,
+                    },
+                )
+                .await;
+                match outcome {
+                    ParallelExitOutcome::Both { ext, lt } => {
+                        let ext_filled = match ext {
+                            ExtendedTerminal::Filled { qty: q } => {
+                                machine.apply(
+                                    now_ts_ms,
+                                    Event::ExtendedExitFilled { qty: q },
+                                )?;
+                                true
+                            }
+                            ExtendedTerminal::Failed { reason: r } => {
+                                log::error!(
+                                    "[XVENUE] LIVE EXIT ext failed reason={:?}",
+                                    r
+                                );
+                                false
+                            }
+                        };
+                        let lt_filled = match lt {
+                            LighterTerminal::Filled { qty: q } => {
+                                machine.apply(
+                                    now_ts_ms,
+                                    Event::LighterExitFilled { qty: q },
+                                )?;
+                                true
+                            }
+                            LighterTerminal::Failed { reason: r } => {
+                                log::error!(
+                                    "[XVENUE] LIVE EXIT lt failed reason={:?}",
+                                    r
+                                );
+                                false
+                            }
+                        };
+                        if ext_filled && lt_filled {
+                            if let Some(r) = reporter.as_deref_mut() {
+                                r.record_fill(true, true, now_ts_ms);
+                                // Realised PnL still 0 at this layer —
+                                // Sprint 5 will replace with the actual
+                                // USD delta computed from entry/exit
+                                // mids + fees.
+                                r.record_close(0.0);
+                            }
+                            risk_manager.record_close(0.0, now_unix_secs());
+                            log::info!("[XVENUE] LIVE EXIT both legs filled → Flat");
+                        } else {
+                            // At least one leg failed. Route to
+                            // EmergencyFlattening — the emergency_loop
+                            // (Sprint 4 step 3/3) will keep retrying
+                            // reduce-only close until the leg is zero.
+                            // No dedicated `ExitFailed` reason in
+                            // EmergencyReason — `LegMismatchTimeout`
+                            // is the closest semantic fit since the
+                            // exit didn't terminate cleanly on one
+                            // side.
+                            machine.apply(
+                                now_ts_ms,
+                                Event::Emergency {
+                                    reason: EmergencyReason::LegMismatchTimeout,
+                                },
+                            )?;
+                            summary.live_exits_failed_legs += 1;
+                            log::error!(
+                                "[XVENUE] LIVE EXIT failed legs (ext_filled={}, \
+                                 lt_filled={}) → EmergencyFlattening",
+                                ext_filled,
+                                lt_filled,
+                            );
+                        }
+                    }
+                    ParallelExitOutcome::LegMismatchTimeout { ext, lt } => {
+                        // Apply whatever terminal we have first so
+                        // the state machine has the latest open qty
+                        // before transitioning to EmergencyFlattening
+                        // (mirrors parallel_exit.rs's documented
+                        // contract for case 11).
+                        if let Some(ExtendedTerminal::Filled { qty: q }) = ext {
+                            machine.apply(
+                                now_ts_ms,
+                                Event::ExtendedExitFilled { qty: q },
+                            )?;
+                        }
+                        if let Some(LighterTerminal::Filled { qty: q }) = lt {
+                            machine.apply(
+                                now_ts_ms,
+                                Event::LighterExitFilled { qty: q },
+                            )?;
+                        }
+                        machine.apply(
+                            now_ts_ms,
+                            Event::Emergency {
+                                reason: EmergencyReason::LegMismatchTimeout,
+                            },
+                        )?;
+                        summary.live_exits_leg_mismatch += 1;
+                        log::error!(
+                            "[XVENUE] LIVE EXIT leg-mismatch ext={:?} lt={:?} → \
+                             EmergencyFlattening",
+                            ext,
+                            lt,
+                        );
+                    }
+                }
             }
-            summary.last_decision_ts_ms = Some(now_ts_ms);
-            summary.decisions_exit += 1;
-            log::info!(
-                "[XVENUE] {} EXIT reason={:?} dev_bps={:?} ext_mid={} lt_mid={} dry_run={}",
-                if cfg.dry_run { "PAPER" } else { "LIVE" },
-                reason,
-                dev,
-                ext_snap.mid,
-                lt_snap.mid,
-                cfg.dry_run,
-            );
-            // ExitReason isn't used for the open_qty reset — that
-            // happens above via .take(). Keeping the reason in the log
-            // for downstream analysis (and to make ExitReason live).
-            let _ = ExitReason::MeanCross;
         }
     }
     Ok(())
@@ -2105,6 +2284,271 @@ lighter_fill_timeout_ms: 100
         assert!(
             ext_vops.snapshot_takers().is_empty(),
             "dry_run must not dispatch real orders"
+        );
+        assert!(lt_vops.snapshot_takers().is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Sprint 4 Decision::Exit live wiring (#244 step 2/3)
+    // ---------------------------------------------------------------
+
+    /// Breach + sustain sequence for Exit testing: 30 warm + 4 breach
+    /// (fires Enter) + `hold_n` more breach buckets at the same +20
+    /// bps. After `max_hold_sec` virtual seconds past entry, the
+    /// signal returns `Decision::Exit(MaxHold)`.
+    fn breach_then_hold_sequence(hold_n: u64) -> (Vec<MidSnapshot>, Vec<MidSnapshot>) {
+        let lt_mid = 2000.0;
+        // +20 bps clears abs_threshold=5 but stays under
+        // force_close_dev_bps=30 so the position holds until max_hold
+        // fires rather than triggering ForceClose immediately.
+        let breach_ext = lt_mid * (1.0 + 20.0 / 10_000.0);
+        let mut ext = Vec::new();
+        let mut lt = Vec::new();
+        let warm_n = 30u64;
+        let breach_n = 4u64;
+        let t0 = 200_000u64;
+        for i in 0..warm_n {
+            ext.push(mid(t0 + i * 1000, lt_mid));
+            lt.push(mid(t0 + i * 1000, lt_mid));
+        }
+        for i in warm_n..(warm_n + breach_n + hold_n) {
+            ext.push(mid(t0 + i * 1000, breach_ext));
+            lt.push(mid(t0 + i * 1000, lt_mid));
+        }
+        (ext, lt)
+    }
+
+    /// Cfg variant tuned for the leg-mismatch test path —
+    /// `leg_mismatch_timeout_ms` (100 ms) is well under
+    /// `lighter_fill_timeout_ms` (1000 ms), so a Lighter that never
+    /// terminates trips the parallel exit's mismatch deadline before
+    /// its own timeout fires.
+    fn live_test_cfg_leg_mismatch() -> XvenueConfig {
+        let yaml = r#"
+agent_name: live-test-leg-mismatch
+symbol_ext: ETH-USD
+symbol_lt: ETH
+trade_size_pct: 0.05
+min_notional_usd: 50
+max_notional_usd: 1000
+binance_reference_symbol: ETHUSDT
+reference_max_dev_bps: 100
+spread_bucket_ms: 1000
+rolling_window_sec: 30
+min_warmup_samples: 3
+abs_threshold_bps: 5.0
+persistence_sec: 1
+max_hold_sec: 60
+extended_post_only: false
+extended_chase_retries: 1
+extended_chase_timeout_ms: 50
+extended_taker_fallback: true
+lighter_fill_timeout_ms: 1000
+leg_mismatch_timeout_ms: 100
+"#;
+        let c: XvenueConfig = serde_yaml::from_str(yaml).unwrap();
+        c.validate().unwrap();
+        c
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_exit_happy_path_walks_parallel_exit_to_flat() {
+        let mut cfg = live_test_cfg();
+        cfg.dry_run = false;
+        // Run long enough past entry that max_hold (60 s with our
+        // 1 s buckets → 60 ticks past Enter) fires Decision::Exit.
+        let (ext_seq, lt_seq) = breach_then_hold_sequence(70);
+        let total = ext_seq.len() as u64;
+        let hub = Arc::new(ScriptedHub::new(ext_seq, lt_seq));
+        let ext_vops = Arc::new(ScriptedVenueOps::new());
+        ext_vops.with_state(|s| {
+            // Default fill terminal-filled handles both entry and
+            // exit takers — extended_post_only=false in cfg means
+            // both cycles skip maker and hit place_taker.
+            s.default_fill = OrderFillStatus {
+                filled_qty: dec!(1),
+                terminal: true,
+                cancelled: false,
+            };
+        });
+        let lt_vops = Arc::new(ScriptedVenueOps::new());
+        lt_vops.with_state(|s| {
+            s.default_fill = OrderFillStatus {
+                filled_qty: dec!(1),
+                terminal: true,
+                cancelled: false,
+            };
+        });
+        let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
+        let (machine, summary, open_qty) =
+            drive_live_ticks(&cfg, &*hub, &live, total).await;
+        assert!(
+            summary.decisions_enter_short >= 1,
+            "Enter must have fired; summary={:?}",
+            summary
+        );
+        assert!(
+            summary.decisions_exit >= 1,
+            "max_hold must have fired Exit within {} ticks; summary={:?}",
+            total,
+            summary
+        );
+        assert_eq!(
+            machine.phase(),
+            Phase::Flat,
+            "live exit happy path lands in Flat; got phase={:?}",
+            machine.phase()
+        );
+        assert!(open_qty.is_none());
+        assert_eq!(summary.live_exits_failed_legs, 0);
+        assert_eq!(summary.live_exits_leg_mismatch, 0);
+        // 1 entry taker + 1 exit taker per venue.
+        assert_eq!(ext_vops.snapshot_takers().len(), 2);
+        assert_eq!(lt_vops.snapshot_takers().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_exit_leg_mismatch_routes_to_emergency_flattening() {
+        // Catalogue case 11 at the runner orchestration level. Lighter
+        // never terminates inside the parallel-exit window → mismatch
+        // deadline fires → Phase: EmergencyFlattening + counter bump.
+        let mut cfg = live_test_cfg_leg_mismatch();
+        cfg.dry_run = false;
+        let (ext_seq, lt_seq) = breach_then_hold_sequence(70);
+        let total = ext_seq.len() as u64;
+        let hub = Arc::new(ScriptedHub::new(ext_seq, lt_seq));
+        let ext_vops = Arc::new(ScriptedVenueOps::new());
+        ext_vops.with_state(|s| {
+            s.default_fill = OrderFillStatus {
+                filled_qty: dec!(1),
+                terminal: true,
+                cancelled: false,
+            };
+        });
+        // Lighter: queue a single terminal-filled response for entry,
+        // then default (zero non-terminal) on exit so the mismatch
+        // deadline fires before Lighter's own fill_timeout_ms.
+        let lt_vops = Arc::new(ScriptedVenueOps::new());
+        lt_vops.with_state(|s| {
+            s.poll_fill.push_back(
+                crate::trade::execution::venue_ops::ScriptedResponse::FillStatus(
+                    OrderFillStatus {
+                        filled_qty: dec!(1),
+                        terminal: true,
+                        cancelled: false,
+                    },
+                ),
+            );
+            // default_fill stays at OrderFillStatus::default() = zero
+            // non-terminal so subsequent polls (the exit cycle) keep
+            // returning "still in flight".
+        });
+        let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
+        let (machine, summary, open_qty) =
+            drive_live_ticks(&cfg, &*hub, &live, total).await;
+        assert!(summary.decisions_enter_short >= 1);
+        assert!(summary.decisions_exit >= 1);
+        assert_eq!(
+            machine.phase(),
+            Phase::EmergencyFlattening,
+            "leg mismatch on exit MUST route to EmergencyFlattening; \
+             got phase={:?}",
+            machine.phase()
+        );
+        assert!(open_qty.is_none());
+        assert!(
+            summary.live_exits_leg_mismatch >= 1,
+            "leg-mismatch counter must increment; summary={:?}",
+            summary
+        );
+        assert_eq!(summary.live_exits_failed_legs, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_exit_one_leg_failed_routes_to_emergency_flattening() {
+        // Both legs terminate within the parallel-exit window but the
+        // Lighter terminal is `Failed{Cancelled}`. Runner applies the
+        // Extended fill, then Emergency to escalate. Distinct from
+        // leg-mismatch: here both legs reported, but one with a
+        // failure — `live_exits_failed_legs` is the relevant counter.
+        let mut cfg = live_test_cfg();
+        cfg.dry_run = false;
+        let (ext_seq, lt_seq) = breach_then_hold_sequence(70);
+        let total = ext_seq.len() as u64;
+        let hub = Arc::new(ScriptedHub::new(ext_seq, lt_seq));
+        let ext_vops = Arc::new(ScriptedVenueOps::new());
+        ext_vops.with_state(|s| {
+            s.default_fill = OrderFillStatus {
+                filled_qty: dec!(1),
+                terminal: true,
+                cancelled: false,
+            };
+        });
+        let lt_vops = Arc::new(ScriptedVenueOps::new());
+        lt_vops.with_state(|s| {
+            // Entry: terminal-filled (queued — first pop).
+            s.poll_fill.push_back(
+                crate::trade::execution::venue_ops::ScriptedResponse::FillStatus(
+                    OrderFillStatus {
+                        filled_qty: dec!(1),
+                        terminal: true,
+                        cancelled: false,
+                    },
+                ),
+            );
+            // Exit: terminal-cancelled with zero fill (default) →
+            // LighterTerminal::Failed{Cancelled}. ParallelExitLoop
+            // returns `Both { ext: Filled, lt: Failed }`.
+            s.default_fill = OrderFillStatus {
+                filled_qty: Decimal::ZERO,
+                terminal: true,
+                cancelled: true,
+            };
+        });
+        let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
+        let (machine, summary, open_qty) =
+            drive_live_ticks(&cfg, &*hub, &live, total).await;
+        assert!(summary.decisions_enter_short >= 1);
+        assert!(summary.decisions_exit >= 1);
+        assert_eq!(
+            machine.phase(),
+            Phase::EmergencyFlattening,
+            "Failed lighter exit terminal MUST route to EmergencyFlattening"
+        );
+        assert!(open_qty.is_none());
+        assert!(
+            summary.live_exits_failed_legs >= 1,
+            "failed-legs counter must increment; summary={:?}",
+            summary
+        );
+        assert_eq!(summary.live_exits_leg_mismatch, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_exit_paper_path_unchanged_when_dry_run_true() {
+        // With dry_run=true the synthetic exit path runs even when a
+        // LiveExecution is provided. Mirrors the entry-side guard.
+        let mut cfg = live_test_cfg();
+        cfg.dry_run = true;
+        let (ext_seq, lt_seq) = breach_then_hold_sequence(70);
+        let total = ext_seq.len() as u64;
+        let hub = Arc::new(ScriptedHub::new(ext_seq, lt_seq));
+        let ext_vops = Arc::new(ScriptedVenueOps::new());
+        let lt_vops = Arc::new(ScriptedVenueOps::new());
+        let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
+        let (machine, summary, open_qty) =
+            drive_live_ticks(&cfg, &*hub, &live, total).await;
+        assert!(summary.decisions_enter_short >= 1);
+        assert!(summary.decisions_exit >= 1);
+        assert_eq!(
+            machine.phase(),
+            Phase::Flat,
+            "paper exit path lands in Flat via synthetic fills"
+        );
+        assert!(open_qty.is_none());
+        assert!(
+            ext_vops.snapshot_takers().is_empty(),
+            "dry_run must not dispatch real orders even on exit"
         );
         assert!(lt_vops.snapshot_takers().is_empty());
     }
