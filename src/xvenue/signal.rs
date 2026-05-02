@@ -189,6 +189,26 @@ impl SignalEngine {
             return Decision::Hold;
         };
 
+        // bot-strategy#287: skip entries when the spread has already
+        // widened past force_close_dev_bps. Entering here would
+        // immediately re-evaluate to Decision::Exit{ForceClose} on
+        // the next tick (the stop-loss threshold is unidirectional
+        // beyond entry), producing the immediate-flip pattern the
+        // 2026-05-02 incident showed: open both legs, exit fails on
+        // post-only chase, leg-mismatch routes to EmergencyFlattening,
+        // recovery declares complete on a false-zero read. We'd
+        // rather not enter at all when force_close is already
+        // armed — the spread is anomalous (likely a stale quote on
+        // one venue, not a real arb).
+        let force_close_armed = match dir {
+            SpreadDirection::Short => dev >= self.cfg.force_close_dev_bps,
+            SpreadDirection::Long => dev <= -self.cfg.force_close_dev_bps,
+        };
+        if force_close_armed {
+            self.breach = None;
+            return Decision::Hold;
+        }
+
         let breach = self
             .breach
             .filter(|b| b.direction == dir)
