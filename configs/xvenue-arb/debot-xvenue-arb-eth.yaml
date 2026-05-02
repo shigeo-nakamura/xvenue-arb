@@ -11,7 +11,7 @@
 # /opt/debot/scripts/debot-xvenue-arb.env (see env.example).
 
 agent_name: debot-xvenue-arb-eth
-dry_run: false                # bot-strategy#244 small-notional probe (#166 Phase 3); kill drill passed 2026-05-02; max_notional_usd: 100 caps blast radius ≤ $10/cycle
+dry_run: true                 # 2026-05-02 reverted from live: leg-mismatch + bot get_positions(Extended) returning 0 while portal shows open SHORT after immediate-ForceClose round-trip. EmergencyFlattening declared complete on false-zero. Re-enable LIVE only after both bugs are fixed (separate follow-up issue).
 
 # ---- Symbol pair (one symbol per process) ----
 symbol_ext: ETH-USD
