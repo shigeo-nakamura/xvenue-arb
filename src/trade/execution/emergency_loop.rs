@@ -283,6 +283,7 @@ mod tests {
             stuck_file: dir.path().join("STUCK"),
             rest_consec_fail_to_escalate: 3,
             reduce_only_consec_fail_to_kill: kill_threshold,
+            enter_timeout_consec_fail_to_kill: 5,
         })
     }
 

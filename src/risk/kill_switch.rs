@@ -53,6 +53,12 @@ pub enum StuckReason {
     /// `close_all_positions` rejected `reduce_only_consec_fail_to_kill`
     /// times in a row inside `EmergencyFlattening`.
     ReduceOnlyFailLimit,
+    /// `LIVE ENTER ext` ended in `Timeout`
+    /// `enter_timeout_consec_fail_to_kill` times in a row. Catches the
+    /// 2026-05-02 Extended-side silent-reject pattern (#244 / #282)
+    /// where neither counter above fires but the bot can't actually
+    /// open a position.
+    EnterTimeoutLimit,
     /// Operator sent SIGUSR1 (`kill -USR1 $pid`).
     Sigusr1,
 }
@@ -62,6 +68,7 @@ impl StuckReason {
         match self {
             StuckReason::RestFailLimit => "REST_FAIL_LIMIT",
             StuckReason::ReduceOnlyFailLimit => "REDUCE_ONLY_FAIL_LIMIT",
+            StuckReason::EnterTimeoutLimit => "ENTER_TIMEOUT_LIMIT",
             StuckReason::Sigusr1 => "SIGUSR1",
         }
     }
@@ -69,12 +76,16 @@ impl StuckReason {
 
 /// Configuration for the tripwire. Ties to the existing
 /// `XvenueConfig` knobs (rest_consec_fail_to_escalate /
-/// reduce_only_consec_fail_to_kill / stuck_file).
+/// reduce_only_consec_fail_to_kill / enter_timeout_consec_fail_to_kill /
+/// stuck_file).
 #[derive(Debug, Clone)]
 pub struct StuckTripwireConfig {
     pub stuck_file: PathBuf,
     pub rest_consec_fail_to_escalate: u32,
     pub reduce_only_consec_fail_to_kill: u32,
+    /// Arm STUCK after this many consecutive `LIVE ENTER ext failed
+    /// reason=Timeout` results. 0 disables the gate. Default 5.
+    pub enter_timeout_consec_fail_to_kill: u32,
 }
 
 /// Persistent counter state. Only the per-path counters and a
@@ -86,6 +97,7 @@ pub struct StuckTripwire {
     ext_rest_consec_fail: u32,
     lt_rest_consec_fail: u32,
     reduce_only_consec_fail: u32,
+    enter_timeout_consec_fail: u32,
     /// Set when this process armed the file (so a stale file from a
     /// previous run is still reported in logs but isn't double-counted).
     armed_by_self: bool,
@@ -105,6 +117,7 @@ impl StuckTripwire {
             ext_rest_consec_fail: 0,
             lt_rest_consec_fail: 0,
             reduce_only_consec_fail: 0,
+            enter_timeout_consec_fail: 0,
             armed_by_self: false,
             sigusr1_rx: Some(rx),
         }
@@ -119,6 +132,7 @@ impl StuckTripwire {
             ext_rest_consec_fail: 0,
             lt_rest_consec_fail: 0,
             reduce_only_consec_fail: 0,
+            enter_timeout_consec_fail: 0,
             armed_by_self: false,
             sigusr1_rx: None,
         }
@@ -247,6 +261,46 @@ impl StuckTripwire {
         self.reduce_only_consec_fail = 0;
     }
 
+    /// Hook for the LIVE ENTER path (live.rs `Decision::Enter`). Call
+    /// after every `ExtendedTerminal::Failed { reason: Timeout }`.
+    /// Returns true if the call sequence escalated.
+    ///
+    /// Catches the silent-Extended-reject pattern (#244 / #282 2026-05-02)
+    /// where `place_taker` returns OK but `poll_fill_status` never sees
+    /// a fill — neither REST consec-fail nor reduce-only fires for that
+    /// case, leaving the bot unable to enter without anyone noticing.
+    pub fn record_enter_timeout_failure(&mut self) -> bool {
+        let kill = self.config.enter_timeout_consec_fail_to_kill;
+        if kill == 0 {
+            // Gate disabled — count for visibility only.
+            self.enter_timeout_consec_fail =
+                self.enter_timeout_consec_fail.saturating_add(1);
+            return false;
+        }
+        self.enter_timeout_consec_fail =
+            self.enter_timeout_consec_fail.saturating_add(1);
+        if self.enter_timeout_consec_fail >= kill {
+            log::error!(
+                "[KILL_SWITCH] enter-timeout consec fails={} >= kill={} — arming STUCK",
+                self.enter_timeout_consec_fail,
+                kill
+            );
+            self.arm(StuckReason::EnterTimeoutLimit);
+            true
+        } else {
+            log::warn!(
+                "[KILL_SWITCH] enter-timeout consec fails={} (kill threshold={})",
+                self.enter_timeout_consec_fail,
+                kill
+            );
+            false
+        }
+    }
+
+    pub fn record_enter_timeout_success(&mut self) {
+        self.enter_timeout_consec_fail = 0;
+    }
+
     /// Best-effort write of the STUCK file. Idempotent — multiple
     /// arms with different reasons append a fresh body each time so
     /// the operator sees the latest cause.
@@ -318,6 +372,7 @@ mod tests {
             stuck_file: dir.path().join("STUCK"),
             rest_consec_fail_to_escalate: 3,
             reduce_only_consec_fail_to_kill: 5,
+            enter_timeout_consec_fail_to_kill: 5,
         }
     }
 

@@ -44,7 +44,7 @@ use crate::risk::ws_health::{WsHealthMonitor, WsHealthOutcome};
 use crate::trade::execution::extended_maker::{ExtendedEntryRequest, ExtendedMakerLoop};
 use crate::trade::execution::lighter_fill::{LighterFillLoop, LighterFillRequest};
 use crate::trade::execution::parallel_exit::{ParallelExitLoop, ParallelExitOutcome};
-use crate::trade::execution::types::{ExtendedTerminal, LighterTerminal};
+use crate::trade::execution::types::{ExecutionFailure, ExtendedTerminal, LighterTerminal};
 
 /// Which venue an operation targets. Avoids leaking the underlying
 /// DexConnector type into the runner core so the mock in
@@ -1153,6 +1153,11 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
                 .await;
                 match ext_term {
                     ExtendedTerminal::Filled { qty } => {
+                        // bot-strategy#244 / #282 silent-reject gate:
+                        // any successful fill resets the consec-Timeout
+                        // counter so a healthy run doesn't leave a
+                        // stale stuck arm pending.
+                        stuck.record_enter_timeout_success();
                         machine.apply(now_ts_ms, Event::ExtendedFilled { qty })?;
                         if let Some(r) = reporter.as_deref_mut() {
                             r.record_fill(true, false, now_ts_ms);
@@ -1222,6 +1227,17 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
                              (no fills landed)",
                             reason,
                         );
+                        // bot-strategy#244 / #282: count consecutive
+                        // Timeout failures so the bot self-arms STUCK
+                        // after N in a row. Only Timeout is the
+                        // silent-reject signature; other reasons
+                        // (VenueRejected, TakerRejected,
+                        // PostOnlyExhausted) have their own meanings
+                        // and the operator should investigate them
+                        // separately.
+                        if matches!(reason, ExecutionFailure::Timeout) {
+                            stuck.record_enter_timeout_failure();
+                        }
                         machine.apply(now_ts_ms, Event::ExtendedFailed)?;
                         summary.live_entries_extended_failed += 1;
                     }
@@ -1672,6 +1688,7 @@ mod tests {
             stuck_file: dir.path().join("STUCK"),
             rest_consec_fail_to_escalate: 3,
             reduce_only_consec_fail_to_kill: 5,
+            enter_timeout_consec_fail_to_kill: 5,
         };
         (
             dir,
@@ -3050,6 +3067,7 @@ leg_mismatch_timeout_ms: 100
             stuck_file: dir.path().join("STUCK"),
             rest_consec_fail_to_escalate: 3,
             reduce_only_consec_fail_to_kill: kill_threshold,
+            enter_timeout_consec_fail_to_kill: 5,
         };
         (
             dir,

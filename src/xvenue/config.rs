@@ -149,6 +149,12 @@ pub struct XvenueConfig {
     pub rest_consec_fail_to_escalate: u32,
     #[serde(default = "default_reduce_only_consec_fail_to_kill")]
     pub reduce_only_consec_fail_to_kill: u32,
+    /// Arm STUCK after this many consecutive `LIVE ENTER ext failed
+    /// reason=Timeout` results. 0 disables. Catches the silent-reject
+    /// pattern (#244 / #282) where neither REST nor reduce-only counter
+    /// fires.
+    #[serde(default = "default_enter_timeout_consec_fail_to_kill")]
+    pub enter_timeout_consec_fail_to_kill: u32,
 
     // ---- Risk gates (#244 D-2..D-7) ----
     /// 0 disables. Daily DD blocks new entries when realized PnL
@@ -252,6 +258,7 @@ impl XvenueConfig {
             stuck_file: self.stuck_file.clone().into(),
             rest_consec_fail_to_escalate: self.rest_consec_fail_to_escalate,
             reduce_only_consec_fail_to_kill: self.reduce_only_consec_fail_to_kill,
+            enter_timeout_consec_fail_to_kill: self.enter_timeout_consec_fail_to_kill,
         }
     }
 
@@ -418,6 +425,9 @@ fn default_rest_consec_fail_to_escalate() -> u32 {
     3
 }
 fn default_reduce_only_consec_fail_to_kill() -> u32 {
+    5
+}
+fn default_enter_timeout_consec_fail_to_kill() -> u32 {
     5
 }
 fn default_reference_consec_buckets_for_halt() -> u32 {
