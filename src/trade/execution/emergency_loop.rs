@@ -55,6 +55,14 @@ pub struct EmergencyLoopConfig {
     /// close-all (success) yet never zeros the leg would otherwise
     /// loop indefinitely. 100 attempts × 30 s = 50 min worst case.
     pub max_attempts: u32,
+    /// Bot-strategy#287 grace: when entering EmergencyFlattening
+    /// the venue position read may not yet reflect a fill the same
+    /// process just observed (WS lag / sub-account auth race). To
+    /// avoid the false-zero EmergencyComplete pattern, require at
+    /// least this many milliseconds of *consistent* zero reads
+    /// before declaring complete. Default 30000 (30 s); 0 disables
+    /// the grace and trusts every zero read.
+    pub complete_grace_ms: u64,
 }
 
 impl EmergencyLoopConfig {
@@ -275,6 +283,7 @@ mod tests {
         EmergencyLoopConfig {
             retry_interval_ms: retry_ms,
             max_attempts: max,
+            complete_grace_ms: 0,
         }
     }
 
@@ -512,18 +521,21 @@ mod tests {
         assert!(EmergencyLoopConfig {
             retry_interval_ms: 0,
             max_attempts: 1,
+            complete_grace_ms: 0,
         }
         .validate()
         .is_err());
         assert!(EmergencyLoopConfig {
             retry_interval_ms: 1,
             max_attempts: 0,
+            complete_grace_ms: 0,
         }
         .validate()
         .is_err());
         assert!(EmergencyLoopConfig {
             retry_interval_ms: 30000,
             max_attempts: 100,
+            complete_grace_ms: 0,
         }
         .validate()
         .is_ok());

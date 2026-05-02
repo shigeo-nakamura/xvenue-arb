@@ -145,6 +145,13 @@ pub struct XvenueConfig {
     /// EmergencyFlattening on the next phase tick.
     #[serde(default = "default_emergency_max_attempts")]
     pub emergency_max_attempts: u32,
+    /// Grace window before EmergencyFlattening trusts a `both legs zero`
+    /// read. Defends against the false-zero pattern (#287) where a
+    /// fill the same process just observed isn't yet reflected by
+    /// `get_positions()` (WS lag / sub-account race). Default 30000
+    /// ms; 0 disables.
+    #[serde(default = "default_emergency_complete_grace_ms")]
+    pub emergency_complete_grace_ms: u64,
     #[serde(default = "default_rest_consec_fail_to_escalate")]
     pub rest_consec_fail_to_escalate: u32,
     #[serde(default = "default_reduce_only_consec_fail_to_kill")]
@@ -335,6 +342,7 @@ impl XvenueConfig {
         EmergencyLoopConfig {
             retry_interval_ms: self.emergency_retry_interval_ms,
             max_attempts: self.emergency_max_attempts,
+            complete_grace_ms: self.emergency_complete_grace_ms,
         }
     }
 }
@@ -420,6 +428,9 @@ fn default_emergency_retry_interval_ms() -> u64 {
 }
 fn default_emergency_max_attempts() -> u32 {
     100
+}
+fn default_emergency_complete_grace_ms() -> u64 {
+    30_000
 }
 fn default_rest_consec_fail_to_escalate() -> u32 {
     3

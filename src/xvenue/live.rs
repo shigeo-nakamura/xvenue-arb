@@ -402,6 +402,11 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
     // close_all (see emergency_loop docs §5).
     let mut last_emergency_attempt_ms: Option<u64> = None;
     let mut emergency_attempts: u32 = 0;
+    // bot-strategy#287: timestamp of the FIRST 'both legs zero'
+    // read since entering EmergencyFlattening. Used by the
+    // post-fill grace window so a stale-zero read seconds after a
+    // confirmed fill doesn't trip a false EmergencyComplete.
+    let mut first_emergency_zero_ms: Option<u64> = None;
     // Entry-time mids + qtys captured at Decision::Enter happy
     // landing for the realised-PnL helper at Decision::Exit (#268
     // S5-1). Cleared whenever the position machine returns to Flat
@@ -481,6 +486,7 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                             &mut summary,
                             &mut last_emergency_attempt_ms,
                             &mut emergency_attempts,
+                            &mut first_emergency_zero_ms,
                             wall_clock_ms(),
                         )
                         .await
@@ -492,6 +498,7 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                         // into EmergencyFlattening starts fresh.
                         last_emergency_attempt_ms = None;
                         emergency_attempts = 0;
+                        first_emergency_zero_ms = None;
                     }
                 }
 
@@ -1541,6 +1548,7 @@ async fn drive_emergency_flatten_round(
     summary: &mut LivePaperSummary,
     last_attempt_ms: &mut Option<u64>,
     attempts: &mut u32,
+    first_zero_observed_ms: &mut Option<u64>,
     now_ms: u64,
 ) -> Result<()> {
     // Throttle: skip if we attempted within the last
@@ -1584,7 +1592,49 @@ async fn drive_emergency_flatten_round(
     };
 
     if qtys.both_zero() {
-        // Case 13 boundary — both venues report zero. Emit
+        // bot-strategy#287 grace: a zero read taken right after a
+        // fill the same process observed may not yet reflect venue
+        // truth (WS lag / sub-account race). Require complete_grace_ms
+        // of *consistent* zero before emitting EmergencyComplete.
+        // Set to 0 to disable the grace and trust every zero read.
+        let grace_ms = live.emergency_loop_cfg.complete_grace_ms;
+        if grace_ms > 0 {
+            match *first_zero_observed_ms {
+                None => {
+                    *first_zero_observed_ms = Some(now_ms);
+                    *last_attempt_ms = Some(now_ms);
+                    log::info!(
+                        "[XVENUE/emerg] both legs zero — entering grace ({} ms) before declaring complete (attempts={})",
+                        grace_ms,
+                        *attempts
+                    );
+                    return Ok(());
+                }
+                Some(first_zero_ms) => {
+                    let elapsed = now_ms.saturating_sub(first_zero_ms);
+                    if elapsed < grace_ms {
+                        // Still inside the grace window — keep
+                        // polling, don't declare complete yet. The
+                        // throttle's retry_interval_ms ensures we
+                        // re-read at a sensible cadence (default
+                        // 30 s). If the read flips to non-zero on
+                        // a later tick the grace timer resets and
+                        // we attempt close_all on the discovered leg.
+                        log::info!(
+                            "[XVENUE/emerg] still both zero ({} ms / {} ms grace) — holding for grace (attempts={})",
+                            elapsed,
+                            grace_ms,
+                            *attempts
+                        );
+                        *last_attempt_ms = Some(now_ms);
+                        return Ok(());
+                    }
+                    // grace elapsed and read still says zero — trust it.
+                }
+            }
+        }
+
+        // Verified zero (after grace, or grace disabled). Emit
         // EmergencyComplete; state machine transitions back to
         // Flat (or rejects with TransitionError if we're already
         // out of EmergencyFlattening, in which case we log and
@@ -1593,6 +1643,7 @@ async fn drive_emergency_flatten_round(
             Ok(()) => {
                 summary.emergency_completes += 1;
                 *open_qty = None;
+                *first_zero_observed_ms = None;
                 log::info!(
                     "[XVENUE/emerg] both legs zero → EmergencyComplete (attempts={})",
                     *attempts
@@ -1607,6 +1658,10 @@ async fn drive_emergency_flatten_round(
         }
         return Ok(());
     }
+
+    // Non-zero read — reset the grace timer; any future zero
+    // observation must restart the grace window.
+    *first_zero_observed_ms = None;
 
     // At least one leg open — issue close_all on the non-zero
     // venues. Sequential rather than parallel so a Lighter rejection
@@ -2416,6 +2471,7 @@ extended_chase_retries: 1
 extended_chase_timeout_ms: 100
 extended_taker_fallback: true
 lighter_fill_timeout_ms: 100
+emergency_complete_grace_ms: 0  # tests assert immediate-complete on zero (#287 grace defaults to 30s in production)
 "#;
         let c: XvenueConfig = serde_yaml::from_str(yaml).unwrap();
         c.validate().unwrap();
@@ -2803,6 +2859,7 @@ extended_chase_retries: 1
 extended_chase_timeout_ms: 50
 extended_taker_fallback: true
 lighter_fill_timeout_ms: 1000
+emergency_complete_grace_ms: 0  # tests assert immediate-complete on zero (#287)
 leg_mismatch_timeout_ms: 100
 "#;
         let c: XvenueConfig = serde_yaml::from_str(yaml).unwrap();
@@ -3107,6 +3164,7 @@ leg_mismatch_timeout_ms: 100
         let mut summary = LivePaperSummary::default();
         let mut last = None;
         let mut attempts = 0;
+        let mut first_zero: Option<u64> = None;
 
         drive_emergency_flatten_round(
             &live,
@@ -3116,6 +3174,7 @@ leg_mismatch_timeout_ms: 100
             &mut summary,
             &mut last,
             &mut attempts,
+            &mut first_zero,
             1_000,
         )
         .await
@@ -3149,6 +3208,7 @@ leg_mismatch_timeout_ms: 100
         let mut summary = LivePaperSummary::default();
         let mut last = None;
         let mut attempts = 0;
+        let mut first_zero: Option<u64> = None;
 
         drive_emergency_flatten_round(
             &live,
@@ -3158,6 +3218,7 @@ leg_mismatch_timeout_ms: 100
             &mut summary,
             &mut last,
             &mut attempts,
+            &mut first_zero,
             1_000,
         )
         .await
@@ -3196,6 +3257,7 @@ leg_mismatch_timeout_ms: 100
         let mut summary = LivePaperSummary::default();
         let mut last = None;
         let mut attempts = 0;
+        let mut first_zero: Option<u64> = None;
 
         drive_emergency_flatten_round(
             &live,
@@ -3205,6 +3267,7 @@ leg_mismatch_timeout_ms: 100
             &mut summary,
             &mut last,
             &mut attempts,
+            &mut first_zero,
             1_000,
         )
         .await
@@ -3236,6 +3299,7 @@ leg_mismatch_timeout_ms: 100
         // Pretend we already did one round at t=1000.
         let mut last = Some(1_000_u64);
         let mut attempts = 1u32;
+        let mut first_zero: Option<u64> = None;
 
         // Call at t=10_000 (only 9 s elapsed, < 30 s retry interval).
         drive_emergency_flatten_round(
@@ -3246,6 +3310,7 @@ leg_mismatch_timeout_ms: 100
             &mut summary,
             &mut last,
             &mut attempts,
+            &mut first_zero,
             10_000,
         )
         .await
@@ -3267,6 +3332,7 @@ leg_mismatch_timeout_ms: 100
             &mut summary,
             &mut last,
             &mut attempts,
+            &mut first_zero,
             40_000,
         )
         .await
@@ -3303,6 +3369,7 @@ leg_mismatch_timeout_ms: 100
         let mut summary = LivePaperSummary::default();
         let mut last = None;
         let mut attempts = 0;
+        let mut first_zero: Option<u64> = None;
 
         // Drive 5 rounds, 60 s apart — well over the 30 s throttle.
         for i in 0..5 {
@@ -3314,6 +3381,7 @@ leg_mismatch_timeout_ms: 100
                 &mut summary,
                 &mut last,
                 &mut attempts,
+                &mut first_zero,
                 (i as u64) * 60_000,
             )
             .await
@@ -3340,6 +3408,7 @@ leg_mismatch_timeout_ms: 100
             &mut summary,
             &mut last,
             &mut attempts,
+            &mut first_zero,
             10 * 60_000,
         )
         .await
@@ -3365,6 +3434,7 @@ leg_mismatch_timeout_ms: 100
         let mut summary = LivePaperSummary::default();
         let mut last = None;
         let mut attempts = 0;
+        let mut first_zero: Option<u64> = None;
 
         drive_emergency_flatten_round(
             &live,
@@ -3374,6 +3444,7 @@ leg_mismatch_timeout_ms: 100
             &mut summary,
             &mut last,
             &mut attempts,
+            &mut first_zero,
             1_000,
         )
         .await
