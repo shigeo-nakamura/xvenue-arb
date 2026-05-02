@@ -1,0 +1,127 @@
+name: Deploy Configs
+
+# Lightweight deploy path for xvenue-arb. Pushes to configs/**, scripts/**,
+# or deploy/** trigger only S3 sync + SSM compare-replace + daemon-reload,
+# skipping the arm64 Rust build that the heavier ci.yml runs.
+#
+# Mirrors pairtrade/.github/workflows/deploy-configs.yml. Filed as a
+# bot-strategy#269 follow-up: deploy/*.service changes weren't reaching
+# the Tokyo Arb host because xvenue-arb's only workflow was ci.yml whose
+# trigger paths did not include deploy/**.
+#
+# Symmetric to pairtrade's split (heavy ci.yml + light deploy-configs.yml),
+# but ships everything to one Tokyo target since xvenue-arb has no
+# Frankfurt counterpart.
+
+on:
+  push:
+    paths:
+      - "configs/**"
+      - "scripts/**"
+      - "deploy/**"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-central-1
+  TOKYO_REGION: ap-northeast-1
+  INSTALL_DIR: /opt/debot
+
+jobs:
+  deploy-configs:
+    runs-on: ubuntu-latest
+    if: ${{ github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' }}
+    environment: debot
+    steps:
+      - name: Checkout debot
+        uses: actions/checkout@v4
+        with:
+          path: debot
+
+      - name: Forbid bot auto-restart in CI workflows
+        # bot-strategy#269: the trading bot must be restarted manually only.
+        # Auto-restart from CI force-closes open positions inside systemd's
+        # 90s TimeoutStopSec window. Sidecar `lighter-ratelimit` (no
+        # exchange position) is exempt and intentionally not matched.
+        run: |
+          if grep -nE 'systemctl[[:space:]]+(restart|start)[[:space:]]+debot-(pair-|xvenue-arb)' debot/.github/workflows/*.yml; then
+            echo "::error::CI workflow contains forbidden 'systemctl restart/start debot-{pair-,xvenue-arb}*' — bot must be restarted manually only (bot-strategy#269)"
+            exit 1
+          fi
+
+      - name: Package artifacts
+        run: |
+          mkdir -p dist/scripts dist/configs
+          rsync -a \
+            --exclude "venv/" \
+            --exclude "__pycache__/" \
+            --exclude "*.log" \
+            --exclude "*.pyc" \
+            debot/scripts/ dist/scripts/
+          rsync -a debot/configs/ dist/configs/
+
+      - name: Configure AWS credentials (eu-central-1 for upload)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload artifacts to S3
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
+        run: |
+          aws s3 sync dist/scripts/ "s3://${S3_BUCKET}/debot-xvenue-arb/scripts/" \
+            --exact-timestamps \
+            --exclude "venv/*" \
+            --exclude "venv/**" \
+            --exclude "__pycache__/*" \
+            --exclude "__pycache__/**" \
+            --exclude "*.log" \
+            --exclude "*.pyc"
+          aws s3 sync dist/configs/ "s3://${S3_BUCKET}/debot-xvenue-arb/configs/" --exact-timestamps
+          aws s3 cp debot/deploy/debot-xvenue-arb.service "s3://${S3_BUCKET}/deploy/debot-xvenue-arb.service"
+
+      - name: Configure AWS credentials (ap-northeast-1 for SSM)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.TOKYO_REGION }}
+
+      - name: Deploy to Tokyo via SSM (no restart)
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
+          TOKYO_INSTANCE_ID: ${{ secrets.TOKYO_INSTANCE_ID || vars.TOKYO_INSTANCE_ID }}
+        run: |
+          cat > /tmp/ssm-tokyo-deploy-configs.json <<'JSON'
+          {
+            "commands": [
+              "sudo mkdir -p __INSTALL_DIR__/scripts __INSTALL_DIR__/configs",
+              "aws s3 sync --region eu-central-1 s3://__S3_BUCKET__/debot-xvenue-arb/scripts __INSTALL_DIR__/scripts --exact-timestamps",
+              "aws s3 sync --region eu-central-1 s3://__S3_BUCKET__/debot-xvenue-arb/configs __INSTALL_DIR__/configs --exact-timestamps",
+              "sudo chmod 755 __INSTALL_DIR__/scripts/*.sh",
+              "/bin/bash -lc 'set -e; UPDATED=0; for svc in debot-xvenue-arb; do aws s3 cp --region eu-central-1 s3://__S3_BUCKET__/deploy/$svc.service /tmp/$svc.service; if [ ! -f /etc/systemd/system/$svc.service ] || ! cmp -s /etc/systemd/system/$svc.service /tmp/$svc.service; then sudo mv /tmp/$svc.service /etc/systemd/system/$svc.service; UPDATED=1; else rm /tmp/$svc.service; fi; done; if [ $UPDATED -eq 1 ]; then sudo systemctl daemon-reload; fi'"
+            ]
+          }
+          JSON
+          sed -i "s|__INSTALL_DIR__|${INSTALL_DIR}|g; s|__S3_BUCKET__|${S3_BUCKET}|g" /tmp/ssm-tokyo-deploy-configs.json
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${TOKYO_INSTANCE_ID}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy debot-xvenue-arb configs/scripts/service" \
+            --parameters file:///tmp/ssm-tokyo-deploy-configs.json \
+            --query "Command.CommandId" \
+            --output text)
+
+          set +e
+          aws ssm wait command-executed --command-id "${COMMAND_ID}" --instance-id "${TOKYO_INSTANCE_ID}"
+          WAIT_STATUS=$?
+          aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${TOKYO_INSTANCE_ID}" --output text
+          set -e
+          if [ $WAIT_STATUS -ne 0 ]; then
+            echo "SSM command failed with status ${WAIT_STATUS}" >&2
+            exit $WAIT_STATUS
+          fi
