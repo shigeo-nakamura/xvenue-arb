@@ -153,18 +153,43 @@ impl VenueOps for LiveVenueOps {
         let cancelled = canceled.orders.iter().any(|o| o.order_id == order_id);
         let still_open = open.orders.iter().any(|o| o.order_id == order_id);
 
-        // Terminal when the venue has either cancelled the order or
-        // closed it after some fill (no longer in the open list, has
-        // a non-zero fill aggregate). A still-open order with a
-        // partial fill is non-terminal so the chase loop keeps
-        // polling. A just-placed order that hasn't appeared in any
+        // bot-strategy#244 live probe (2026-05-02): rejected orders never
+        // appear in canceled / open lists and were silently filtered out
+        // here, leaving terminal=false / cancelled=false and the chase /
+        // taker round wasting its full deadline. Surface rejection as
+        // terminal+cancelled and log the detail so we can see WHY.
+        //
+        // Only count as "pure rejection" if no partial fills landed —
+        // a partial fill alongside a rejection record means the order
+        // actually executed in part, and the partial fill is the truth.
+        let rejected_record_exists = filled
+            .orders
+            .iter()
+            .any(|o| o.order_id == order_id && o.is_rejected);
+        let pure_rejection = rejected_record_exists && filled_qty.is_zero();
+        if pure_rejection {
+            let detail = filled
+                .orders
+                .iter()
+                .find(|o| o.order_id == order_id && o.is_rejected);
+            log::warn!(
+                "[XVENUE/extmaker] order rejected by venue order_id={} detail={:?}",
+                order_id, detail
+            );
+        }
+
+        // Terminal when the venue has either cancelled the order, rejected
+        // the order with no fills, or closed it after some fill (no longer
+        // in the open list, has a non-zero fill aggregate). A still-open
+        // order with a partial fill is non-terminal so the chase loop
+        // keeps polling. A just-placed order that hasn't appeared in any
         // list yet (WS lag) also stays non-terminal.
-        let terminal = cancelled || (!still_open && filled_qty > Decimal::ZERO);
+        let terminal = cancelled || pure_rejection || (!still_open && filled_qty > Decimal::ZERO);
 
         Ok(OrderFillStatus {
             filled_qty,
             terminal,
-            cancelled,
+            cancelled: cancelled || pure_rejection,
         })
     }
 
