@@ -17,7 +17,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "build.rs"
-      - ".github/workflows/ci.yml"
+      - ".github/workflows/**"
   workflow_dispatch:
     inputs:
       dex_connector_ref:
