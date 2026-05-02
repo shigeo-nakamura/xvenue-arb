@@ -8,6 +8,11 @@ ExecStart=/bin/bash /opt/debot/scripts/debot-xvenue-arb.sh
 Restart=on-failure
 RestartSec=30
 StartLimitBurst=5
+# bot-strategy#244 Phase 2 finding: stuck_file=/var/run/xvenue-arb/STUCK
+# was unreachable because /var/run/xvenue-arb/ never existed — emergency
+# self-write would silent-fail. systemd creates RuntimeDirectory= under
+# /run on service start (= /var/run on this host) with the right perms.
+RuntimeDirectory=xvenue-arb
 # bot-strategy#269: xvenue-arb does not configure a shutdown_grace_secs;
 # its SIGTERM path drops out of the live loop within seconds. Pick a
 # generous 10 min cap so any in-flight reduce-only flatten finishes
