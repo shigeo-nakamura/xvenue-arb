@@ -204,8 +204,16 @@ impl<'a, V: VenueOps + ?Sized> ExtendedMakerLoop<'a, V> {
                 return Err(ExecutionFailure::VenueRejected);
             }
         };
+        log::info!(
+            "[XVENUE/extmaker] post_only placed round={} side={:?} qty={} price={} order_id={}",
+            round, req.side, remaining, price, placed.order_id
+        );
 
         let outcome = self.poll_until_terminal_or_deadline(req, &placed.order_id).await;
+        log::info!(
+            "[XVENUE/extmaker] post_only round={} done filled={} cancelled={} order_id={}",
+            round, outcome.filled_this_round, outcome.terminal_cancelled, placed.order_id
+        );
 
         // Cancel residual regardless of outcome — Idempotent on the
         // mock, harmless on a venue that has already terminated the
@@ -275,9 +283,17 @@ impl<'a, V: VenueOps + ?Sized> ExtendedMakerLoop<'a, V> {
                 return Err(ExecutionFailure::TakerRejected);
             }
         };
+        log::info!(
+            "[XVENUE/extmaker] taker placed side={:?} qty={} reduce_only={} order_id={}",
+            req.side, residual, req.reduce_only, placed.order_id
+        );
         let outcome = self
             .poll_until_terminal_or_deadline(req, &placed.order_id)
             .await;
+        log::info!(
+            "[XVENUE/extmaker] taker done filled={} cancelled={} order_id={}",
+            outcome.filled_this_round, outcome.terminal_cancelled, placed.order_id
+        );
         let _ = self.ops.cancel(&req.symbol, &placed.order_id).await;
         if outcome.filled_this_round > Decimal::ZERO {
             Ok(outcome.filled_this_round)
