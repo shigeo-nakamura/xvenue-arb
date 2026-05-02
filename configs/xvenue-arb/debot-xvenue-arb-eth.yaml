@@ -11,7 +11,7 @@
 # /opt/debot/scripts/debot-xvenue-arb.env (see env.example).
 
 agent_name: debot-xvenue-arb-eth
-dry_run: true                 # flip to false only after Phase 2 paper trading clears
+dry_run: false                # bot-strategy#244 small-notional probe (#166 Phase 3); kill drill passed 2026-05-02; max_notional_usd: 100 caps blast radius ≤ $10/cycle
 
 # ---- Symbol pair (one symbol per process) ----
 symbol_ext: ETH-USD
