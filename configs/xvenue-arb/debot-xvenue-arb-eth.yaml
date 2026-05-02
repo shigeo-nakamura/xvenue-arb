@@ -49,7 +49,7 @@ max_notional_usd: 100
 extended_post_only: true
 extended_chase_ticks: 1
 extended_chase_retries: 3
-extended_chase_timeout_ms: 500
+extended_chase_timeout_ms: 2000   # bumped 500→2000 after #244 live probe (5/5 Timeout 2026-05-02): poll_until_terminal_or_deadline reuses this for the taker poll, and 500ms was too tight for Extended fill ack. Re-evaluate once a real fill lands.
 extended_taker_fallback: true
 
 # ---- Execution: Lighter (market) ----

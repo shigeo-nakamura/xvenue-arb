@@ -37,7 +37,7 @@ max_notional_usd: 1000
 extended_post_only: true
 extended_chase_ticks: 1
 extended_chase_retries: 3
-extended_chase_timeout_ms: 500
+extended_chase_timeout_ms: 2000   # symmetric with ETH YAML; see eth.yaml for context
 extended_taker_fallback: true
 
 # ---- Execution: Lighter ----
