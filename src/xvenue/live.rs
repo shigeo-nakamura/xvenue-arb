@@ -31,7 +31,7 @@ use tokio::sync::oneshot;
 
 use super::config::XvenueConfig;
 use super::live_exec::LiveExecution;
-use super::signal::{Decision, ExitReason, SignalEngine, SpreadDirection};
+use super::signal::{Decision, ExitReason, PositionSummary, SignalEngine, SpreadDirection};
 use super::sizing::{compute_notional_usd, notional_to_qty, SizeOutcome};
 use super::spread::SpreadEngine;
 use super::state::{EmergencyReason, Event, PositionMachine};
@@ -660,6 +660,68 @@ fn handle_ws_stale_emergency(
     true
 }
 
+/// S5-3 forced flatten on session DD (#268). Runs *before* signal.decide
+/// so a HALTed position routes to `EmergencyFlattening` rather than
+/// letting the strategy decide a natural exit (which could chase for
+/// seconds while the position bleeds). Idempotent via the state
+/// machine's phase gate: once applied, machine.phase() leaves Held →
+/// subsequent ticks see the Emergency apply rejected and fall through
+/// without flipping `position`.
+///
+/// Live mode only — paper synthesises EmergencyComplete in the
+/// existing dry_run short-circuits in `handle_ws_stale_emergency` /
+/// `handle_skew_breach_emergency`. `position` is refreshed in place on
+/// successful apply so signal.decide further down sees the post-
+/// Emergency state instead of the stale `Some(_)` (which would race
+/// signal.decide into a Decision::Exit and then get rejected by the
+/// state machine).
+#[allow(clippy::too_many_arguments)]
+fn force_flatten_on_session_dd_halt(
+    cfg: &XvenueConfig,
+    risk_manager: &RiskManager,
+    machine: &mut PositionMachine,
+    summary: &mut LivePaperSummary,
+    live_exec: Option<&LiveExecution>,
+    position: &mut Option<PositionSummary>,
+    now_ts_ms: u64,
+) {
+    if position.is_none() || cfg.dry_run || live_exec.is_none() {
+        return;
+    }
+    if !matches!(
+        risk_manager.block_reason(now_unix_secs()),
+        Some(BlockReason::SessionDdHalted)
+    ) {
+        return;
+    }
+    log::error!(
+        "[XVENUE] session_dd halt while position held → forced flatten \
+         (machine→EmergencyFlattening; emergency_loop drives close_all)"
+    );
+    let event = Event::Emergency {
+        reason: super::state::EmergencyReason::SessionDdHalted,
+    };
+    match machine.apply(now_ts_ms, event) {
+        Ok(()) => {
+            summary.live_session_dd_forced_flattens += 1;
+            // Refresh the cached `position` snapshot — signal.decide()
+            // further down would otherwise see the pre-Emergency
+            // Some(_) and could fire Decision::Exit, which the state
+            // machine then rejects with `ExitSignal in
+            // EmergencyFlattening`.
+            *position = machine.summary();
+        }
+        Err(e) => {
+            // Already in EmergencyFlattening (idempotent re-fire) or
+            // other transient — debug-log and continue.
+            log::debug!(
+                "[XVENUE] forced-flatten Emergency rejected: {:?}",
+                e
+            );
+        }
+    }
+}
+
 /// Reference guard cross-check (#244 C). Reads the latest Binance 1m
 /// mid and suppresses each venue's `book_ok` when its mid drifts past
 /// `reference_max_dev_bps` for `reference_consec_buckets_for_halt`
@@ -1028,50 +1090,16 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
         return Ok(());
     }
 
-    // S5-3 forced flatten on session DD (#268). Runs before
-    // signal.decide so a HALTed position routes to
-    // EmergencyFlattening rather than letting the strategy decide
-    // a natural exit (which could chase for seconds while the
-    // position bleeds). Idempotent via the phase check: once
-    // applied, machine.phase() leaves Held → subsequent ticks see
-    // the gate as already-fired without needing a separate flag.
-    // Live mode only; paper synthesises EmergencyComplete in the
-    // existing dry_run short-circuits.
     let mut position = position;
-    if position.is_some() && !cfg.dry_run && live_exec.is_some() {
-        if matches!(
-            risk_manager.block_reason(now_unix_secs()),
-            Some(BlockReason::SessionDdHalted)
-        ) {
-            log::error!(
-                "[XVENUE] session_dd halt while position held → forced flatten \
-                 (machine→EmergencyFlattening; emergency_loop drives close_all)"
-            );
-            let event = Event::Emergency {
-                reason: super::state::EmergencyReason::SessionDdHalted,
-            };
-            match machine.apply(now_ts_ms, event) {
-                Ok(()) => {
-                    summary.live_session_dd_forced_flattens += 1;
-                    // Refresh the cached `position` snapshot —
-                    // signal.decide() further down would otherwise
-                    // see the pre-Emergency Some(_) and could fire
-                    // Decision::Exit, which the state machine then
-                    // rejects with `ExitSignal in EmergencyFlattening`.
-                    position = machine.summary();
-                }
-                Err(e) => {
-                    // Already in EmergencyFlattening (idempotent
-                    // re-fire) or other transient — debug-log and
-                    // continue.
-                    log::debug!(
-                        "[XVENUE] forced-flatten Emergency rejected: {:?}",
-                        e
-                    );
-                }
-            }
-        }
-    }
+    force_flatten_on_session_dd_halt(
+        cfg,
+        risk_manager,
+        machine,
+        summary,
+        live_exec,
+        &mut position,
+        now_ts_ms,
+    );
 
     let evaluate = committed || position.is_some();
     if !evaluate {
