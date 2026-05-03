@@ -13,7 +13,7 @@
 //! |---------------------|------------------------------------------------------------|
 //! | `read_top_of_book`  | `get_order_book(symbol, 1)`                                |
 //! | `place_post_only`   | `create_order(price=Some, spread=Some(-2), reduce_only=false)` |
-//! | `place_taker`       | `create_order(price=None, spread=None, reduce_only=…)`     |
+//! | `place_taker`       | `create_order_taker_ioc(slippage_bps=…)` if configured, else `create_order(price=None, spread=None, …)` |
 //! | `cancel`            | `cancel_order(symbol, order_id)`                           |
 //! | `poll_fill_status`  | `get_filled_orders` + `get_canceled_orders` + `get_open_orders`, filter by `order_id`, aggregate |
 //! | `close_all`         | `close_all_positions(symbol.map(String::from))`            |
@@ -23,6 +23,19 @@
 //! venues ignore the marker and place a regular limit; the chase
 //! loop's terminal-cancelled and partial-fill handling still copes
 //! with whatever fill behaviour results.
+//!
+//! `taker_slippage_bps` selects the `place_taker` backend per venue
+//! (bot-strategy#302):
+//! - `Some(bps)` → call `create_order_taker_ioc(symbol, side, qty, bps,
+//!   reduce_only)` so the connector sends a true IOC at touch ± 1 tick
+//!   ± slippage and terminates immediately whether or not it crosses.
+//!   Use this for venues that historically returned a 1 h GTT LIMIT
+//!   masquerading as a taker order (Extended).
+//! - `None` → keep the legacy `create_order(price=None, spread=None,
+//!   reduce_only)` call for venues whose taker semantics already work
+//!   (Lighter market order). Lighter's `create_order_taker_ioc`
+//!   intentionally returns `NotImplemented` and we don't want to
+//!   regress its fill rate just to share the same code path.
 //!
 //! `poll_fill_status` does three connector reads. In production the
 //! per-venue connectors back these with an in-memory WS-fed cache
@@ -52,11 +65,33 @@ const EXTENDED_POST_ONLY_SPREAD_MARKER: i64 = -2;
 /// `emergency_loop`).
 pub struct LiveVenueOps {
     pub conn: Arc<dyn DexConnector>,
+    /// bot-strategy#302: when `Some`, `place_taker` routes through
+    /// `create_order_taker_ioc` with this slippage budget so the venue
+    /// receives a true IOC. When `None`, falls back to the legacy
+    /// `create_order(price=None, spread=None)` path. Set per venue at
+    /// construction time — Extended uses Some, Lighter uses None.
+    pub taker_slippage_bps: Option<u32>,
 }
 
 impl LiveVenueOps {
+    /// Legacy taker behavior (`create_order` with no slippage). Kept
+    /// for venues that already work (Lighter) and tests that don't
+    /// care about taker semantics.
     pub fn new(conn: Arc<dyn DexConnector>) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            taker_slippage_bps: None,
+        }
+    }
+
+    /// IOC taker behavior with the given slippage budget. Use for
+    /// Extended, where the legacy `create_order` path silently sends
+    /// a 1 h GTT LIMIT instead of a true taker (bot-strategy#302).
+    pub fn with_taker_ioc_slippage(conn: Arc<dyn DexConnector>, slippage_bps: u32) -> Self {
+        Self {
+            conn,
+            taker_slippage_bps: Some(slippage_bps),
+        }
     }
 }
 
@@ -114,11 +149,18 @@ impl VenueOps for LiveVenueOps {
         qty: Decimal,
         reduce_only: bool,
     ) -> Result<PlacedOrder> {
-        let resp = self
-            .conn
-            .create_order(symbol, qty, side, None, None, reduce_only, None)
-            .await
-            .map_err(|e| anyhow!("create_order taker {}: {}", symbol, e))?;
+        let resp = match self.taker_slippage_bps {
+            Some(bps) => self
+                .conn
+                .create_order_taker_ioc(symbol, qty, side, bps, reduce_only)
+                .await
+                .map_err(|e| anyhow!("create_order_taker_ioc {}: {}", symbol, e))?,
+            None => self
+                .conn
+                .create_order(symbol, qty, side, None, None, reduce_only, None)
+                .await
+                .map_err(|e| anyhow!("create_order taker {}: {}", symbol, e))?,
+        };
         Ok(PlacedOrder {
             order_id: resp.order_id,
         })

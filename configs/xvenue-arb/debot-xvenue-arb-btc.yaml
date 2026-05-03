@@ -42,6 +42,7 @@ extended_chase_timeout_ms: 2000   # symmetric with ETH YAML; see eth.yaml for co
 extended_taker_fallback: true
 extended_min_qty: 0.0001          # bot-strategy#299: Extended BTC min order size (verify against connector MarketModel before flipping live).
 extended_taker_grace_poll_ms: 1000   # bot-strategy#298: see eth.yaml for context.
+extended_taker_slippage_bps: 50   # bot-strategy#302: see eth.yaml for context.
 
 # ---- Execution: Lighter ----
 lighter_order_type: market

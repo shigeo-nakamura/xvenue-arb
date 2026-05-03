@@ -105,9 +105,19 @@ pub struct XvenueConfig {
     /// `filled=0 cancelled=false`). Production sets ~1000 ms so a
     /// fill that landed at the venue but propagated through the
     /// connector cache slightly past `chase_timeout_ms` is recovered
-    /// instead of falling through to EmergencyFlattening.
+    /// instead of falling through to EmergencyFlattening. Largely
+    /// obviated by #302 (true IOC), but kept for safety until verified.
     #[serde(default = "default_extended_taker_grace_poll_ms")]
     pub extended_taker_grace_poll_ms: u64,
+    /// bot-strategy#302: slippage budget for the Extended IOC taker
+    /// path (`create_order_taker_ioc`). The connector places at touch
+    /// ± 1 tick ± `slippage_bps` so the order crosses on the first
+    /// opposing level even when the book moves a few ticks between
+    /// read and submit. Default 50 bps mirrors `close_all_positions`'s
+    /// `CLOSE_ALL_POSITIONS_SLIPPAGE_BPS` default — wide enough to fill
+    /// reliably at $50 notional, narrow enough to bound slippage cost.
+    #[serde(default = "default_extended_taker_slippage_bps")]
+    pub extended_taker_slippage_bps: u32,
 
     // ---- Execution: Lighter ----
     /// "market" or "limit".
@@ -431,6 +441,13 @@ fn default_extended_min_qty() -> f64 {
 }
 fn default_extended_taker_grace_poll_ms() -> u64 {
     0
+}
+fn default_extended_taker_slippage_bps() -> u32 {
+    // bot-strategy#302: matches the production setting in YAML
+    // (50 bps). 0 here would mean "exact-touch IOC", which would
+    // regress fill rate to today's broken state if YAML were ever
+    // missing the field.
+    50
 }
 fn default_lighter_order_type() -> String {
     "market".to_string()

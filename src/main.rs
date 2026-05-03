@@ -196,7 +196,16 @@ async fn run() -> anyhow::Result<()> {
         // is true the runner ignores it and stays on the synthetic-
         // fill paper path; only `dry_run = false` actually exercises
         // the executors.
-        let ext_ops: Arc<dyn VenueOps> = Arc::new(LiveVenueOps::new(extended.clone()));
+        //
+        // bot-strategy#302: Extended uses the IOC taker path
+        // (`create_order_taker_ioc`) with the slippage budget from
+        // YAML so the venue actually receives a true IOC instead of a
+        // 1 h GTT LIMIT. Lighter keeps the legacy `create_order` path
+        // — its market-order semantics already work.
+        let ext_ops: Arc<dyn VenueOps> = Arc::new(LiveVenueOps::with_taker_ioc_slippage(
+            extended.clone(),
+            cfg.extended_taker_slippage_bps,
+        ));
         let lt_ops: Arc<dyn VenueOps> = Arc::new(LiveVenueOps::new(lighter.clone()));
         let leg_reader: Arc<dyn LegStateReader> = Arc::new(LiveLegStateReader::new(
             extended.clone(),
