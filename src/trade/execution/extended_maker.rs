@@ -30,10 +30,10 @@ use std::time::Duration;
 use anyhow::Result;
 use dex_connector::OrderSide;
 use rust_decimal::Decimal;
-use tokio::time::Instant;
 
+use super::poll_loop::{poll_until_terminal_or_deadline, PollOutcome};
 use super::types::{ExecutionFailure, ExtendedMakerConfig, ExtendedTerminal};
-use super::venue_ops::{OrderFillStatus, PlacedOrder, VenueOps};
+use super::venue_ops::{PlacedOrder, VenueOps};
 
 /// Inputs to one execution cycle.
 #[derive(Debug, Clone)]
@@ -184,7 +184,7 @@ impl<'a, V: VenueOps + ?Sized> ExtendedMakerLoop<'a, V> {
         req: &ExtendedEntryRequest,
         remaining: Decimal,
         round: u32,
-    ) -> Result<RoundOutcome, ExecutionFailure> {
+    ) -> Result<PollOutcome, ExecutionFailure> {
         let book = match self.ops.read_top_of_book(&req.symbol).await {
             Ok(b) => b,
             Err(e) => {
@@ -221,7 +221,15 @@ impl<'a, V: VenueOps + ?Sized> ExtendedMakerLoop<'a, V> {
             round, req.side, remaining, price, placed.order_id
         );
 
-        let outcome = self.poll_until_terminal_or_deadline(req, &placed.order_id).await;
+        let outcome = poll_until_terminal_or_deadline(
+            self.ops,
+            &req.symbol,
+            &placed.order_id,
+            self.cfg.chase_timeout_ms,
+            self.poll_interval_ms,
+            "XVENUE/extmaker",
+        )
+        .await;
         log::info!(
             "[XVENUE/extmaker] post_only round={} done filled={} cancelled={} order_id={}",
             round, outcome.filled_this_round, outcome.terminal_cancelled, placed.order_id
@@ -233,50 +241,6 @@ impl<'a, V: VenueOps + ?Sized> ExtendedMakerLoop<'a, V> {
         let _ = self.ops.cancel(&req.symbol, &placed.order_id).await;
 
         Ok(outcome)
-    }
-
-    async fn poll_until_terminal_or_deadline(
-        &self,
-        req: &ExtendedEntryRequest,
-        order_id: &str,
-    ) -> RoundOutcome {
-        let deadline = Instant::now() + Duration::from_millis(self.cfg.chase_timeout_ms);
-        let poll_dur = Duration::from_millis(self.poll_interval_ms);
-        let mut filled_this_round = Decimal::ZERO;
-        loop {
-            match self.ops.poll_fill_status(&req.symbol, order_id).await {
-                Ok(OrderFillStatus {
-                    filled_qty,
-                    terminal,
-                    cancelled,
-                }) => {
-                    filled_this_round = filled_qty.max(filled_this_round);
-                    if terminal {
-                        return RoundOutcome {
-                            filled_this_round,
-                            terminal_cancelled: cancelled,
-                        };
-                    }
-                }
-                Err(e) => {
-                    log::warn!(
-                        "[XVENUE/extmaker] poll_fill_status order={} err={:?}",
-                        order_id,
-                        e
-                    );
-                    // Soft failure — keep polling until the deadline,
-                    // then break. The venue may recover within the
-                    // window and surface a fill we'd otherwise miss.
-                }
-            }
-            if Instant::now() >= deadline {
-                return RoundOutcome {
-                    filled_this_round,
-                    terminal_cancelled: false,
-                };
-            }
-            tokio::time::sleep(poll_dur).await;
-        }
     }
 
     async fn run_taker_round(
@@ -299,9 +263,15 @@ impl<'a, V: VenueOps + ?Sized> ExtendedMakerLoop<'a, V> {
             "[XVENUE/extmaker] taker placed side={:?} qty={} reduce_only={} order_id={}",
             req.side, residual, req.reduce_only, placed.order_id
         );
-        let mut outcome = self
-            .poll_until_terminal_or_deadline(req, &placed.order_id)
-            .await;
+        let mut outcome = poll_until_terminal_or_deadline(
+            self.ops,
+            &req.symbol,
+            &placed.order_id,
+            self.cfg.chase_timeout_ms,
+            self.poll_interval_ms,
+            "XVENUE/extmaker",
+        )
+        .await;
         log::info!(
             "[XVENUE/extmaker] taker done filled={} cancelled={} order_id={}",
             outcome.filled_this_round, outcome.terminal_cancelled, placed.order_id
@@ -330,7 +300,7 @@ impl<'a, V: VenueOps + ?Sized> ExtendedMakerLoop<'a, V> {
                              filled={} terminal={} cancelled={} order_id={}",
                             s.filled_qty, s.terminal, s.cancelled, placed.order_id
                         );
-                        outcome = RoundOutcome {
+                        outcome = PollOutcome {
                             filled_this_round: s.filled_qty,
                             terminal_cancelled: s.cancelled,
                         };
@@ -360,12 +330,6 @@ impl<'a, V: VenueOps + ?Sized> ExtendedMakerLoop<'a, V> {
             Err(ExecutionFailure::Timeout)
         }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RoundOutcome {
-    filled_this_round: Decimal,
-    terminal_cancelled: bool,
 }
 
 fn price_for_post_only(side: OrderSide, book: &super::venue_ops::TopOfBook) -> Decimal {

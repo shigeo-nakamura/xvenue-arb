@@ -24,15 +24,12 @@
 //!   timeout → aggregator emits `LighterFilled{partial_qty}`.
 //!   Skew monitor catches downstream if breach.
 
-use std::time::Duration;
-
-use anyhow::Result;
 use dex_connector::OrderSide;
 use rust_decimal::Decimal;
-use tokio::time::Instant;
 
+use super::poll_loop::poll_until_terminal_or_deadline;
 use super::types::{ExecutionFailure, LighterFillConfig, LighterOrderType, LighterTerminal};
-use super::venue_ops::{OrderFillStatus, PlacedOrder, TopOfBook, VenueOps};
+use super::venue_ops::{PlacedOrder, TopOfBook, VenueOps};
 
 /// Inputs to one Lighter execution cycle.
 #[derive(Debug, Clone)]
@@ -125,7 +122,15 @@ impl<'a, V: VenueOps + ?Sized> LighterFillLoop<'a, V> {
             }
         };
 
-        let outcome = self.poll_until_terminal_or_deadline(&req, &placed.order_id).await;
+        let outcome = poll_until_terminal_or_deadline(
+            self.ops,
+            &req.symbol,
+            &placed.order_id,
+            self.cfg.fill_timeout_ms,
+            self.poll_interval_ms,
+            "XVENUE/lighter",
+        )
+        .await;
         // Cancel residual order id — idempotent on already-terminal
         // orders, makes sure a slow venue cancel doesn't leave a
         // ghost order resting if we declared timeout locally.
@@ -153,52 +158,6 @@ impl<'a, V: VenueOps + ?Sized> LighterFillLoop<'a, V> {
         }
     }
 
-    async fn poll_until_terminal_or_deadline(
-        &self,
-        req: &LighterFillRequest,
-        order_id: &str,
-    ) -> LighterRoundOutcome {
-        let deadline = Instant::now() + Duration::from_millis(self.cfg.fill_timeout_ms);
-        let poll_dur = Duration::from_millis(self.poll_interval_ms);
-        let mut filled_this_round = Decimal::ZERO;
-        loop {
-            match self.ops.poll_fill_status(&req.symbol, order_id).await {
-                Ok(OrderFillStatus {
-                    filled_qty,
-                    terminal,
-                    cancelled,
-                }) => {
-                    filled_this_round = filled_qty.max(filled_this_round);
-                    if terminal {
-                        return LighterRoundOutcome {
-                            filled_this_round,
-                            terminal_cancelled: cancelled,
-                        };
-                    }
-                }
-                Err(e) => {
-                    log::warn!(
-                        "[XVENUE/lighter] poll_fill_status order={} err={:?}",
-                        order_id,
-                        e
-                    );
-                }
-            }
-            if Instant::now() >= deadline {
-                return LighterRoundOutcome {
-                    filled_this_round,
-                    terminal_cancelled: false,
-                };
-            }
-            tokio::time::sleep(poll_dur).await;
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct LighterRoundOutcome {
-    filled_this_round: Decimal,
-    terminal_cancelled: bool,
 }
 
 fn price_for_aggressive(side: OrderSide, book: &TopOfBook) -> Decimal {
