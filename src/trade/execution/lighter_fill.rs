@@ -24,10 +24,11 @@
 //!   timeout → aggregator emits `LighterFilled{partial_qty}`.
 //!   Skew monitor catches downstream if breach.
 
+use async_trait::async_trait;
 use dex_connector::OrderSide;
 use rust_decimal::Decimal;
 
-use super::poll_loop::poll_until_terminal_or_deadline;
+use super::poll_loop::{poll_until_terminal_or_deadline, Executor};
 use super::types::{ExecutionFailure, LighterFillConfig, LighterOrderType, LighterTerminal};
 use super::venue_ops::{PlacedOrder, TopOfBook, VenueOps};
 
@@ -159,6 +160,16 @@ impl<'a, V: VenueOps + ?Sized> LighterFillLoop<'a, V> {
         }
     }
 
+}
+
+#[async_trait]
+impl<'a, V: VenueOps + ?Sized + Sync> Executor for LighterFillLoop<'a, V> {
+    type Request = LighterFillRequest;
+    type Terminal = LighterTerminal;
+
+    async fn run(&self, req: Self::Request) -> Self::Terminal {
+        LighterFillLoop::run(self, req).await
+    }
 }
 
 fn price_for_aggressive(side: OrderSide, book: &TopOfBook) -> Decimal {

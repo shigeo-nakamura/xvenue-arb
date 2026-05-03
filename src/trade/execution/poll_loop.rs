@@ -1,11 +1,14 @@
 //! Shared `poll_until_terminal_or_deadline` for the per-venue executor
-//! loops in `extended_maker.rs` and `lighter_fill.rs`.
+//! loops in `extended_maker.rs` and `lighter_fill.rs`, plus the
+//! `Executor` trait that both per-venue loops implement so callers can
+//! hold them behind a uniform interface (test mocks, future
+//! third-venue plug-ins).
 //!
-//! Both loops follow the same shape: place an order, then poll
-//! `VenueOps::poll_fill_status` at a fixed cadence until the venue
-//! terminals the order or a wall-clock deadline elapses. The only
-//! caller-visible knobs are the per-venue timeout, poll cadence, and
-//! log prefix.
+//! Both per-venue loops follow the same shape: place an order, then
+//! poll `VenueOps::poll_fill_status` at a fixed cadence until the
+//! venue terminals the order or a wall-clock deadline elapses. The
+//! only caller-visible knobs are the per-venue timeout, poll cadence,
+//! and log prefix.
 //!
 //! Behaviour-preserving extraction of the previously-duplicated
 //! `LighterFillLoop::poll_until_terminal_or_deadline` and
@@ -13,10 +16,26 @@
 
 use std::time::Duration;
 
+use async_trait::async_trait;
+
 use rust_decimal::Decimal;
 use tokio::time::Instant;
 
 use super::venue_ops::{OrderFillStatus, VenueOps};
+
+/// Common public surface of `LighterFillLoop` and `ExtendedMakerLoop`.
+/// Captures "given a per-venue request, return one terminal event"
+/// without forcing the caller to know which venue is on the other end
+/// — useful for test mocks and future third-venue plug-ins. The
+/// per-venue loops keep their idiomatic state-machine internals; the
+/// trait just names the shared shape.
+#[async_trait]
+pub trait Executor {
+    type Request: Send;
+    type Terminal: Send;
+
+    async fn run(&self, req: Self::Request) -> Self::Terminal;
+}
 
 /// Result of one poll round. `terminal_cancelled` is true when the
 /// venue terminated the order with `cancelled=true` (taker rejected /

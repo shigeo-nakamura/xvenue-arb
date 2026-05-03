@@ -28,10 +28,11 @@
 use std::time::Duration;
 
 use anyhow::Result;
+use async_trait::async_trait;
 use dex_connector::OrderSide;
 use rust_decimal::Decimal;
 
-use super::poll_loop::{poll_until_terminal_or_deadline, PollOutcome};
+use super::poll_loop::{poll_until_terminal_or_deadline, Executor, PollOutcome};
 use super::types::{ExecutionFailure, ExtendedMakerConfig, ExtendedTerminal};
 use super::venue_ops::{PlacedOrder, VenueOps};
 
@@ -328,6 +329,16 @@ impl<'a, V: VenueOps + ?Sized> ExtendedMakerLoop<'a, V> {
         } else {
             Err(ExecutionFailure::Timeout)
         }
+    }
+}
+
+#[async_trait]
+impl<'a, V: VenueOps + ?Sized + Sync> Executor for ExtendedMakerLoop<'a, V> {
+    type Request = ExtendedEntryRequest;
+    type Terminal = ExtendedTerminal;
+
+    async fn run(&self, req: Self::Request) -> Self::Terminal {
+        self.run_entry(req).await
     }
 }
 
