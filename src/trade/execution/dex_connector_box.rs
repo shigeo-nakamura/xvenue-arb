@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use dex_connector::{
     BalanceResponse, CanceledOrdersResponse, CreateOrderResponse, DexConnector, DexError,
-    FilledOrdersResponse, HyperliquidConnector, LastTradesResponse, OpenOrdersResponse,
+    FilledOrdersResponse, LastTradesResponse, OpenOrdersResponse,
     OrderBookSnapshot, OrderSide, TickerResponse, TpSl, TriggerOrderStyle,
 };
 #[cfg(feature = "lighter-sdk")]
@@ -15,7 +15,6 @@ use rust_decimal::Decimal;
 use crate::config::get_lighter_config_from_env;
 #[cfg(feature = "extended-sdk")]
 use crate::config::get_extended_config_from_env;
-use crate::config::{get_hyperliquid_config_from_env, RunMode};
 use crate::rate_limit_notifier::{notify_lighter_waf_cooldown, notify_rate_limit};
 use lazy_static::lazy_static;
 use std::env;
@@ -53,7 +52,13 @@ impl DexConnectorBox {
 
     // instance_id is only read from the lighter-sdk arm; extended-sdk-only
     // builds (Tokyo, bot-strategy#123) don't consume it.
-    #[cfg_attr(not(feature = "lighter-sdk"), allow(unused_variables))]
+    // rest_endpoint / web_socket_endpoint / agent_name are kept in the
+    // signature for back-compat (and the eventual reintroduction of a
+    // network-config arm) — neither lighter nor extended currently
+    // reads them since both pull endpoints from their config_from_env
+    // helpers. The `_` prefix would lose the documentation, so we
+    // allow the warnings instead.
+    #[allow(unused_variables)]
     pub async fn create(
         dex_name: &str,
         rest_endpoint: &str,
@@ -69,36 +74,6 @@ impl DexConnectorBox {
         instance_id: Option<&str>,
     ) -> Result<Self, DexError> {
         match dex_name {
-            "hyperliquid" => {
-                let run_mode = if dry_run {
-                    RunMode::Dry
-                } else {
-                    RunMode::RealTrade
-                };
-                let hyperliquid_config = match get_hyperliquid_config_from_env(run_mode).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return Err(DexError::Other(e.to_string()));
-                    }
-                };
-
-                let token_list_refs: Vec<&str> = token_list.iter().map(|s| s.as_str()).collect();
-                let connector = HyperliquidConnector::new(
-                    rest_endpoint,
-                    web_socket_endpoint,
-                    &hyperliquid_config.private_key,
-                    &hyperliquid_config.evm_wallet_address,
-                    hyperliquid_config.vault_address,
-                    !dry_run,
-                    agent_name,
-                    &token_list_refs,
-                )
-                .await?;
-
-                Ok(DexConnectorBox {
-                    inner: Box::new(connector),
-                })
-            }
             #[cfg(feature = "lighter-sdk")]
             "lighter" => {
                 let lighter_config = match get_lighter_config_from_env(instance_id).await {

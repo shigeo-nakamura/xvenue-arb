@@ -883,7 +883,7 @@ dependencies = [
 
 [[package]]
 name = "dex-connector"
-version = "4.3.0"
+version = "4.4.0"
 dependencies = [
  "async-trait",
  "base64 0.21.7",
@@ -902,7 +902,6 @@ dependencies = [
  "hex-literal",
  "hmac 0.12.1",
  "http 0.2.12",
- "hyperliquid_rust_sdk_fork",
  "k256",
  "lazy_static",
  "libc",
@@ -2146,31 +2145,6 @@ dependencies = [
  "tokio",
  "tower-service",
  "tracing",
-]
-
-[[package]]
-name = "hyperliquid_rust_sdk_fork"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba60f79b2971aad0a4781d08c3d39cad5ad499f8490dc5a76b3d97b0a44556a0"
-dependencies = [
- "chrono",
- "env_logger",
- "ethers",
- "futures-util",
- "hex",
- "http 0.2.12",
- "lazy_static",
- "log",
- "rand 0.8.5",
- "reqwest 0.11.27",
- "rmp-serde",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-tungstenite",
- "uuid 1.22.0",
 ]
 
 [[package]]
@@ -5210,10 +5184,8 @@ checksum = "212d5dcb2a1ce06d81107c3d0ffa3121fe974b73f068c8282cb1c32328113b6c"
 dependencies = [
  "futures-util",
  "log",
- "native-tls",
  "rustls 0.21.12",
  "tokio",
- "tokio-native-tls",
  "tokio-rustls 0.24.1",
  "tungstenite",
  "webpki-roots 0.25.4",
@@ -5407,7 +5379,6 @@ dependencies = [
  "http 0.2.12",
  "httparse",
  "log",
- "native-tls",
  "rand 0.8.5",
  "rustls 0.21.12",
  "sha1",
