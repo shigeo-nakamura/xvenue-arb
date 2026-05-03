@@ -576,6 +576,41 @@ fn publish_risk(risk_manager: &RiskManager, reporter: &mut StatusReporter) {
     reporter.set_risk_history(risk_manager.risk_history());
 }
 
+/// Read the current mid from both venues, gated by the per-venue
+/// warm-up latch. Returns `Ok(None)` when either venue is still
+/// warming up — the caller should treat this as "skip the rest of
+/// this tick" exactly like the previous inline `return Ok(())`. A
+/// hard error propagates as `Err`. On success the warm-up latch is
+/// flipped on for the corresponding venue.
+async fn read_both_mids<H: VenueHub + ?Sized>(
+    hub: &H,
+    warmup: &mut VenueWarmup,
+) -> Result<Option<(MidSnapshot, MidSnapshot)>> {
+    let ext_snap = match hub.read_mid(Venue::Extended).await {
+        Ok(s) => {
+            warmup.mark_ready(Venue::Extended);
+            s
+        }
+        Err(e) if !warmup.is_ready(Venue::Extended) => {
+            log::debug!("[XVENUE] read_mid Extended pending (WS warm-up): {:?}", e);
+            return Ok(None);
+        }
+        Err(e) => return Err(e).context("read_mid Extended"),
+    };
+    let lt_snap = match hub.read_mid(Venue::Lighter).await {
+        Ok(s) => {
+            warmup.mark_ready(Venue::Lighter);
+            s
+        }
+        Err(e) if !warmup.is_ready(Venue::Lighter) => {
+            log::debug!("[XVENUE] read_mid Lighter pending (WS warm-up): {:?}", e);
+            return Ok(None);
+        }
+        Err(e) => return Err(e).context("read_mid Lighter"),
+    };
+    Ok(Some((ext_snap, lt_snap)))
+}
+
 /// Live-mode emergency-flatten round driver invoked from the tick arm
 /// of `run_paper_loop`. Behaviour-preserving wrapper around
 /// `drive_emergency_flatten_round` that also (a) resets the throttle
@@ -714,33 +749,8 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
     // Drain any pending SIGUSR1 — arms the STUCK file if needed.
     let _ = stuck.poll_sigusr1();
 
-    let mut ext_snap = match hub.read_mid(Venue::Extended).await {
-        Ok(s) => {
-            warmup.mark_ready(Venue::Extended);
-            s
-        }
-        Err(e) if !warmup.is_ready(Venue::Extended) => {
-            log::debug!(
-                "[XVENUE] read_mid Extended pending (WS warm-up): {:?}",
-                e
-            );
-            return Ok(());
-        }
-        Err(e) => return Err(e).context("read_mid Extended"),
-    };
-    let mut lt_snap = match hub.read_mid(Venue::Lighter).await {
-        Ok(s) => {
-            warmup.mark_ready(Venue::Lighter);
-            s
-        }
-        Err(e) if !warmup.is_ready(Venue::Lighter) => {
-            log::debug!(
-                "[XVENUE] read_mid Lighter pending (WS warm-up): {:?}",
-                e
-            );
-            return Ok(());
-        }
-        Err(e) => return Err(e).context("read_mid Lighter"),
+    let Some((mut ext_snap, mut lt_snap)) = read_both_mids(hub, warmup).await? else {
+        return Ok(());
     };
 
     // Record successful WS observations for health tracking. Any
