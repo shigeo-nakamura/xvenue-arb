@@ -1250,260 +1250,22 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
             .await?;
         }
         Decision::Exit(reason) => {
-            let go_live = !cfg.dry_run && live_exec.is_some();
-            if !go_live {
-                // Paper-mode synthetic exit fills (existing behaviour).
-                let qty = open_qty.take().unwrap_or(Decimal::ZERO);
-                machine.apply(now_ts_ms, Event::ExitSignal { reason })?;
-                if qty > Decimal::ZERO {
-                    machine.apply(now_ts_ms, Event::ExtendedExitFilled { qty })?;
-                    machine.apply(now_ts_ms, Event::LighterExitFilled { qty })?;
-                    if let Some(r) = reporter.as_deref_mut() {
-                        r.record_fill(true, true, now_ts_ms);
-                        r.record_close(0.0);
-                    }
-                    risk_manager.record_close(0.0, now_unix_secs());
-                }
-                summary.last_decision_ts_ms = Some(now_ts_ms);
-                summary.decisions_exit += 1;
-                log::info!(
-                    "[XVENUE] PAPER EXIT reason={:?} dev_bps={:?} ext_mid={} lt_mid={} \
-                     dry_run={}",
-                    reason,
-                    dev,
-                    ext_snap.mid,
-                    lt_snap.mid,
-                    cfg.dry_run,
-                );
-                let _ = ExitReason::MeanCross;
-            } else {
-                // Live mode: reduce-only parallel exit on both legs
-                // (#244 Sprint 4 step 2/3). DESIGN.md §4.2 specifies
-                // parallel exit (vs entry's serial Extended-first
-                // dispatch) — the legs are already balanced so we
-                // close both simultaneously to minimise the open-leg
-                // window if one venue lags.
-                let live = live_exec.expect(
-                    "go_live = !cfg.dry_run && live_exec.is_some(); checked above",
-                );
-                // Read direction + per-venue open qty from the
-                // state machine's `Position` (#268 S5-2). The
-                // machine is the source of truth: each venue's
-                // qty is updated independently as `*Filled` events
-                // land during entry, so an asymmetric entry (e.g.
-                // Extended partial-fill + Lighter full-fill)
-                // surfaces here as ext_qty != lt_qty. The runner-
-                // level `open_qty` cache is no longer consulted on
-                // exit — but kept because the paper-mode WS-stale
-                // / skew short-circuits still use it.
-                let (position_dir, ext_qty, lt_qty) = match machine.position() {
-                    Some(p) => (p.direction, p.extended_open_qty, p.lighter_open_qty),
-                    None => {
-                        log::warn!(
-                            "[XVENUE] LIVE EXIT skipped: no position in phase {:?}",
-                            machine.phase()
-                        );
-                        return Ok(());
-                    }
-                };
-                if ext_qty <= Decimal::ZERO && lt_qty <= Decimal::ZERO {
-                    // No legs to close — log + skip. Don't touch
-                    // open_qty (leave its existing value alone for
-                    // paper-mode short-circuits).
-                    log::warn!(
-                        "[XVENUE] LIVE EXIT skipped: both legs already zero in phase {:?}",
-                        machine.phase()
-                    );
-                    return Ok(());
-                }
-                // Clear the runner-level cache so a subsequent paper-
-                // mode short-circuit doesn't synthesise stale
-                // ExitFilled events. Live mode no longer reads it
-                // post-S5-2.
-                let _ = open_qty.take();
-                machine.apply(now_ts_ms, Event::ExitSignal { reason })?;
-                summary.last_decision_ts_ms = Some(now_ts_ms);
-                summary.decisions_exit += 1;
-                let (ext_exit_side, lt_exit_side) = match position_dir {
-                    // Reverse the entry sides — see Decision::Enter
-                    // for the entry sign convention. To close a
-                    // long leg we sell (Short), and vice versa.
-                    SpreadDirection::Long => (DcOrderSide::Short, DcOrderSide::Long),
-                    SpreadDirection::Short => (DcOrderSide::Long, DcOrderSide::Short),
-                };
-                log::info!(
-                    "[XVENUE] LIVE EXIT start reason={:?} dev_bps={:?} dir={:?} \
-                     ext_qty={} lt_qty={}",
-                    reason,
-                    dev,
-                    position_dir,
-                    ext_qty,
-                    lt_qty,
-                );
-                let outcome = ParallelExitLoop::new(
-                    &*live.ext_ops,
-                    &*live.lt_ops,
-                    &live.extended_maker_cfg,
-                    &live.lighter_fill_cfg,
-                    &live.parallel_exit_cfg,
-                )
-                .run(
-                    ExtendedEntryRequest {
-                        symbol: live.ext_symbol.clone(),
-                        side: ext_exit_side,
-                        target_qty: ext_qty,
-                        dust_qty: live.dust_qty,
-                        venue_min_qty: live.ext_min_qty,
-                        reduce_only: true,
-                    },
-                    LighterFillRequest {
-                        symbol: live.lt_symbol.clone(),
-                        side: lt_exit_side,
-                        target_qty: lt_qty,
-                        dust_qty: live.dust_qty,
-                        reduce_only: true,
-                    },
-                )
-                .await;
-                match outcome {
-                    ParallelExitOutcome::Both { ext, lt } => {
-                        let ext_exit_qty = match ext {
-                            ExtendedTerminal::Filled { qty: q } => {
-                                machine.apply(
-                                    now_ts_ms,
-                                    Event::ExtendedExitFilled { qty: q },
-                                )?;
-                                Some(q)
-                            }
-                            ExtendedTerminal::Failed { reason: r } => {
-                                log::error!(
-                                    "[XVENUE] LIVE EXIT ext failed reason={:?}",
-                                    r
-                                );
-                                None
-                            }
-                        };
-                        let lt_exit_qty = match lt {
-                            LighterTerminal::Filled { qty: q } => {
-                                machine.apply(
-                                    now_ts_ms,
-                                    Event::LighterExitFilled { qty: q },
-                                )?;
-                                Some(q)
-                            }
-                            LighterTerminal::Failed { reason: r } => {
-                                log::error!(
-                                    "[XVENUE] LIVE EXIT lt failed reason={:?}",
-                                    r
-                                );
-                                None
-                            }
-                        };
-                        match (ext_exit_qty, lt_exit_qty) {
-                            (Some(ext_eq), Some(lt_eq)) => {
-                                // Happy path — compute realised PnL
-                                // (#268 S5-1). If the ctx is missing
-                                // (shouldn't happen but defensive),
-                                // fall back to 0.0 + log warn.
-                                let pnl = match live_entry_ctx.take() {
-                                    Some(ctx) => compute_realised_pnl(
-                                        ctx.direction,
-                                        ctx.ext_entry_mid,
-                                        ctx.lt_entry_mid,
-                                        ext_snap.mid,
-                                        lt_snap.mid,
-                                        ctx.ext_entry_qty,
-                                        ctx.lt_entry_qty,
-                                        ext_eq,
-                                        lt_eq,
-                                        cfg.extended_fee_bps,
-                                        cfg.lighter_fee_bps,
-                                    ),
-                                    None => {
-                                        log::warn!(
-                                            "[XVENUE] LIVE EXIT realised PnL: \
-                                             entry ctx missing, recording 0.0"
-                                        );
-                                        Decimal::ZERO
-                                    }
-                                };
-                                let pnl_f64 = rust_decimal::prelude::ToPrimitive::to_f64(&pnl)
-                                    .unwrap_or(0.0);
-                                summary.last_realised_pnl_usd = Some(pnl_f64);
-                                if let Some(r) = reporter.as_deref_mut() {
-                                    r.record_fill(true, true, now_ts_ms);
-                                    r.record_close(pnl_f64);
-                                }
-                                risk_manager.record_close(pnl_f64, now_unix_secs());
-                                log::info!(
-                                    "[XVENUE] LIVE EXIT both legs filled → Flat \
-                                     pnl_usd={:.4}",
-                                    pnl_f64
-                                );
-                            }
-                            (ext_filled, lt_filled) => {
-                                // Failure: at least one leg returned
-                                // Failed. Drop the entry ctx (no PnL
-                                // computation for partial trades —
-                                // out of scope per #268 S5-1) and
-                                // route to EmergencyFlattening. No
-                                // dedicated `ExitFailed` reason in
-                                // EmergencyReason — `LegMismatchTimeout`
-                                // is the closest semantic fit.
-                                let _ = live_entry_ctx.take();
-                                machine.apply(
-                                    now_ts_ms,
-                                    Event::Emergency {
-                                        reason: EmergencyReason::LegMismatchTimeout,
-                                    },
-                                )?;
-                                summary.live_exits_failed_legs += 1;
-                                log::error!(
-                                    "[XVENUE] LIVE EXIT failed legs \
-                                     (ext_filled={}, lt_filled={}) → EmergencyFlattening",
-                                    ext_filled.is_some(),
-                                    lt_filled.is_some(),
-                                );
-                            }
-                        }
-                    }
-                    ParallelExitOutcome::LegMismatchTimeout { ext, lt } => {
-                        // Apply whatever terminal we have first so
-                        // the state machine has the latest open qty
-                        // before transitioning to EmergencyFlattening
-                        // (mirrors parallel_exit.rs's documented
-                        // contract for case 11). PnL is not computed
-                        // — see #268 S5-1 'Out of scope' for partial
-                        // trade PnL accounting.
-                        if let Some(ExtendedTerminal::Filled { qty: q }) = ext {
-                            machine.apply(
-                                now_ts_ms,
-                                Event::ExtendedExitFilled { qty: q },
-                            )?;
-                        }
-                        if let Some(LighterTerminal::Filled { qty: q }) = lt {
-                            machine.apply(
-                                now_ts_ms,
-                                Event::LighterExitFilled { qty: q },
-                            )?;
-                        }
-                        let _ = live_entry_ctx.take();
-                        machine.apply(
-                            now_ts_ms,
-                            Event::Emergency {
-                                reason: EmergencyReason::LegMismatchTimeout,
-                            },
-                        )?;
-                        summary.live_exits_leg_mismatch += 1;
-                        log::error!(
-                            "[XVENUE] LIVE EXIT leg-mismatch ext={:?} lt={:?} → \
-                             EmergencyFlattening",
-                            ext,
-                            lt,
-                        );
-                    }
-                }
-            }
+            handle_decision_exit(
+                cfg,
+                live_exec,
+                machine,
+                summary,
+                open_qty,
+                live_entry_ctx,
+                reporter.as_deref_mut(),
+                risk_manager,
+                &ext_snap,
+                &lt_snap,
+                reason,
+                now_ts_ms,
+                dev,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -1756,6 +1518,271 @@ async fn handle_decision_enter<H: VenueHub + ?Sized>(
             }
             machine.apply(now_ts_ms, Event::ExtendedFailed)?;
             summary.live_entries_extended_failed += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Handle `Decision::Exit(reason)` — the post-gate exit dispatch.
+/// Branches on dry-run vs live:
+///   - Paper mode: synthesise ExitSignal + both *ExitFilled events
+///     against the cached open_qty (matching the prior inline form;
+///     paper PnL is recorded as 0.0 so the equity-based pnl_today
+///     remains the live-mode renderer).
+///   - Live mode: read per-venue qty + direction from the position
+///     machine (#268 S5-2 source-of-truth move) → reduce-only parallel
+///     exit on both legs (#244 Sprint 4 step 2/3) → on Both{Filled,
+///     Filled} compute realised PnL via compute_realised_pnl, on any
+///     Failed leg drop the entry ctx and route to EmergencyFlattening.
+///   - LegMismatchTimeout: apply whatever terminal qtys landed before
+///     routing to EmergencyFlattening (mirrors parallel_exit case 11).
+///
+/// Behaviour-preserving wholesale extraction of the previous inline
+/// `Decision::Exit` arm. All log lines, summary counters, state-
+/// machine apply ordering, record_close calls (with the 0.0
+/// placeholder on paper-mode and on Both/Some+None Failed paths), and
+/// the live_entry_ctx.take() points are byte-identical.
+#[allow(clippy::too_many_arguments)]
+async fn handle_decision_exit(
+    cfg: &XvenueConfig,
+    live_exec: Option<&LiveExecution>,
+    machine: &mut PositionMachine,
+    summary: &mut LivePaperSummary,
+    open_qty: &mut Option<Decimal>,
+    live_entry_ctx: &mut Option<LiveEntryCtx>,
+    mut reporter: Option<&mut StatusReporter>,
+    risk_manager: &mut RiskManager,
+    ext_snap: &MidSnapshot,
+    lt_snap: &MidSnapshot,
+    reason: ExitReason,
+    now_ts_ms: u64,
+    dev: Option<f64>,
+) -> Result<()> {
+    let go_live = !cfg.dry_run && live_exec.is_some();
+    if !go_live {
+        // Paper-mode synthetic exit fills (existing behaviour).
+        let qty = open_qty.take().unwrap_or(Decimal::ZERO);
+        machine.apply(now_ts_ms, Event::ExitSignal { reason })?;
+        if qty > Decimal::ZERO {
+            machine.apply(now_ts_ms, Event::ExtendedExitFilled { qty })?;
+            machine.apply(now_ts_ms, Event::LighterExitFilled { qty })?;
+            if let Some(r) = reporter.as_deref_mut() {
+                r.record_fill(true, true, now_ts_ms);
+                r.record_close(0.0);
+            }
+            risk_manager.record_close(0.0, now_unix_secs());
+        }
+        summary.last_decision_ts_ms = Some(now_ts_ms);
+        summary.decisions_exit += 1;
+        log::info!(
+            "[XVENUE] PAPER EXIT reason={:?} dev_bps={:?} ext_mid={} lt_mid={} \
+             dry_run={}",
+            reason,
+            dev,
+            ext_snap.mid,
+            lt_snap.mid,
+            cfg.dry_run,
+        );
+        let _ = ExitReason::MeanCross;
+        return Ok(());
+    }
+
+    // Live mode: reduce-only parallel exit on both legs (#244 Sprint 4
+    // step 2/3). DESIGN.md §4.2 specifies parallel exit (vs entry's
+    // serial Extended-first dispatch) — the legs are already balanced
+    // so we close both simultaneously to minimise the open-leg window
+    // if one venue lags.
+    let live = live_exec.expect("go_live = !cfg.dry_run && live_exec.is_some(); checked above");
+    // Read direction + per-venue open qty from the state machine's
+    // `Position` (#268 S5-2). The machine is the source of truth: each
+    // venue's qty is updated independently as `*Filled` events land
+    // during entry, so an asymmetric entry (e.g. Extended partial-fill
+    // + Lighter full-fill) surfaces here as ext_qty != lt_qty. The
+    // runner-level `open_qty` cache is no longer consulted on exit —
+    // but kept because the paper-mode WS-stale / skew short-circuits
+    // still use it.
+    let (position_dir, ext_qty, lt_qty) = match machine.position() {
+        Some(p) => (p.direction, p.extended_open_qty, p.lighter_open_qty),
+        None => {
+            log::warn!(
+                "[XVENUE] LIVE EXIT skipped: no position in phase {:?}",
+                machine.phase()
+            );
+            return Ok(());
+        }
+    };
+    if ext_qty <= Decimal::ZERO && lt_qty <= Decimal::ZERO {
+        // No legs to close — log + skip. Don't touch open_qty (leave
+        // its existing value alone for paper-mode short-circuits).
+        log::warn!(
+            "[XVENUE] LIVE EXIT skipped: both legs already zero in phase {:?}",
+            machine.phase()
+        );
+        return Ok(());
+    }
+    // Clear the runner-level cache so a subsequent paper-mode short-
+    // circuit doesn't synthesise stale ExitFilled events. Live mode no
+    // longer reads it post-S5-2.
+    let _ = open_qty.take();
+    machine.apply(now_ts_ms, Event::ExitSignal { reason })?;
+    summary.last_decision_ts_ms = Some(now_ts_ms);
+    summary.decisions_exit += 1;
+    let (ext_exit_side, lt_exit_side) = match position_dir {
+        // Reverse the entry sides — see Decision::Enter for the entry
+        // sign convention. To close a long leg we sell (Short), and
+        // vice versa.
+        SpreadDirection::Long => (DcOrderSide::Short, DcOrderSide::Long),
+        SpreadDirection::Short => (DcOrderSide::Long, DcOrderSide::Short),
+    };
+    log::info!(
+        "[XVENUE] LIVE EXIT start reason={:?} dev_bps={:?} dir={:?} \
+         ext_qty={} lt_qty={}",
+        reason,
+        dev,
+        position_dir,
+        ext_qty,
+        lt_qty,
+    );
+    let outcome = ParallelExitLoop::new(
+        &*live.ext_ops,
+        &*live.lt_ops,
+        &live.extended_maker_cfg,
+        &live.lighter_fill_cfg,
+        &live.parallel_exit_cfg,
+    )
+    .run(
+        ExtendedEntryRequest {
+            symbol: live.ext_symbol.clone(),
+            side: ext_exit_side,
+            target_qty: ext_qty,
+            dust_qty: live.dust_qty,
+            venue_min_qty: live.ext_min_qty,
+            reduce_only: true,
+        },
+        LighterFillRequest {
+            symbol: live.lt_symbol.clone(),
+            side: lt_exit_side,
+            target_qty: lt_qty,
+            dust_qty: live.dust_qty,
+            reduce_only: true,
+        },
+    )
+    .await;
+    match outcome {
+        ParallelExitOutcome::Both { ext, lt } => {
+            let ext_exit_qty = match ext {
+                ExtendedTerminal::Filled { qty: q } => {
+                    machine.apply(now_ts_ms, Event::ExtendedExitFilled { qty: q })?;
+                    Some(q)
+                }
+                ExtendedTerminal::Failed { reason: r } => {
+                    log::error!("[XVENUE] LIVE EXIT ext failed reason={:?}", r);
+                    None
+                }
+            };
+            let lt_exit_qty = match lt {
+                LighterTerminal::Filled { qty: q } => {
+                    machine.apply(now_ts_ms, Event::LighterExitFilled { qty: q })?;
+                    Some(q)
+                }
+                LighterTerminal::Failed { reason: r } => {
+                    log::error!("[XVENUE] LIVE EXIT lt failed reason={:?}", r);
+                    None
+                }
+            };
+            match (ext_exit_qty, lt_exit_qty) {
+                (Some(ext_eq), Some(lt_eq)) => {
+                    // Happy path — compute realised PnL (#268 S5-1).
+                    // If the ctx is missing (shouldn't happen but
+                    // defensive), fall back to 0.0 + log warn.
+                    let pnl = match live_entry_ctx.take() {
+                        Some(ctx) => compute_realised_pnl(
+                            ctx.direction,
+                            ctx.ext_entry_mid,
+                            ctx.lt_entry_mid,
+                            ext_snap.mid,
+                            lt_snap.mid,
+                            ctx.ext_entry_qty,
+                            ctx.lt_entry_qty,
+                            ext_eq,
+                            lt_eq,
+                            cfg.extended_fee_bps,
+                            cfg.lighter_fee_bps,
+                        ),
+                        None => {
+                            log::warn!(
+                                "[XVENUE] LIVE EXIT realised PnL: \
+                                 entry ctx missing, recording 0.0"
+                            );
+                            Decimal::ZERO
+                        }
+                    };
+                    let pnl_f64 =
+                        rust_decimal::prelude::ToPrimitive::to_f64(&pnl).unwrap_or(0.0);
+                    summary.last_realised_pnl_usd = Some(pnl_f64);
+                    if let Some(r) = reporter.as_deref_mut() {
+                        r.record_fill(true, true, now_ts_ms);
+                        r.record_close(pnl_f64);
+                    }
+                    risk_manager.record_close(pnl_f64, now_unix_secs());
+                    log::info!(
+                        "[XVENUE] LIVE EXIT both legs filled → Flat \
+                         pnl_usd={:.4}",
+                        pnl_f64
+                    );
+                }
+                (ext_filled, lt_filled) => {
+                    // Failure: at least one leg returned Failed. Drop
+                    // the entry ctx (no PnL computation for partial
+                    // trades — out of scope per #268 S5-1) and route
+                    // to EmergencyFlattening. No dedicated
+                    // `ExitFailed` reason in EmergencyReason —
+                    // `LegMismatchTimeout` is the closest semantic
+                    // fit.
+                    let _ = live_entry_ctx.take();
+                    machine.apply(
+                        now_ts_ms,
+                        Event::Emergency {
+                            reason: EmergencyReason::LegMismatchTimeout,
+                        },
+                    )?;
+                    summary.live_exits_failed_legs += 1;
+                    log::error!(
+                        "[XVENUE] LIVE EXIT failed legs \
+                         (ext_filled={}, lt_filled={}) → EmergencyFlattening",
+                        ext_filled.is_some(),
+                        lt_filled.is_some(),
+                    );
+                }
+            }
+        }
+        ParallelExitOutcome::LegMismatchTimeout { ext, lt } => {
+            // Apply whatever terminal we have first so the state
+            // machine has the latest open qty before transitioning to
+            // EmergencyFlattening (mirrors parallel_exit.rs's
+            // documented contract for case 11). PnL is not computed —
+            // see #268 S5-1 'Out of scope' for partial trade PnL
+            // accounting.
+            if let Some(ExtendedTerminal::Filled { qty: q }) = ext {
+                machine.apply(now_ts_ms, Event::ExtendedExitFilled { qty: q })?;
+            }
+            if let Some(LighterTerminal::Filled { qty: q }) = lt {
+                machine.apply(now_ts_ms, Event::LighterExitFilled { qty: q })?;
+            }
+            let _ = live_entry_ctx.take();
+            machine.apply(
+                now_ts_ms,
+                Event::Emergency {
+                    reason: EmergencyReason::LegMismatchTimeout,
+                },
+            )?;
+            summary.live_exits_leg_mismatch += 1;
+            log::error!(
+                "[XVENUE] LIVE EXIT leg-mismatch ext={:?} lt={:?} → \
+                 EmergencyFlattening",
+                ext,
+                lt,
+            );
         }
     }
     Ok(())
