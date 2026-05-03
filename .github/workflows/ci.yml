@@ -13,11 +13,16 @@ on:
   push:
     paths:
       - "src/**"
-      - "configs/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "build.rs"
       - ".github/workflows/**"
+      # configs/** lives in deploy-configs.yml's trigger list — that
+      # workflow handles config-only pushes in 30 s. ci.yml's heavy
+      # arm64 Rust build only fires when actual code or workflow
+      # files change. A combined push that touches both src/ and
+      # configs/ still fires ci.yml via src/**, and ci.yml's deploy
+      # step uploads configs as part of its full pipeline.
   workflow_dispatch:
     inputs:
       dex_connector_ref:
