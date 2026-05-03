@@ -88,6 +88,7 @@ impl VenueOps for LiveVenueOps {
         side: OrderSide,
         qty: Decimal,
         price: Decimal,
+        reduce_only: bool,
     ) -> Result<PlacedOrder> {
         let resp = self
             .conn
@@ -97,7 +98,7 @@ impl VenueOps for LiveVenueOps {
                 side,
                 Some(price),
                 Some(EXTENDED_POST_ONLY_SPREAD_MARKER),
-                false,
+                reduce_only,
                 None,
             )
             .await
@@ -576,7 +577,7 @@ mod tests {
         let stub_arc: Arc<StubConnector> = Arc::new(StubConnector::new());
         let ops = LiveVenueOps::new(stub_arc.clone());
         let placed = ops
-            .place_post_only("BTC-USD", OrderSide::Long, dec!(0.5), dec!(78000))
+            .place_post_only("BTC-USD", OrderSide::Long, dec!(0.5), dec!(78000), false)
             .await
             .unwrap();
         assert_eq!(placed.order_id, "stub-order-1");
@@ -617,7 +618,7 @@ mod tests {
         stub.state.lock().unwrap().create_order_err = Some("auth fail".into());
         let ops = LiveVenueOps::new(stub.arc());
         let err = ops
-            .place_post_only("BTC-USD", OrderSide::Long, dec!(0.5), dec!(78000))
+            .place_post_only("BTC-USD", OrderSide::Long, dec!(0.5), dec!(78000), false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("create_order"));

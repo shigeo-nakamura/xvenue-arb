@@ -191,7 +191,7 @@ impl<'a, V: VenueOps + ?Sized> ExtendedMakerLoop<'a, V> {
 
         let placed: PlacedOrder = match self
             .ops
-            .place_post_only(&req.symbol, req.side, remaining, price)
+            .place_post_only(&req.symbol, req.side, remaining, price, req.reduce_only)
             .await
         {
             Ok(o) => o,

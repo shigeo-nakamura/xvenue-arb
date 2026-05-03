@@ -73,12 +73,20 @@ pub trait VenueOps: Send + Sync {
     /// once the venue has acknowledged the placement. Errors are
     /// surfaced as anyhow so the caller can decide whether to
     /// retry, escalate, or fall through to taker.
+    ///
+    /// `reduce_only=true` MUST be set for exit-side post-only chases:
+    /// without it, multiple rounds racing against each other can
+    /// over-fill and flip the held position to the opposite direction
+    /// (bot-strategy#289 — observed 2026-05-03 round-trip 2).
+    /// `reduce_only=false` for entry-side; the entry path opens
+    /// fresh exposure where reduce-only would just block fills.
     async fn place_post_only(
         &self,
         symbol: &str,
         side: OrderSide,
         qty: Decimal,
         price: Decimal,
+        reduce_only: bool,
     ) -> Result<PlacedOrder>;
 
     /// Places a taker (market or aggressive limit) order. Used by
@@ -158,7 +166,7 @@ pub struct ScriptedVenueOpsState {
 
     /// Captured place_post_only calls (symbol, side, qty, price).
     /// Exposed for assertions.
-    pub posts: Vec<(String, OrderSide, Decimal, Decimal)>,
+    pub posts: Vec<(String, OrderSide, Decimal, Decimal, bool)>,
     /// Captured place_taker calls (symbol, side, qty, reduce_only).
     pub takers: Vec<(String, OrderSide, Decimal, bool)>,
     /// Captured cancel calls (symbol, order_id).
@@ -192,7 +200,7 @@ impl ScriptedVenueOps {
         f(&mut g)
     }
 
-    pub fn snapshot_posts(&self) -> Vec<(String, OrderSide, Decimal, Decimal)> {
+    pub fn snapshot_posts(&self) -> Vec<(String, OrderSide, Decimal, Decimal, bool)> {
         self.inner.lock().unwrap().posts.clone()
     }
 
@@ -235,10 +243,11 @@ impl VenueOps for ScriptedVenueOps {
         side: OrderSide,
         qty: Decimal,
         price: Decimal,
+        reduce_only: bool,
     ) -> Result<PlacedOrder> {
         let resp_opt = {
             let mut g = self.inner.lock().unwrap();
-            g.posts.push((symbol.to_string(), side, qty, price));
+            g.posts.push((symbol.to_string(), side, qty, price, reduce_only));
             g.place_post_only.pop_front()
         };
         match resp_opt {
@@ -352,7 +361,7 @@ mod tests {
     async fn place_post_only_records_call_and_returns_default_id() {
         let ops = ScriptedVenueOps::new();
         let placed = ops
-            .place_post_only("BTC-USD", OrderSide::Long, dec!(0.1), dec!(78000))
+            .place_post_only("BTC-USD", OrderSide::Long, dec!(0.1), dec!(78000), false)
             .await
             .unwrap();
         assert!(placed.order_id.starts_with("mock-order-"));
@@ -386,7 +395,7 @@ mod tests {
             s.place_post_only.push_back(ScriptedResponse::Err("boom".into()));
         });
         let err = ops
-            .place_post_only("BTC-USD", OrderSide::Long, dec!(0.1), dec!(78000))
+            .place_post_only("BTC-USD", OrderSide::Long, dec!(0.1), dec!(78000), false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("boom"));
