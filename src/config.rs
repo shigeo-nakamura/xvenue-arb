@@ -1,9 +1,31 @@
-#[cfg(feature = "lighter-sdk")]
-use debot_utils::decrypt_data_with_kms;
 use rust_decimal::Error as DecimalParseError;
 use std::env;
 use std::fmt;
 use std::num::{ParseFloatError, ParseIntError};
+
+/// Read `ENCRYPTED_DATA_KEY` and strip embedded whitespace.
+///
+/// The whitespace strip exists because the value comes from SSM
+/// Parameter Store via the systemd unit's `EnvironmentFile=`, and some
+/// editors / paste flows wrap long base64 strings — `decrypt_data_with_kms`
+/// does not tolerate them.
+fn read_encrypted_data_key() -> String {
+    env::var("ENCRYPTED_DATA_KEY")
+        .expect("ENCRYPTED_DATA_KEY must be set")
+        .replace(' ', "")
+}
+
+/// KMS-decrypt a base64-encoded ciphertext into a UTF-8 string using the
+/// data key from `ENCRYPTED_DATA_KEY`. Panics if the decrypted payload
+/// is not valid UTF-8, matching the prior `String::from_utf8(...).unwrap()`
+/// behaviour at every call site. Caller maps the KMS error.
+async fn decrypt_string_with_kms(
+    encrypted_data_key: &str,
+    ciphertext: String,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let bytes = debot_utils::decrypt_data_with_kms(encrypted_data_key, ciphertext, true).await?;
+    Ok(String::from_utf8(bytes).expect("decrypted KMS payload was not valid UTF-8"))
+}
 
 #[cfg(feature = "lighter-sdk")]
 #[derive(Debug)]
@@ -40,6 +62,12 @@ pub struct ExtendedConfig {
 pub enum RunMode {
     Dry,
     RealTrade,
+    /// Reserved variant: exercises real-trade code paths against the
+    /// `*_DRYRUN_*` Hyperliquid credentials so a live engine wiring can
+    /// be smoke-tested without spending corp-wallet equity. No caller
+    /// constructs this today; kept so the dryrun-credential branch in
+    /// `get_hyperliquid_config_from_env` (and the equivalent split in
+    /// `dex_connector_box`) stays explicit.
     #[allow(dead_code)]
     RealTradeTest,
 }
@@ -127,16 +155,13 @@ pub async fn get_lighter_config_from_env(
         // EVM wallet private key is always encrypted, even in plain text mode
         let evm_wallet_key = if let Some(evm_key) = evm_wallet_private_key {
             log::info!("Decrypting EVM wallet private key (always encrypted)");
-            let encrypted_data_key = env::var("ENCRYPTED_DATA_KEY")
-                .expect("ENCRYPTED_DATA_KEY must be set")
-                .replace(" ", ""); // Remove whitespace characters
-
-            let evm_key_vec = decrypt_data_with_kms(&encrypted_data_key, evm_key, true)
+            let encrypted_data_key = read_encrypted_data_key();
+            let key = decrypt_string_with_kms(&encrypted_data_key, evm_key)
                 .await
                 .map_err(|_| {
                     ConfigError::OtherError("decrypt evm_wallet_private_key".to_owned())
                 })?;
-            Some(String::from_utf8(evm_key_vec).unwrap())
+            Some(key)
         } else {
             log::info!("No EVM wallet private key provided");
             None
@@ -150,29 +175,25 @@ pub async fn get_lighter_config_from_env(
         let api_key = public_api_key.expect("LIGHTER_PUBLIC_API_KEY must be set");
         let private_key = private_api_key.expect("LIGHTER_PRIVATE_API_KEY must be set");
 
-        let encrypted_data_key = env::var("ENCRYPTED_DATA_KEY")
-            .expect("ENCRYPTED_DATA_KEY must be set")
-            .replace(" ", ""); // Remove whitespace characters
+        let encrypted_data_key = read_encrypted_data_key();
 
-        let api_key_vec = decrypt_data_with_kms(&encrypted_data_key, api_key, true)
+        let api_key = decrypt_string_with_kms(&encrypted_data_key, api_key)
             .await
             .map_err(|_| ConfigError::OtherError("decrypt api_key".to_owned()))?;
-        let api_key = String::from_utf8(api_key_vec).unwrap();
 
-        let private_key_vec = decrypt_data_with_kms(&encrypted_data_key, private_key, true)
+        let private_key = decrypt_string_with_kms(&encrypted_data_key, private_key)
             .await
             .map_err(|_| ConfigError::OtherError("decrypt private_key".to_owned()))?;
-        let private_key = String::from_utf8(private_key_vec).unwrap();
 
         // Decrypt EVM wallet private key if provided
         let evm_wallet_key = if let Some(evm_key) = evm_wallet_private_key {
             log::info!("Decrypting EVM wallet private key");
-            let evm_key_vec = decrypt_data_with_kms(&encrypted_data_key, evm_key, true)
+            let key = decrypt_string_with_kms(&encrypted_data_key, evm_key)
                 .await
                 .map_err(|_| {
                     ConfigError::OtherError("decrypt evm_wallet_private_key".to_owned())
                 })?;
-            Some(String::from_utf8(evm_key_vec).unwrap())
+            Some(key)
         } else {
             log::info!("No EVM wallet private key provided");
             None
@@ -237,18 +258,13 @@ pub async fn get_hyperliquid_config_from_env(
     };
 
     // Decrypt private key using KMS
-    let encrypted_data_key = env::var("ENCRYPTED_DATA_KEY")
-        .expect("ENCRYPTED_DATA_KEY must be set")
-        .replace(" ", ""); // Remove whitespace characters
-
-    let private_key_vec =
-        debot_utils::decrypt_data_with_kms(&encrypted_data_key, private_key_encrypted, true)
-            .await
-            .map_err(|e| {
-                log::error!("Failed to decrypt private key: {:?}", e);
-                ConfigError::DecimalParseError(DecimalParseError::from("KMS decryption failed"))
-            })?;
-    let private_key = String::from_utf8(private_key_vec).unwrap();
+    let encrypted_data_key = read_encrypted_data_key();
+    let private_key = decrypt_string_with_kms(&encrypted_data_key, private_key_encrypted)
+        .await
+        .map_err(|e| {
+            log::error!("Failed to decrypt private key: {:?}", e);
+            ConfigError::DecimalParseError(DecimalParseError::from("KMS decryption failed"))
+        })?;
 
     Ok(HyperliquidConfig {
         private_key,
@@ -272,17 +288,13 @@ pub async fn get_extended_config_from_env() -> Result<ExtendedConfig, ConfigErro
         .ok()
         .filter(|v| !v.is_empty());
 
-    let encrypted_data_key = env::var("ENCRYPTED_DATA_KEY")
-        .expect("ENCRYPTED_DATA_KEY must be set")
-        .replace(" ", "");
-    let private_key_vec =
-        debot_utils::decrypt_data_with_kms(&encrypted_data_key, private_key_encrypted, true)
-            .await
-            .map_err(|e| {
-                log::error!("Failed to decrypt EXTENDED_PRIVATE_KEY: {:?}", e);
-                ConfigError::DecimalParseError(DecimalParseError::from("KMS decryption failed"))
-            })?;
-    let private_key = String::from_utf8(private_key_vec).unwrap();
+    let encrypted_data_key = read_encrypted_data_key();
+    let private_key = decrypt_string_with_kms(&encrypted_data_key, private_key_encrypted)
+        .await
+        .map_err(|e| {
+            log::error!("Failed to decrypt EXTENDED_PRIVATE_KEY: {:?}", e);
+            ConfigError::DecimalParseError(DecimalParseError::from("KMS decryption failed"))
+        })?;
 
     Ok(ExtendedConfig {
         api_key,
