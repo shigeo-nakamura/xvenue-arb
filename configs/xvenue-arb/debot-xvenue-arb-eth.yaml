@@ -45,11 +45,19 @@ min_notional_usd: 20
 # only after each tier survives ≥3 clean round-trips under real flow.
 max_notional_usd: 50
 
-# ---- Execution: Extended (post-only with chase + taker fallback) ----
-extended_post_only: true
+# ---- Execution: Extended (taker — see #302) ----
+# bot-strategy#302: 25 h LIVE on 2026-05-02..03 produced 1/100 post_only fills
+# (97 timed out at the touch with cancelled=false → queue position never matured
+# at $50 notional, not a price-through). Phase 1 BT already models Extended as
+# taker (extended_taker_fee_bps=2.5), so flipping to taker-direct loses no PnL
+# vs the BT projection while removing 6 s of dead chase per leg, which also
+# shrinks the WS-lag exposure window that triggers #298 EXIT-side ext Timeout.
+# Re-evaluate (i.e. revisit Direction 3 / chase_ticks-for-real) once we have a
+# data-backed reason to expect maker fills at higher notional or BTC.
+extended_post_only: false
 extended_chase_ticks: 1
 extended_chase_retries: 3
-extended_chase_timeout_ms: 2000   # bumped 500→2000 after #244 live probe (5/5 Timeout 2026-05-02): poll_until_terminal_or_deadline reuses this for the taker poll, and 500ms was too tight for Extended fill ack. Re-evaluate once a real fill lands.
+extended_chase_timeout_ms: 2000   # poll_until_terminal_or_deadline reuses this for the taker poll budget; left at 2000 ms which the 2026-05-02 #244 live probe established as enough for Extended fill ack.
 extended_taker_fallback: true
 extended_min_qty: 0.01            # bot-strategy#299: Extended ETH min order size. Skip taker fallback when post_only fills target_qty within this floor — connector would otherwise reject with "Order size 0 below min 0.01" and emit a noisy WARN.
 extended_taker_grace_poll_ms: 1000   # bot-strategy#298: WS-lag grace re-poll after taker `filled=0 cancelled=false`. Catches late fills that landed at the venue but propagated through the connector cache slightly past chase_timeout_ms, avoiding lt-only hold → EmergencyFlattening on what was actually a clean fill. 1s budget keeps total exit < leg_mismatch_timeout_ms (8s + 1s = 9s; 10s ceiling).

@@ -33,8 +33,9 @@ trade_size_pct: 0.05
 min_notional_usd: 20
 max_notional_usd: 1000
 
-# ---- Execution: Extended ----
-extended_post_only: true
+# ---- Execution: Extended (taker — see #302) ----
+# Symmetric with eth.yaml; see eth.yaml for the live evidence + Phase 1 BT context.
+extended_post_only: false
 extended_chase_ticks: 1
 extended_chase_retries: 3
 extended_chase_timeout_ms: 2000   # symmetric with ETH YAML; see eth.yaml for context
