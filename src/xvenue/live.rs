@@ -478,6 +478,7 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                     if !cfg.dry_run
                         && matches!(machine.phase(), super::state::Phase::EmergencyFlattening)
                     {
+                        let prev_emergency_completes = summary.emergency_completes;
                         if let Err(e) = drive_emergency_flatten_round(
                             live,
                             &mut machine,
@@ -492,6 +493,25 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                         .await
                         {
                             log::warn!("[XVENUE] emergency-flatten round error: {:?}", e);
+                        }
+                        // bot-strategy#288 Action B/C: when EmergencyComplete
+                        // just fired we owe the round-trip a record_close so
+                        // daily_risk.daily_pnl and trade_stats reflect it.
+                        // Sprint 5's happy-path record_close lives in the
+                        // Decision::Exit Both{Filled,Filled} consume which
+                        // never runs on the emergency-recovered route. Use
+                        // 0.0 as placeholder PnL — the real cost shows up in
+                        // the equity-based pnl_today; an exact figure here
+                        // would need entry-mid + exit-fill prices from the
+                        // venue side.
+                        if summary.emergency_completes > prev_emergency_completes {
+                            if let Some(r) = reporter.as_mut() {
+                                r.record_close(0.0);
+                            }
+                            risk_manager.record_close(0.0, now_unix_secs());
+                            log::info!(
+                                "[XVENUE/emerg] record_close fired with placeholder pnl=0.0 (real cost via equity-based pnl_today)"
+                            );
                         }
                     } else {
                         // Reset throttle state so the *next* entry
