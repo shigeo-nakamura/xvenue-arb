@@ -39,7 +39,6 @@ use async_trait::async_trait;
 use dex_connector::{DexConnector, OrderSide};
 use rust_decimal::Decimal;
 
-use super::emergency_loop::{LegQtys, LegStateReader};
 use super::venue_ops::{OrderFillStatus, PlacedOrder, TopOfBook, VenueOps};
 
 /// Sentinel value Extended interprets as the post-only flag on
@@ -202,88 +201,10 @@ impl VenueOps for LiveVenueOps {
     }
 }
 
-/// Production [`LegStateReader`] sourcing per-venue open qty from
-/// each connector's `get_positions` call. Used by the emergency-
-/// flatten handler (#244 Sprint 4 step 3/3) to know whether a
-/// `close_all` round is still required, or whether both legs have
-/// already zeroed out (case 13 boundary).
-///
-/// Reads the two venues in parallel via `tokio::try_join!`. The
-/// production connectors back `get_positions` with WS-fed in-memory
-/// state, so the call is cheap on the emergency-retry cadence
-/// (default 30 s). A cache miss surfaces as `Err`; the emergency
-/// handler treats that as "still has open qty" and retries on the
-/// next round.
-pub struct LiveLegStateReader {
-    pub ext_conn: Arc<dyn DexConnector>,
-    pub lt_conn: Arc<dyn DexConnector>,
-    pub ext_symbol: String,
-    pub lt_symbol: String,
-}
-
-impl LiveLegStateReader {
-    pub fn new(
-        ext_conn: Arc<dyn DexConnector>,
-        lt_conn: Arc<dyn DexConnector>,
-        ext_symbol: String,
-        lt_symbol: String,
-    ) -> Self {
-        // bot-strategy#287 Bug 1 root cause:
-        //   YAML symbol_ext is the pair form Extended's order APIs use
-        //   ("ETH-USD"), but dex_connector::extended runs every
-        //   PositionSnapshot through `normalize_symbol`, which strips
-        //   the "-USD" / "-USDT" suffix and returns the bare base
-        //   token ("ETH"). `read_leg_qtys` did
-        //   `find(|p| p.symbol == "ETH-USD")` against snapshots with
-        //   symbol="ETH" — never matched, so every real Extended
-        //   position was silently reported as zero. EmergencyFlattening
-        //   then declared complete on the false zero (the 2026-05-02
-        //   incident).
-        //
-        //   Strip the suffix here so the `find` in `read_leg_qtys`
-        //   compares the same form both sides produce. Lighter
-        //   symbols are already bare so normalisation is idempotent.
-        Self {
-            ext_conn,
-            lt_conn,
-            ext_symbol: strip_quote_suffix(&ext_symbol),
-            lt_symbol: strip_quote_suffix(&lt_symbol),
-        }
-    }
-}
-
-fn strip_quote_suffix(symbol: &str) -> String {
-    symbol
-        .split_once('-')
-        .map(|(prefix, _)| prefix.to_string())
-        .unwrap_or_else(|| symbol.to_string())
-}
-
-#[async_trait]
-impl LegStateReader for LiveLegStateReader {
-    async fn read_leg_qtys(&self) -> Result<LegQtys> {
-        let (ext_pos, lt_pos) = tokio::try_join!(
-            self.ext_conn.get_positions(),
-            self.lt_conn.get_positions(),
-        )
-        .map_err(|e| anyhow!("get_positions: {}", e))?;
-        let ext = ext_pos
-            .iter()
-            .find(|p| p.symbol == self.ext_symbol)
-            .map(|p| p.size)
-            .unwrap_or(Decimal::ZERO);
-        let lt = lt_pos
-            .iter()
-            .find(|p| p.symbol == self.lt_symbol)
-            .map(|p| p.size)
-            .unwrap_or(Decimal::ZERO);
-        Ok(LegQtys { ext, lt })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trade::execution::emergency_loop::{LegStateReader, LiveLegStateReader};
     use dex_connector::{
         BalanceResponse, CanceledOrder, CanceledOrdersResponse, CombinedBalanceResponse,
         CreateOrderResponse, DexError, FilledOrder, FilledOrdersResponse, LastTradesResponse,
