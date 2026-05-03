@@ -23,13 +23,14 @@
 use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-const RISK_STATE_VERSION: u32 = 1;
+use super::persistence::{load_state, persist_state};
+
 const RISK_HISTORY_BUFFER_CAP: usize = 200;
 const PERSIST_MIN_INTERVAL_SECS: u64 = 5;
 
@@ -76,13 +77,6 @@ pub struct RiskState {
     pub session_halt_reason: Option<String>,
     #[serde(default)]
     pub session_halt_ts: Option<i64>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct RiskStateSnapshot {
-    #[serde(rename = "_v")]
-    version: u32,
-    state: RiskState,
 }
 
 /// Configuration knobs for the risk gates. Built from `XvenueConfig`
@@ -659,61 +653,6 @@ impl RiskManager {
     pub fn flush(&mut self) {
         persist_state(&self.config.risk_state_path, &self.state);
         self.last_persist = Some(Instant::now());
-    }
-}
-
-fn persist_state(path: &Path, state: &RiskState) {
-    let snapshot = RiskStateSnapshot {
-        version: RISK_STATE_VERSION,
-        state: state.clone(),
-    };
-    let Ok(json) = serde_json::to_string(&snapshot) else {
-        log::warn!("[RISK_STATE] serialize failed");
-        return;
-    };
-    let dir = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    if let Err(e) = fs::create_dir_all(dir) {
-        log::warn!("[RISK_STATE] mkdir {}: {:?}", dir.display(), e);
-        return;
-    }
-    let file_name = path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "risk_state.json".to_string());
-    let tmp = dir.join(format!(".{}.tmp.{}", file_name, std::process::id()));
-    if let Err(e) = fs::write(&tmp, json) {
-        log::warn!("[RISK_STATE] tmp write {}: {:?}", tmp.display(), e);
-        return;
-    }
-    if let Err(e) = fs::rename(&tmp, path) {
-        log::warn!(
-            "[RISK_STATE] rename {} → {}: {:?}",
-            tmp.display(),
-            path.display(),
-            e
-        );
-        let _ = fs::remove_file(&tmp);
-    }
-}
-
-fn load_state(path: &Path) -> RiskState {
-    let raw = match fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return RiskState::default(),
-        Err(e) => {
-            log::warn!("[RISK_STATE] read {}: {:?}", path.display(), e);
-            return RiskState::default();
-        }
-    };
-    match serde_json::from_str::<RiskStateSnapshot>(&raw) {
-        Ok(s) => s.state,
-        Err(e) => {
-            log::warn!("[RISK_STATE] parse {}: {:?}", path.display(), e);
-            RiskState::default()
-        }
     }
 }
 
