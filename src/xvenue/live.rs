@@ -576,6 +576,90 @@ fn publish_risk(risk_manager: &RiskManager, reporter: &mut StatusReporter) {
     reporter.set_risk_history(risk_manager.risk_history());
 }
 
+/// Evaluate the WS staleness latch and, when a position is open and
+/// the venue stream went stale, route the position machine into
+/// `EmergencyFlattening`. Returns `true` when the caller should bail
+/// out of the rest of the tick (`return Ok(())`); `false` means
+/// continue. Three outcomes map to:
+///   - `WsHealthOutcome::Stale` + position open  → emergency apply,
+///     return `true`.
+///   - `WsHealthOutcome::Stale` + flat           → debug-log, return
+///     `false` (the spread engine's `book_ok` filter is the entry
+///     gate; flat has nothing to flatten).
+///   - non-Stale                                 → return `false`.
+///
+/// Behaviour-preserving: identical log lines, identical paper-mode
+/// EmergencyComplete synthesis (live mode must not take that path),
+/// identical summary counter increment.
+fn handle_ws_stale_emergency(
+    cfg: &XvenueConfig,
+    ws_health: &mut WsHealthMonitor,
+    machine: &mut PositionMachine,
+    open_qty: &mut Option<Decimal>,
+    summary: &mut LivePaperSummary,
+    now_wall_ms: u64,
+) -> bool {
+    let WsHealthOutcome::Stale(stale_venue) = ws_health.evaluate(now_wall_ms) else {
+        return false;
+    };
+    if machine.summary().is_none() {
+        log::debug!(
+            "[XVENUE] WS staleness in Flat: venue={:?} threshold_ms={} \
+             (no position to flatten — continuing)",
+            stale_venue,
+            ws_health.ws_stale_emergency_ms()
+        );
+        // Don't increment entries_blocked_by_ws_stale — Flat doesn't
+        // block anything; the spread engine's book_ok filter is what
+        // gates entries on bad data.
+        return false;
+    }
+
+    let event = Event::Emergency {
+        reason: super::state::EmergencyReason::WsStale,
+    };
+    match machine.apply(now_wall_ms, event) {
+        Ok(()) => {
+            log::error!(
+                "[XVENUE] WS staleness emergency: venue={:?} threshold_ms={} \
+                 → flattening",
+                stale_venue,
+                ws_health.ws_stale_emergency_ms()
+            );
+            summary.ws_stale_emergencies_emitted += 1;
+
+            // Paper-mode short-circuit: Group B (real orders +
+            // emergency-flatten loop) is not yet wired, so there is no
+            // producer of `EmergencyComplete` in dry-run. Without
+            // this, a transient WS hiccup would dead-end the state
+            // machine in EmergencyFlattening. Synthesise the exit
+            // fills + EmergencyComplete so the paper loop recovers.
+            // Live mode (Group B once it lands) MUST NOT take this
+            // path.
+            if cfg.dry_run {
+                if let Some(qty) = open_qty.take() {
+                    let _ = machine.apply(now_wall_ms, Event::ExtendedExitFilled { qty });
+                    let _ = machine.apply(now_wall_ms, Event::LighterExitFilled { qty });
+                }
+                let _ = machine.apply(now_wall_ms, Event::EmergencyComplete);
+                ws_health.reset_after_recovery();
+                log::warn!(
+                    "[XVENUE] paper-mode WS-stale recovery: synthesised \
+                     EmergencyComplete (Group B will replace this in live)"
+                );
+            }
+        }
+        Err(e) => {
+            log::debug!(
+                "[XVENUE] WS stale ignored by state machine \
+                 (likely already flattening): {:?}",
+                e
+            );
+        }
+    }
+    true
+}
+
 /// Read the current mid from both venues, gated by the per-venue
 /// warm-up latch. Returns `Ok(None)` when either venue is still
 /// warming up — the caller should treat this as "skip the rest of
@@ -766,80 +850,17 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
     ws_health.record_book_update(VenueLabel::Extended, now_wall_ms);
     ws_health.record_book_update(VenueLabel::Lighter, now_wall_ms);
 
-    // WS staleness check (#244 Group C). Runs *after* the reads so
-    // a successful read clears any prior staleness latch. Decision
-    // policy:
-    //   - Position open: emit Event::Emergency{WsStale} → state
-    //     machine routes to EmergencyFlattening.
-    //   - Flat (no position): log debug, continue normally. The
-    //     spread engine already drops thin-book samples via
-    //     `book_ok=false`; we don't need a separate gate.
-    //   - NotReady (warm-up): proceed normally; the read_mid
-    //     warm-up gate already handled the "no data yet" case.
-    let ws_outcome = ws_health.evaluate(now_wall_ms);
-    if let WsHealthOutcome::Stale(stale_venue) = ws_outcome {
-        if machine.summary().is_some() {
-            let event = Event::Emergency {
-                reason: super::state::EmergencyReason::WsStale,
-            };
-            match machine.apply(now_wall_ms, event) {
-                Ok(()) => {
-                    log::error!(
-                        "[XVENUE] WS staleness emergency: venue={:?} threshold_ms={} \
-                         → flattening",
-                        stale_venue,
-                        ws_health.ws_stale_emergency_ms()
-                    );
-                    summary.ws_stale_emergencies_emitted += 1;
-
-                    // Paper-mode short-circuit: Group B (real orders +
-                    // emergency-flatten loop) is not yet wired, so
-                    // there is no producer of `EmergencyComplete` in
-                    // dry-run. Without this, a transient WS hiccup
-                    // would dead-end the state machine in
-                    // EmergencyFlattening. Synthesise the exit fills
-                    // + EmergencyComplete so the paper loop recovers.
-                    // Live mode (Group B once it lands) MUST NOT take
-                    // this path.
-                    if cfg.dry_run {
-                        if let Some(qty) = open_qty.take() {
-                            let _ = machine.apply(
-                                now_wall_ms,
-                                Event::ExtendedExitFilled { qty },
-                            );
-                            let _ = machine.apply(
-                                now_wall_ms,
-                                Event::LighterExitFilled { qty },
-                            );
-                        }
-                        let _ = machine.apply(now_wall_ms, Event::EmergencyComplete);
-                        ws_health.reset_after_recovery();
-                        log::warn!(
-                            "[XVENUE] paper-mode WS-stale recovery: synthesised \
-                             EmergencyComplete (Group B will replace this in live)"
-                        );
-                    }
-                }
-                Err(e) => {
-                    log::debug!(
-                        "[XVENUE] WS stale ignored by state machine \
-                         (likely already flattening): {:?}",
-                        e
-                    );
-                }
-            }
-            return Ok(());
-        } else {
-            log::debug!(
-                "[XVENUE] WS staleness in Flat: venue={:?} threshold_ms={} \
-                 (no position to flatten — continuing)",
-                stale_venue,
-                ws_health.ws_stale_emergency_ms()
-            );
-            // Don't increment entries_blocked_by_ws_stale — Flat
-            // doesn't block anything; the spread engine's book_ok
-            // filter is what gates entries on bad data.
-        }
+    // WS staleness check (#244 Group C). Runs *after* the reads so a
+    // successful read clears any prior staleness latch.
+    if handle_ws_stale_emergency(
+        cfg,
+        ws_health,
+        machine,
+        open_qty,
+        summary,
+        now_wall_ms,
+    ) {
+        return Ok(());
     }
 
     // Reference guard cross-check (#244 C). Reads the latest Binance
