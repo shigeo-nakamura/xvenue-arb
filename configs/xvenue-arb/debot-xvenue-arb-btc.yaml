@@ -47,7 +47,7 @@ lighter_fill_timeout_ms: 1000
 # ---- Risk ----
 ws_stale_emergency_ms: 5000
 max_inventory_skew_usd: 50.0
-leg_mismatch_timeout_ms: 3000
+leg_mismatch_timeout_ms: 10000   # symmetric with eth.yaml; see #288 for context
 kill_switch_file: /opt/debot/KILL_SWITCH   # external operator pause — pairtrade-symmetric (#244 D-1)
 stuck_file: /var/run/xvenue-arb/STUCK      # runner self-write on unrecoverable emergency (#244 D-2..6 follow-up)
 emergency_retry_interval_ms: 30000
