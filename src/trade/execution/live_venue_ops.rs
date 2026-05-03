@@ -227,13 +227,35 @@ impl LiveLegStateReader {
         ext_symbol: String,
         lt_symbol: String,
     ) -> Self {
+        // bot-strategy#287 Bug 1 root cause:
+        //   YAML symbol_ext is the pair form Extended's order APIs use
+        //   ("ETH-USD"), but dex_connector::extended runs every
+        //   PositionSnapshot through `normalize_symbol`, which strips
+        //   the "-USD" / "-USDT" suffix and returns the bare base
+        //   token ("ETH"). `read_leg_qtys` did
+        //   `find(|p| p.symbol == "ETH-USD")` against snapshots with
+        //   symbol="ETH" — never matched, so every real Extended
+        //   position was silently reported as zero. EmergencyFlattening
+        //   then declared complete on the false zero (the 2026-05-02
+        //   incident).
+        //
+        //   Strip the suffix here so the `find` in `read_leg_qtys`
+        //   compares the same form both sides produce. Lighter
+        //   symbols are already bare so normalisation is idempotent.
         Self {
             ext_conn,
             lt_conn,
-            ext_symbol,
-            lt_symbol,
+            ext_symbol: strip_quote_suffix(&ext_symbol),
+            lt_symbol: strip_quote_suffix(&lt_symbol),
         }
     }
+}
+
+fn strip_quote_suffix(symbol: &str) -> String {
+    symbol
+        .split_once('-')
+        .map(|(prefix, _)| prefix.to_string())
+        .unwrap_or_else(|| symbol.to_string())
 }
 
 #[async_trait]
@@ -726,8 +748,13 @@ mod tests {
     async fn live_leg_state_reader_returns_open_qty_per_venue() {
         let ext_stub = StubConnector::new();
         let lt_stub = StubConnector::new();
+        // Both connectors emit PositionSnapshot.symbol in the bare-base
+        // form: dex_connector::extended runs `normalize_symbol("ETH-USD")
+        // → "ETH"`, and Lighter already uses bare tokens. The reader
+        // strips the YAML "ETH-USD" / "ETH" inputs to match.
+        // bot-strategy#287 Bug 1.
         ext_stub.state.lock().unwrap().positions = vec![PositionSnapshot {
-            symbol: "ETH-USD".into(),
+            symbol: "ETH".into(),
             size: dec!(0.42),
             sign: 1,
             entry_price: None,
@@ -748,6 +775,33 @@ mod tests {
         assert_eq!(qtys.ext, dec!(0.42));
         assert_eq!(qtys.lt, dec!(0.42));
         assert!(!qtys.both_zero());
+    }
+
+    #[tokio::test]
+    async fn live_leg_state_reader_strips_quote_suffix_for_match() {
+        // Regression test for #287 Bug 1: a YAML symbol_ext="ETH-USD"
+        // must still match a venue-emitted PositionSnapshot.symbol="ETH".
+        let ext_stub = StubConnector::new();
+        let lt_stub = StubConnector::new();
+        ext_stub.state.lock().unwrap().positions = vec![PositionSnapshot {
+            symbol: "ETH".into(),
+            size: dec!(0.021),
+            sign: -1,
+            entry_price: None,
+        }];
+        let reader = LiveLegStateReader::new(
+            ext_stub.arc(),
+            lt_stub.arc(),
+            "ETH-USD".into(),
+            "ETH".into(),
+        );
+        let qtys = reader.read_leg_qtys().await.unwrap();
+        assert_eq!(
+            qtys.ext,
+            dec!(0.021),
+            "ETH-USD must strip to ETH and match the venue snapshot"
+        );
+        assert_eq!(qtys.lt, Decimal::ZERO);
     }
 
     #[tokio::test]
