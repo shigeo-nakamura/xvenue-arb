@@ -660,6 +660,57 @@ fn handle_ws_stale_emergency(
     true
 }
 
+/// Reference guard cross-check (#244 C). Reads the latest Binance 1m
+/// mid and suppresses each venue's `book_ok` when its mid drifts past
+/// `reference_max_dev_bps` for `reference_consec_buckets_for_halt`
+/// consecutive minutes. Mirrors the BT pre-filter so live and BT see
+/// the same suppression behaviour on stuck quotes. The
+/// `ToPrimitive::to_f64` step can fail in theory for absurdly-large
+/// Decimals — when it does, the guard is silently skipped (matching
+/// the prior `if let (Some, Some) = ...` shape).
+async fn apply_reference_guard(
+    reference_guard: &mut ReferenceGuard,
+    ext_snap: &mut MidSnapshot,
+    lt_snap: &mut MidSnapshot,
+    summary: &mut LivePaperSummary,
+) {
+    let ref_state = reference_guard.current_reference().await;
+    let (Some(ext_mid_f), Some(lt_mid_f)) = (
+        rust_decimal::prelude::ToPrimitive::to_f64(&ext_snap.mid),
+        rust_decimal::prelude::ToPrimitive::to_f64(&lt_snap.mid),
+    ) else {
+        return;
+    };
+    let now_ts_secs = now_unix_secs();
+    let (ext_oc, lt_oc) = reference_guard.evaluate(
+        ext_snap.ts_ms.min(lt_snap.ts_ms),
+        ext_mid_f,
+        lt_mid_f,
+        ref_state.as_ref(),
+        now_ts_secs,
+    );
+    if ext_oc == RefCheckOutcome::Suppress && ext_snap.book_ok {
+        log::warn!(
+            "[XVENUE] reference_guard suppressing Extended book: \
+             venue_mid={:.4} ref_mid={:?}",
+            ext_mid_f,
+            ref_state.as_ref().map(|r| r.mid)
+        );
+        ext_snap.book_ok = false;
+        summary.ext_book_suppressed_by_ref_guard += 1;
+    }
+    if lt_oc == RefCheckOutcome::Suppress && lt_snap.book_ok {
+        log::warn!(
+            "[XVENUE] reference_guard suppressing Lighter book: \
+             venue_mid={:.4} ref_mid={:?}",
+            lt_mid_f,
+            ref_state.as_ref().map(|r| r.mid)
+        );
+        lt_snap.book_ok = false;
+        summary.lt_book_suppressed_by_ref_guard += 1;
+    }
+}
+
 /// Inventory-skew watchdog mirror of `handle_ws_stale_emergency`.
 /// Computes the position's current skew_usd, asks the skew monitor
 /// whether it has breached, and on breach routes the position machine
@@ -930,45 +981,8 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
         return Ok(());
     }
 
-    // Reference guard cross-check (#244 C). Reads the latest Binance
-    // 1m mid and suppresses each venue's book_ok when its mid drifts
-    // past `reference_max_dev_bps` for `reference_consec_buckets_for_halt`
-    // consecutive minutes. Mirrors the BT pre-filter, so live and BT
-    // see the same suppression behavior on stuck quotes.
-    let ref_state = reference_guard.current_reference().await;
-    if let (Some(ext_mid_f), Some(lt_mid_f)) = (
-        rust_decimal::prelude::ToPrimitive::to_f64(&ext_snap.mid),
-        rust_decimal::prelude::ToPrimitive::to_f64(&lt_snap.mid),
-    ) {
-        let now_ts_secs = now_unix_secs();
-        let (ext_oc, lt_oc) = reference_guard.evaluate(
-            ext_snap.ts_ms.min(lt_snap.ts_ms),
-            ext_mid_f,
-            lt_mid_f,
-            ref_state.as_ref(),
-            now_ts_secs,
-        );
-        if ext_oc == RefCheckOutcome::Suppress && ext_snap.book_ok {
-            log::warn!(
-                "[XVENUE] reference_guard suppressing Extended book: \
-                 venue_mid={:.4} ref_mid={:?}",
-                ext_mid_f,
-                ref_state.as_ref().map(|r| r.mid)
-            );
-            ext_snap.book_ok = false;
-            summary.ext_book_suppressed_by_ref_guard += 1;
-        }
-        if lt_oc == RefCheckOutcome::Suppress && lt_snap.book_ok {
-            log::warn!(
-                "[XVENUE] reference_guard suppressing Lighter book: \
-                 venue_mid={:.4} ref_mid={:?}",
-                lt_mid_f,
-                ref_state.as_ref().map(|r| r.mid)
-            );
-            lt_snap.book_ok = false;
-            summary.lt_book_suppressed_by_ref_guard += 1;
-        }
-    }
+    // Reference guard cross-check (#244 C).
+    apply_reference_guard(reference_guard, &mut ext_snap, &mut lt_snap, summary).await;
 
     if let Some(r) = reporter.as_deref_mut() {
         r.record_book_ok(
