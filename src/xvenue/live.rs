@@ -1369,6 +1369,7 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
                     side: ext_side,
                     target_qty: ext_qty,
                     dust_qty: live.dust_qty,
+                    venue_min_qty: live.ext_min_qty,
                     reduce_only: false,
                 })
                 .await;
@@ -1569,6 +1570,7 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
                         side: ext_exit_side,
                         target_qty: ext_qty,
                         dust_qty: live.dust_qty,
+                        venue_min_qty: live.ext_min_qty,
                         reduce_only: true,
                     },
                     LighterFillRequest {

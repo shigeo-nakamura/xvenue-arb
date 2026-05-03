@@ -51,6 +51,8 @@ extended_chase_ticks: 1
 extended_chase_retries: 3
 extended_chase_timeout_ms: 2000   # bumped 500→2000 after #244 live probe (5/5 Timeout 2026-05-02): poll_until_terminal_or_deadline reuses this for the taker poll, and 500ms was too tight for Extended fill ack. Re-evaluate once a real fill lands.
 extended_taker_fallback: true
+extended_min_qty: 0.01            # bot-strategy#299: Extended ETH min order size. Skip taker fallback when post_only fills target_qty within this floor — connector would otherwise reject with "Order size 0 below min 0.01" and emit a noisy WARN.
+extended_taker_grace_poll_ms: 1000   # bot-strategy#298: WS-lag grace re-poll after taker `filled=0 cancelled=false`. Catches late fills that landed at the venue but propagated through the connector cache slightly past chase_timeout_ms, avoiding lt-only hold → EmergencyFlattening on what was actually a clean fill. 1s budget keeps total exit < leg_mismatch_timeout_ms (8s + 1s = 9s; 10s ceiling).
 
 # ---- Execution: Lighter (market) ----
 lighter_order_type: market

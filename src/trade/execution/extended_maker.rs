@@ -47,6 +47,13 @@ pub struct ExtendedEntryRequest {
     /// treated as dust and the executor either returns the partial
     /// fill or escalates to taker (per `cfg.taker_fallback`).
     pub dust_qty: Decimal,
+    /// bot-strategy#299: venue-side minimum order size. The taker
+    /// fallback gate uses `residual > venue_min_qty.max(dust_qty)`,
+    /// so a residual below this is treated as fully filled rather
+    /// than handed to `place_taker` only to be rejected with
+    /// "Order size N below min M" by the connector. 0 disables the
+    /// guard (back-compat for tests / non-Extended venues).
+    pub venue_min_qty: Decimal,
     /// Whether this is a reduce-only order (used by exit /
     /// emergency-flatten paths). Surfaces to `place_taker` so the
     /// venue rejects accidental position grows.
@@ -136,9 +143,14 @@ impl<'a, V: VenueOps + ?Sized> ExtendedMakerLoop<'a, V> {
         }
 
         // If chase didn't fill it all, decide whether to fall
-        // through to taker for the residual.
+        // through to taker for the residual. bot-strategy#299: also
+        // gate against the venue minimum order size — a residual
+        // smaller than `venue_min_qty` cannot be placed and would
+        // emit a noisy `place_taker err=Order size 0 below min` WARN
+        // for what is effectively a clean post_only fill.
         let residual = req.target_qty - total_filled;
-        if residual > req.dust_qty && self.cfg.taker_fallback {
+        let taker_min_threshold = req.venue_min_qty.max(req.dust_qty);
+        if residual > taker_min_threshold && self.cfg.taker_fallback {
             match self.run_taker_round(&req, residual).await {
                 Ok(taker_filled) => {
                     total_filled += taker_filled;
@@ -287,13 +299,58 @@ impl<'a, V: VenueOps + ?Sized> ExtendedMakerLoop<'a, V> {
             "[XVENUE/extmaker] taker placed side={:?} qty={} reduce_only={} order_id={}",
             req.side, residual, req.reduce_only, placed.order_id
         );
-        let outcome = self
+        let mut outcome = self
             .poll_until_terminal_or_deadline(req, &placed.order_id)
             .await;
         log::info!(
             "[XVENUE/extmaker] taker done filled={} cancelled={} order_id={}",
             outcome.filled_this_round, outcome.terminal_cancelled, placed.order_id
         );
+
+        // bot-strategy#298: WS-lag grace re-poll. The 2026-05-03
+        // EXIT-side timeouts (cases C/D in #298) all showed the
+        // taker landing on `filled=0 cancelled=false` — an IOC that
+        // neither filled nor terminal-cancelled within the chase
+        // deadline. That's the WS feed lagging the venue's actual
+        // result; one extra poll after a short grace lets a late
+        // fill surface as Filled rather than fall through to
+        // EmergencyFlattening on what was a clean fill. Runs before
+        // cancel so a fill that landed at the venue still gets
+        // recorded if the cancel races against it.
+        if outcome.filled_this_round.is_zero()
+            && !outcome.terminal_cancelled
+            && self.cfg.taker_grace_poll_ms > 0
+        {
+            tokio::time::sleep(Duration::from_millis(self.cfg.taker_grace_poll_ms)).await;
+            match self.ops.poll_fill_status(&req.symbol, &placed.order_id).await {
+                Ok(s) => {
+                    if s.filled_qty > Decimal::ZERO {
+                        log::info!(
+                            "[XVENUE/extmaker] taker grace-recovered \
+                             filled={} terminal={} cancelled={} order_id={}",
+                            s.filled_qty, s.terminal, s.cancelled, placed.order_id
+                        );
+                        outcome = RoundOutcome {
+                            filled_this_round: s.filled_qty,
+                            terminal_cancelled: s.cancelled,
+                        };
+                    } else {
+                        log::warn!(
+                            "[XVENUE/extmaker] taker grace-poll no-late-fill \
+                             terminal={} cancelled={} order_id={}",
+                            s.terminal, s.cancelled, placed.order_id
+                        );
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[XVENUE/extmaker] taker grace-poll err={:?} order_id={}",
+                        e, placed.order_id
+                    );
+                }
+            }
+        }
+
         let _ = self.ops.cancel(&req.symbol, &placed.order_id).await;
         if outcome.filled_this_round > Decimal::ZERO {
             Ok(outcome.filled_this_round)
@@ -336,6 +393,7 @@ mod tests {
             chase_timeout_ms: 500,
             taker_fallback: true,
             post_only: true,
+            taker_grace_poll_ms: 0,
         }
     }
 
@@ -346,6 +404,7 @@ mod tests {
             chase_timeout_ms: 500,
             taker_fallback: false,
             post_only: true,
+            taker_grace_poll_ms: 0,
         }
     }
 
@@ -355,6 +414,7 @@ mod tests {
             side: OrderSide::Long,
             target_qty: qty,
             dust_qty: dec!(0.0001),
+            venue_min_qty: Decimal::ZERO,
             reduce_only: false,
         }
     }
@@ -453,6 +513,7 @@ mod tests {
             chase_timeout_ms: 100,
             taker_fallback: true,
             post_only: true,
+            taker_grace_poll_ms: 0,
         };
         let lp = ExtendedMakerLoop::new(&ops, &cfg).with_poll_interval(20);
         let res = lp.run_entry(req_long(dec!(0.1))).await;
@@ -496,6 +557,7 @@ mod tests {
             chase_timeout_ms: 200,
             taker_fallback: true,
             post_only: true,
+            taker_grace_poll_ms: 0,
         };
         let lp = ExtendedMakerLoop::new(&ops, &cfg).with_poll_interval(20);
         let res = lp.run_entry(req_long(dec!(0.1))).await;
@@ -549,6 +611,7 @@ mod tests {
             chase_timeout_ms: 500,
             taker_fallback: true,
             post_only: false,
+            taker_grace_poll_ms: 0,
         };
         let lp = ExtendedMakerLoop::new(&ops, &cfg).with_poll_interval(10);
         let res = lp.run_entry(req_long(dec!(0.1))).await;
@@ -645,6 +708,7 @@ mod tests {
             chase_timeout_ms: 100,
             taker_fallback: false,
             post_only: true,
+            taker_grace_poll_ms: 0,
         };
         let lp = ExtendedMakerLoop::new(&ops, &cfg).with_poll_interval(20);
         let res = lp.run_entry(req_long(dec!(0.1))).await;
@@ -673,6 +737,7 @@ mod tests {
             chase_timeout_ms: 100,
             taker_fallback: true,
             post_only: false,
+            taker_grace_poll_ms: 0,
         };
         let lp = ExtendedMakerLoop::new(&ops, &cfg).with_poll_interval(10);
         let req = ExtendedEntryRequest {
@@ -685,6 +750,183 @@ mod tests {
         assert!(
             takers[0].3,
             "reduce_only flag must propagate to place_taker"
+        );
+    }
+
+    /// bot-strategy#299: when post_only fills `target_qty - small`
+    /// and the residual is below `venue_min_qty`, the taker fallback
+    /// must NOT be invoked — otherwise the connector rejects with
+    /// "Order size N below min M" and emits a noisy WARN. The aggregated
+    /// fill should still be reported as `Filled { qty: post_only_total }`.
+    #[tokio::test(start_paused = true)]
+    async fn taker_fallback_skipped_when_residual_below_venue_min() {
+        let ops = ScriptedVenueOps::new();
+        ops.with_state(|s| {
+            s.default_book = TopOfBook {
+                best_bid: dec!(2300),
+                best_ask: dec!(2301),
+            };
+            // Single chase round fills 0.021 of the 0.0216 target.
+            // residual = 0.0006 < venue_min_qty (0.01) → no taker.
+            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                filled_qty: dec!(0.021),
+                terminal: true,
+                cancelled: false,
+            }));
+        });
+        let cfg = ExtendedMakerConfig {
+            chase_ticks: 1,
+            chase_retries: 1,
+            chase_timeout_ms: 100,
+            taker_fallback: true,
+            post_only: true,
+            taker_grace_poll_ms: 0,
+        };
+        let lp = ExtendedMakerLoop::new(&ops, &cfg).with_poll_interval(20);
+        let req = ExtendedEntryRequest {
+            symbol: "ETH-USD".to_string(),
+            side: OrderSide::Long,
+            target_qty: dec!(0.0216),
+            dust_qty: dec!(0.00001),
+            venue_min_qty: dec!(0.01),
+            reduce_only: false,
+        };
+        let res = lp.run_entry(req).await;
+        assert_eq!(res, ExtendedTerminal::Filled { qty: dec!(0.021) });
+        assert!(
+            ops.snapshot_takers().is_empty(),
+            "taker must not be called when residual < venue_min_qty"
+        );
+    }
+
+    /// bot-strategy#299: with `venue_min_qty=0` (the default for
+    /// non-Extended venues / tests), the existing dust-only behavior
+    /// is preserved — a residual above dust still escalates to taker.
+    #[tokio::test(start_paused = true)]
+    async fn taker_fallback_invoked_when_venue_min_qty_disabled() {
+        let ops = ScriptedVenueOps::new();
+        ops.with_state(|s| {
+            s.default_book = TopOfBook {
+                best_bid: dec!(2300),
+                best_ask: dec!(2301),
+            };
+            // post_only round 0: 0.021 of 0.0216 (zero-fill cancelled
+            // would loop, so report terminal-filled with the partial).
+            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                filled_qty: dec!(0.021),
+                terminal: true,
+                cancelled: false,
+            }));
+            // Taker poll fills the 0.0006 residual.
+            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                filled_qty: dec!(0.0006),
+                terminal: true,
+                cancelled: false,
+            }));
+        });
+        let cfg = ExtendedMakerConfig {
+            chase_ticks: 1,
+            chase_retries: 1,
+            chase_timeout_ms: 100,
+            taker_fallback: true,
+            post_only: true,
+            taker_grace_poll_ms: 0,
+        };
+        let lp = ExtendedMakerLoop::new(&ops, &cfg).with_poll_interval(20);
+        // venue_min_qty=0 keeps the old behavior — residual > dust → taker.
+        let req = req_long(dec!(0.0216));
+        let res = lp.run_entry(req).await;
+        assert_eq!(res, ExtendedTerminal::Filled { qty: dec!(0.0216) });
+        assert_eq!(
+            ops.snapshot_takers().len(),
+            1,
+            "taker must be invoked when venue_min_qty is disabled"
+        );
+    }
+
+    /// bot-strategy#298: when the taker round reports
+    /// `filled=0 cancelled=false` (WS lag), and `taker_grace_poll_ms`
+    /// is configured, the executor re-polls once after the grace
+    /// window and accepts a fill that landed late.
+    #[tokio::test(start_paused = true)]
+    async fn taker_grace_poll_recovers_late_fill() {
+        let ops = ScriptedVenueOps::new();
+        ops.with_state(|s| {
+            s.default_book = TopOfBook {
+                best_bid: dec!(2300),
+                best_ask: dec!(2301),
+            };
+            // Maker stage skipped (post_only=false); straight to taker.
+            // First poll-loop reports filled=0 cancelled=false until
+            // the deadline (FillStatus with terminal=false stays open).
+            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                filled_qty: Decimal::ZERO,
+                terminal: false,
+                cancelled: false,
+            }));
+            // The grace re-poll sees the late fill.
+            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                filled_qty: dec!(0.021),
+                terminal: true,
+                cancelled: false,
+            }));
+        });
+        let cfg = ExtendedMakerConfig {
+            chase_ticks: 1,
+            chase_retries: 0,
+            chase_timeout_ms: 50,
+            taker_fallback: true,
+            post_only: false,
+            taker_grace_poll_ms: 200,
+        };
+        let lp = ExtendedMakerLoop::new(&ops, &cfg).with_poll_interval(10);
+        let res = lp.run_entry(req_long(dec!(0.021))).await;
+        assert_eq!(
+            res,
+            ExtendedTerminal::Filled { qty: dec!(0.021) },
+            "grace-poll should recover the late fill instead of returning Failed{{Timeout}}"
+        );
+    }
+
+    /// bot-strategy#298: when grace-poll is enabled but no fill ever
+    /// lands, the round still falls through to Timeout (no false
+    /// recovery).
+    #[tokio::test(start_paused = true)]
+    async fn taker_grace_poll_no_late_fill_still_times_out() {
+        let ops = ScriptedVenueOps::new();
+        ops.with_state(|s| {
+            s.default_book = TopOfBook {
+                best_bid: dec!(2300),
+                best_ask: dec!(2301),
+            };
+            // Initial taker poll: never terminal.
+            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                filled_qty: Decimal::ZERO,
+                terminal: false,
+                cancelled: false,
+            }));
+            // Grace re-poll: still no fill.
+            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                filled_qty: Decimal::ZERO,
+                terminal: false,
+                cancelled: false,
+            }));
+        });
+        let cfg = ExtendedMakerConfig {
+            chase_ticks: 1,
+            chase_retries: 0,
+            chase_timeout_ms: 50,
+            taker_fallback: true,
+            post_only: false,
+            taker_grace_poll_ms: 200,
+        };
+        let lp = ExtendedMakerLoop::new(&ops, &cfg).with_poll_interval(10);
+        let res = lp.run_entry(req_long(dec!(0.021))).await;
+        assert_eq!(
+            res,
+            ExtendedTerminal::Failed {
+                reason: ExecutionFailure::Timeout
+            }
         );
     }
 }

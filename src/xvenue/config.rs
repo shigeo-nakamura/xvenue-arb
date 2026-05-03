@@ -91,6 +91,23 @@ pub struct XvenueConfig {
     pub extended_chase_timeout_ms: u64,
     #[serde(default = "default_true")]
     pub extended_taker_fallback: bool,
+    /// bot-strategy#299: per-asset Extended venue minimum order
+    /// size. ETH = 0.01, BTC = 0.0001 (consult the live `MarketModel`
+    /// the connector caches). 0 (default) disables the guard so
+    /// dust_qty is the only floor. The taker fallback gate uses
+    /// `residual > extended_min_qty.max(dust_qty)` — a residual below
+    /// this is treated as fully filled rather than handed to the
+    /// connector only to be rejected with "Order size N below min M".
+    #[serde(default = "default_extended_min_qty")]
+    pub extended_min_qty: f64,
+    /// bot-strategy#298: WS-lag grace re-poll for late taker fills.
+    /// Default 0 keeps the previous behavior (Timeout immediately on
+    /// `filled=0 cancelled=false`). Production sets ~1000 ms so a
+    /// fill that landed at the venue but propagated through the
+    /// connector cache slightly past `chase_timeout_ms` is recovered
+    /// instead of falling through to EmergencyFlattening.
+    #[serde(default = "default_extended_taker_grace_poll_ms")]
+    pub extended_taker_grace_poll_ms: u64,
 
     // ---- Execution: Lighter ----
     /// "market" or "limit".
@@ -310,7 +327,16 @@ impl XvenueConfig {
             chase_timeout_ms: self.extended_chase_timeout_ms,
             taker_fallback: self.extended_taker_fallback,
             post_only: self.extended_post_only,
+            taker_grace_poll_ms: self.extended_taker_grace_poll_ms,
         }
+    }
+
+    /// bot-strategy#299: Extended venue min order size, surfaced as
+    /// `Decimal` for `LiveExecution.ext_min_qty`. f64 → Decimal goes
+    /// through the same retain path the rest of sizing uses.
+    pub fn ext_min_qty(&self) -> rust_decimal::Decimal {
+        rust_decimal::Decimal::from_f64_retain(self.extended_min_qty)
+            .unwrap_or(rust_decimal::Decimal::ZERO)
     }
 
     /// Knobs for [`crate::trade::execution::lighter_fill::LighterFillLoop`].
@@ -393,6 +419,12 @@ fn default_extended_chase_retries() -> u32 {
 }
 fn default_extended_chase_timeout_ms() -> u64 {
     500
+}
+fn default_extended_min_qty() -> f64 {
+    0.0
+}
+fn default_extended_taker_grace_poll_ms() -> u64 {
+    0
 }
 fn default_lighter_order_type() -> String {
     "market".to_string()

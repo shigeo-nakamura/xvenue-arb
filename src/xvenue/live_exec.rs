@@ -55,6 +55,12 @@ pub struct LiveExecution {
     /// Dust threshold passed into each executor cycle. The chase
     /// loop short-circuits on residuals below this.
     pub dust_qty: Decimal,
+    /// bot-strategy#299: Extended-side venue minimum order size.
+    /// Surfaces to `ExtendedEntryRequest.venue_min_qty` so the taker
+    /// fallback gate skips residuals the venue would silently reject
+    /// with `Order size N below min M`. ETH on Extended is 0.01;
+    /// BTC is smaller. 0 disables the guard (dust-only behavior).
+    pub ext_min_qty: Decimal,
     /// Reads each venue's open qty for the emergency-flatten round
     /// (#244 Sprint 4 step 3/3). Defaults to a [`NoopLegStateReader`]
     /// that surfaces an Err so the runner skips emergency rounds
@@ -79,6 +85,7 @@ impl LiveExecution {
             ext_symbol: cfg.symbol_ext.clone(),
             lt_symbol: cfg.symbol_lt.clone(),
             dust_qty: default_dust_qty(),
+            ext_min_qty: cfg.ext_min_qty(),
             leg_reader: Arc::new(NoopLegStateReader),
         };
         exec.validate()?;
@@ -128,6 +135,9 @@ impl LiveExecution {
             .map_err(|e| anyhow::anyhow!(e))?;
         if self.dust_qty <= Decimal::ZERO {
             anyhow::bail!("dust_qty must be > 0; got {}", self.dust_qty);
+        }
+        if self.ext_min_qty < Decimal::ZERO {
+            anyhow::bail!("ext_min_qty must be >= 0; got {}", self.ext_min_qty);
         }
         if self.ext_symbol.trim().is_empty() {
             anyhow::bail!("ext_symbol must be non-empty");

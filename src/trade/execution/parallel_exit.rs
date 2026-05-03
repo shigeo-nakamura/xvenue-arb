@@ -235,6 +235,7 @@ mod tests {
             chase_timeout_ms: 100,
             taker_fallback: true,
             post_only: true,
+            taker_grace_poll_ms: 0,
         }
     }
 
@@ -257,6 +258,7 @@ mod tests {
             side: OrderSide::Short,
             target_qty: qty,
             dust_qty: dec!(0.0001),
+            venue_min_qty: Decimal::ZERO,
             // Reduce-only on exit per DESIGN.md §4.2.
             reduce_only: true,
         }
@@ -342,6 +344,7 @@ mod tests {
             chase_timeout_ms: 2000,
             taker_fallback: false,
             post_only: true,
+            taker_grace_poll_ms: 0,
         };
         let lc = LighterFillConfig {
             order_type: LighterOrderType::Market,
@@ -384,6 +387,7 @@ mod tests {
             chase_timeout_ms: 100,
             taker_fallback: false,
             post_only: true,
+            taker_grace_poll_ms: 0,
         };
         let lc = LighterFillConfig {
             order_type: LighterOrderType::Market,
@@ -447,6 +451,7 @@ mod tests {
             chase_timeout_ms: 1000,
             taker_fallback: false,
             post_only: true,
+            taker_grace_poll_ms: 0,
         };
         let lc = LighterFillConfig {
             order_type: LighterOrderType::Market,
@@ -501,6 +506,7 @@ mod tests {
             chase_timeout_ms: 100,
             taker_fallback: true,
             post_only: false,
+            taker_grace_poll_ms: 0,
         };
         let lc = lt_cfg();
         let pc = parallel_cfg(3000);

@@ -102,6 +102,16 @@ pub struct ExtendedMakerConfig {
     /// and the executor goes straight to taker. Operator escape for
     /// urgent venue-down scenarios.
     pub post_only: bool,
+    /// bot-strategy#298: after a taker round terminates with
+    /// `filled=0 cancelled=false` (i.e. the venue's WS feed didn't
+    /// terminal the order within `chase_timeout_ms`), wait this many
+    /// ms and poll the order one more time before declaring Timeout.
+    /// Catches WS-lag fills that landed at the venue but propagated
+    /// through the connector cache slightly past the chase deadline,
+    /// avoiding a one-sided position → EmergencyFlattening on what
+    /// was actually a successful fill. 0 disables the grace poll.
+    /// `extended_taker_grace_poll_ms` in YAML.
+    pub taker_grace_poll_ms: u64,
 }
 
 impl ExtendedMakerConfig {
@@ -212,6 +222,7 @@ mod tests {
             chase_timeout_ms: 0,
             taker_fallback: true,
             post_only: true,
+            taker_grace_poll_ms: 0,
         };
         assert!(cfg.validate().is_err());
     }
@@ -224,6 +235,7 @@ mod tests {
             chase_timeout_ms: 500,
             taker_fallback: false,
             post_only: true,
+            taker_grace_poll_ms: 0,
         };
         assert!(cfg.validate().is_err());
     }
@@ -237,6 +249,7 @@ mod tests {
             chase_timeout_ms: 500,
             taker_fallback: true,
             post_only: false,
+            taker_grace_poll_ms: 0,
         };
         assert!(cfg.validate().is_ok());
     }
