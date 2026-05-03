@@ -474,53 +474,20 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                 // EmergencyComplete inline in the WS-stale / skew
                 // handlers. Throttled inside the helper, so calling
                 // every tick is fine.
-                if let Some(live) = live_exec.as_deref() {
-                    if !cfg.dry_run
-                        && matches!(machine.phase(), super::state::Phase::EmergencyFlattening)
-                    {
-                        let prev_emergency_completes = summary.emergency_completes;
-                        if let Err(e) = drive_emergency_flatten_round(
-                            live,
-                            &mut machine,
-                            &mut open_qty,
-                            &mut stuck,
-                            &mut summary,
-                            &mut last_emergency_attempt_ms,
-                            &mut emergency_attempts,
-                            &mut first_emergency_zero_ms,
-                            wall_clock_ms(),
-                        )
-                        .await
-                        {
-                            log::warn!("[XVENUE] emergency-flatten round error: {:?}", e);
-                        }
-                        // bot-strategy#288 Action B/C: when EmergencyComplete
-                        // just fired we owe the round-trip a record_close so
-                        // daily_risk.daily_pnl and trade_stats reflect it.
-                        // Sprint 5's happy-path record_close lives in the
-                        // Decision::Exit Both{Filled,Filled} consume which
-                        // never runs on the emergency-recovered route. Use
-                        // 0.0 as placeholder PnL — the real cost shows up in
-                        // the equity-based pnl_today; an exact figure here
-                        // would need entry-mid + exit-fill prices from the
-                        // venue side.
-                        if summary.emergency_completes > prev_emergency_completes {
-                            if let Some(r) = reporter.as_mut() {
-                                r.record_close(0.0);
-                            }
-                            risk_manager.record_close(0.0, now_unix_secs());
-                            log::info!(
-                                "[XVENUE/emerg] record_close fired with placeholder pnl=0.0 (real cost via equity-based pnl_today)"
-                            );
-                        }
-                    } else {
-                        // Reset throttle state so the *next* entry
-                        // into EmergencyFlattening starts fresh.
-                        last_emergency_attempt_ms = None;
-                        emergency_attempts = 0;
-                        first_emergency_zero_ms = None;
-                    }
-                }
+                handle_emergency_flatten_tick(
+                    &cfg,
+                    live_exec.as_deref(),
+                    &mut machine,
+                    &mut open_qty,
+                    &mut stuck,
+                    &mut summary,
+                    &mut last_emergency_attempt_ms,
+                    &mut emergency_attempts,
+                    &mut first_emergency_zero_ms,
+                    reporter.as_mut(),
+                    &mut risk_manager,
+                )
+                .await;
 
                 // Drop a stale live_entry_ctx whenever the position
                 // machine has returned to Flat without a corresponding
@@ -534,40 +501,14 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
             }
 
             _ = status_ivl.tick() => {
-                let ws_age = ws_health.ws_age(wall_clock_ms());
-                log::info!(
-                    "[STATUS] ticks={} samples={} hold={} enter_l={} enter_s={} exit={} \
-                     ks_blocked={} stuck_blocked={} dd_blocked={} sd_blocked={} cb_blocked={} \
-                     ws_blocked={} ws_emerg={} skew_emerg={} ws_age_ext={:?} ws_age_lt={:?} \
-                     ref_supp_ext={} ref_supp_lt={} dev_bps={:?}",
-                    summary.ticks,
-                    summary.samples_committed,
-                    summary.decisions_hold,
-                    summary.decisions_enter_long,
-                    summary.decisions_enter_short,
-                    summary.decisions_exit,
-                    summary.entries_blocked_by_kill_switch,
-                    summary.entries_blocked_by_stuck_file,
-                    summary.entries_blocked_by_daily_dd,
-                    summary.entries_blocked_by_session_dd,
-                    summary.entries_blocked_by_circuit_breaker,
-                    summary.entries_blocked_by_ws_stale,
-                    summary.ws_stale_emergencies_emitted,
-                    summary.skew_emergencies_emitted,
-                    ws_age.ext_age_ms,
-                    ws_age.lt_age_ms,
-                    summary.ext_book_suppressed_by_ref_guard,
-                    summary.lt_book_suppressed_by_ref_guard,
-                    summary.last_dev_bps,
-                );
-                if let Some(r) = reporter.as_mut() {
-                    refresh_equity(&*hub, r, &mut risk_manager).await;
-                    publish_risk(&risk_manager, r);
-                    let now_ts_ms = wall_clock_ms();
-                    if let Err(e) = r.write_snapshot_if_due(&machine, now_ts_ms) {
-                        log::warn!("[STATUS] snapshot write failed: {:?}", e);
-                    }
-                }
+                report_status_tick(
+                    &*hub,
+                    &summary,
+                    &ws_health,
+                    &machine,
+                    &mut risk_manager,
+                    reporter.as_mut(),
+                ).await;
             }
         }
     }
@@ -633,6 +574,123 @@ fn publish_risk(risk_manager: &RiskManager, reporter: &mut StatusReporter) {
         risk_manager.circuit_breaker_snapshot(now_unix_secs()),
     ));
     reporter.set_risk_history(risk_manager.risk_history());
+}
+
+/// Live-mode emergency-flatten round driver invoked from the tick arm
+/// of `run_paper_loop`. Behaviour-preserving wrapper around
+/// `drive_emergency_flatten_round` that also (a) resets the throttle
+/// state when the position machine is *not* in EmergencyFlattening, and
+/// (b) fires the bot-strategy#288 Action B/C `record_close` placeholder
+/// when an EmergencyComplete just landed. Skips entirely when
+/// `live_exec` is None (paper-mode loops have no orders to flatten).
+#[allow(clippy::too_many_arguments)]
+async fn handle_emergency_flatten_tick(
+    cfg: &XvenueConfig,
+    live_exec: Option<&LiveExecution>,
+    machine: &mut PositionMachine,
+    open_qty: &mut Option<Decimal>,
+    stuck: &mut StuckTripwire,
+    summary: &mut LivePaperSummary,
+    last_emergency_attempt_ms: &mut Option<u64>,
+    emergency_attempts: &mut u32,
+    first_emergency_zero_ms: &mut Option<u64>,
+    reporter: Option<&mut StatusReporter>,
+    risk_manager: &mut RiskManager,
+) {
+    let Some(live) = live_exec else {
+        return;
+    };
+    if cfg.dry_run || !matches!(machine.phase(), super::state::Phase::EmergencyFlattening) {
+        // Reset throttle state so the *next* entry into
+        // EmergencyFlattening starts fresh.
+        *last_emergency_attempt_ms = None;
+        *emergency_attempts = 0;
+        *first_emergency_zero_ms = None;
+        return;
+    }
+
+    let prev_emergency_completes = summary.emergency_completes;
+    if let Err(e) = drive_emergency_flatten_round(
+        live,
+        machine,
+        open_qty,
+        stuck,
+        summary,
+        last_emergency_attempt_ms,
+        emergency_attempts,
+        first_emergency_zero_ms,
+        wall_clock_ms(),
+    )
+    .await
+    {
+        log::warn!("[XVENUE] emergency-flatten round error: {:?}", e);
+    }
+    // bot-strategy#288 Action B/C: when EmergencyComplete just fired we
+    // owe the round-trip a record_close so daily_risk.daily_pnl and
+    // trade_stats reflect it. Sprint 5's happy-path record_close lives
+    // in the Decision::Exit Both{Filled,Filled} consume which never
+    // runs on the emergency-recovered route. Use 0.0 as placeholder PnL
+    // — the real cost shows up in the equity-based pnl_today; an exact
+    // figure here would need entry-mid + exit-fill prices from the
+    // venue side.
+    if summary.emergency_completes > prev_emergency_completes {
+        if let Some(r) = reporter {
+            r.record_close(0.0);
+        }
+        risk_manager.record_close(0.0, now_unix_secs());
+        log::info!(
+            "[XVENUE/emerg] record_close fired with placeholder pnl=0.0 (real cost via equity-based pnl_today)"
+        );
+    }
+}
+
+/// Periodic [STATUS] log + dashboard snapshot write fired by the
+/// `status_ivl` arm in `run_paper_loop`. Pulled out so the loop body
+/// reads as a state machine rather than a paragraph of formatting.
+/// Behaviour-preserving: identical log line, identical equity refresh /
+/// risk publish / snapshot-write order.
+async fn report_status_tick<H: VenueHub + ?Sized>(
+    hub: &H,
+    summary: &LivePaperSummary,
+    ws_health: &WsHealthMonitor,
+    machine: &PositionMachine,
+    risk_manager: &mut RiskManager,
+    reporter: Option<&mut StatusReporter>,
+) {
+    let ws_age = ws_health.ws_age(wall_clock_ms());
+    log::info!(
+        "[STATUS] ticks={} samples={} hold={} enter_l={} enter_s={} exit={} \
+         ks_blocked={} stuck_blocked={} dd_blocked={} sd_blocked={} cb_blocked={} \
+         ws_blocked={} ws_emerg={} skew_emerg={} ws_age_ext={:?} ws_age_lt={:?} \
+         ref_supp_ext={} ref_supp_lt={} dev_bps={:?}",
+        summary.ticks,
+        summary.samples_committed,
+        summary.decisions_hold,
+        summary.decisions_enter_long,
+        summary.decisions_enter_short,
+        summary.decisions_exit,
+        summary.entries_blocked_by_kill_switch,
+        summary.entries_blocked_by_stuck_file,
+        summary.entries_blocked_by_daily_dd,
+        summary.entries_blocked_by_session_dd,
+        summary.entries_blocked_by_circuit_breaker,
+        summary.entries_blocked_by_ws_stale,
+        summary.ws_stale_emergencies_emitted,
+        summary.skew_emergencies_emitted,
+        ws_age.ext_age_ms,
+        ws_age.lt_age_ms,
+        summary.ext_book_suppressed_by_ref_guard,
+        summary.lt_book_suppressed_by_ref_guard,
+        summary.last_dev_bps,
+    );
+    if let Some(r) = reporter {
+        refresh_equity(hub, r, risk_manager).await;
+        publish_risk(risk_manager, r);
+        let now_ts_ms = wall_clock_ms();
+        if let Err(e) = r.write_snapshot_if_due(machine, now_ts_ms) {
+            log::warn!("[STATUS] snapshot write failed: {:?}", e);
+        }
+    }
 }
 
 async fn run_one_tick<H: VenueHub + ?Sized>(
