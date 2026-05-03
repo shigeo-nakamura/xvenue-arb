@@ -660,6 +660,104 @@ fn handle_ws_stale_emergency(
     true
 }
 
+/// Apply the four short-circuit gates that can downgrade a
+/// `Decision::Enter` to `Decision::Hold` before it reaches the state
+/// machine: KILL_SWITCH (#244 D-1), STUCK file (#244 C / #102 P2),
+/// phase gate (signal can re-emit Enter while the machine is in
+/// EnteringX / Exiting / EmergencyFlattening; the resulting
+/// EntrySignal would be rejected and panic), and risk gates (#244
+/// D-2..D-7: daily DD / session DD / circuit breaker).
+///
+/// Order is meaningful and preserved from the original inline form:
+/// KILL_SWITCH first so an operator pause doesn't burn a risk-gate
+/// counter, then STUCK, then phase, then risk. Each gate increments
+/// its own `summary.entries_blocked_by_*` counter on a block.
+///
+/// Behaviour-preserving: log lines, counter increments, and the
+/// short-circuit chain are byte-identical to the prior 4-block form.
+fn apply_entry_gates(
+    cfg: &XvenueConfig,
+    decision: &mut Decision,
+    risk_manager: &RiskManager,
+    stuck: &StuckTripwire,
+    machine: &PositionMachine,
+    summary: &mut LivePaperSummary,
+    dev: Option<f64>,
+) {
+    // External KILL_SWITCH gate (bot-strategy#244 D-1). Pairtrade-
+    // symmetric: when /opt/debot/KILL_SWITCH exists, refuse new
+    // entries; held positions still exit normally. We gate at the
+    // live-loop level rather than the SignalEngine so the strategy
+    // logic stays free of file-IO concerns.
+    if matches!(decision, Decision::Enter(_)) && kill_switch_active(&cfg.kill_switch_file) {
+        log::warn!(
+            "[XVENUE] KILL_SWITCH active ({}); blocking new entry. \
+             Existing positions exit normally; remove the file to resume.",
+            cfg.kill_switch_file
+        );
+        summary.entries_blocked_by_kill_switch += 1;
+        *decision = Decision::Hold;
+    }
+
+    // STUCK file (#244 C / #102 P2). Runner-written tripwire from
+    // sustained REST failures, reduce-only failures, or SIGUSR1.
+    // Distinct from KILL_SWITCH: STUCK is "something is very wrong"
+    // and requires manual `rm` to clear; KILL_SWITCH is just a
+    // vacation pause that auto-clears on file removal.
+    if matches!(decision, Decision::Enter(_)) && stuck.is_stuck() {
+        log::warn!(
+            "[XVENUE] STUCK file present ({}); blocking new entry. \
+             Operator must inspect and `rm` to resume.",
+            stuck.stuck_file_path().display()
+        );
+        summary.entries_blocked_by_stuck_file += 1;
+        *decision = Decision::Hold;
+    }
+
+    // Phase gate: signal.decide() only sees a position via
+    // `machine.summary()`, which is `Some` only in `Phase::Held`.
+    // During EnteringExtended / EnteringLighter / Exiting /
+    // EmergencyFlattening the strategy can re-emit Enter and the
+    // state machine would reject the resulting EntrySignal. Down-
+    // grade to Hold so a multi-tick failure mode (e.g. Lighter
+    // failed-after-Extended landing in EmergencyFlattening) doesn't
+    // panic the runner on the next tick's Decision::Enter.
+    if matches!(decision, Decision::Enter(_))
+        && !matches!(machine.phase(), super::state::Phase::Flat)
+    {
+        log::debug!(
+            "[XVENUE] Decision::Enter suppressed: phase={:?} (not Flat)",
+            machine.phase(),
+        );
+        *decision = Decision::Hold;
+    }
+
+    // Risk gates (#244 D-2..D-7). KILL_SWITCH ran first so the
+    // operator-pause path doesn't burn a risk-gate counter; risk
+    // gates fire only if the bot is otherwise willing to enter.
+    if matches!(decision, Decision::Enter(_)) {
+        if let Some(reason) = risk_manager.block_reason(now_unix_secs()) {
+            log::warn!(
+                "[XVENUE] risk gate {:?} blocking new entry. dev_bps={:?}",
+                reason,
+                dev
+            );
+            match reason {
+                BlockReason::DailyDdHalted => {
+                    summary.entries_blocked_by_daily_dd += 1;
+                }
+                BlockReason::SessionDdHalted => {
+                    summary.entries_blocked_by_session_dd += 1;
+                }
+                BlockReason::CircuitBreakerCooldown => {
+                    summary.entries_blocked_by_circuit_breaker += 1;
+                }
+            }
+            *decision = Decision::Hold;
+        }
+    }
+}
+
 /// S5-3 forced flatten on session DD (#268). Runs *before* signal.decide
 /// so a HALTed position routes to `EmergencyFlattening` rather than
 /// letting the strategy decide a natural exit (which could chase for
@@ -1118,78 +1216,15 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
 
     let mut decision = signal.decide(now_ts_ms, dev, is_warm, position);
 
-    // External KILL_SWITCH gate (bot-strategy#244 D-1). Pairtrade-
-    // symmetric: when /opt/debot/KILL_SWITCH exists, refuse new
-    // entries; held positions still exit normally. We gate at the
-    // live-loop level rather than the SignalEngine so the strategy
-    // logic stays free of file-IO concerns.
-    if matches!(decision, Decision::Enter(_)) && kill_switch_active(&cfg.kill_switch_file) {
-        log::warn!(
-            "[XVENUE] KILL_SWITCH active ({}); blocking new entry. \
-             Existing positions exit normally; remove the file to resume.",
-            cfg.kill_switch_file
-        );
-        summary.entries_blocked_by_kill_switch += 1;
-        decision = Decision::Hold;
-    }
-
-    // STUCK file (#244 C / #102 P2). Runner-written tripwire from
-    // sustained REST failures, reduce-only failures, or SIGUSR1.
-    // Distinct from KILL_SWITCH: STUCK is "something is very wrong"
-    // and requires manual `rm` to clear; KILL_SWITCH is just a
-    // vacation pause that auto-clears on file removal.
-    if matches!(decision, Decision::Enter(_)) && stuck.is_stuck() {
-        log::warn!(
-            "[XVENUE] STUCK file present ({}); blocking new entry. \
-             Operator must inspect and `rm` to resume.",
-            stuck.stuck_file_path().display()
-        );
-        summary.entries_blocked_by_stuck_file += 1;
-        decision = Decision::Hold;
-    }
-
-    // Phase gate: signal.decide() only sees a position via
-    // `machine.summary()`, which is `Some` only in `Phase::Held`.
-    // During EnteringExtended / EnteringLighter / Exiting /
-    // EmergencyFlattening the strategy can re-emit Enter and the
-    // state machine would reject the resulting EntrySignal. Down-
-    // grade to Hold so a multi-tick failure mode (e.g. Lighter
-    // failed-after-Extended landing in EmergencyFlattening) doesn't
-    // panic the runner on the next tick's Decision::Enter.
-    if matches!(decision, Decision::Enter(_))
-        && !matches!(super::state::PositionMachine::phase(machine), super::state::Phase::Flat)
-    {
-        log::debug!(
-            "[XVENUE] Decision::Enter suppressed: phase={:?} (not Flat)",
-            super::state::PositionMachine::phase(machine),
-        );
-        decision = Decision::Hold;
-    }
-
-    // Risk gates (#244 D-2..D-7). KILL_SWITCH ran first so the
-    // operator-pause path doesn't burn a risk-gate counter; risk
-    // gates fire only if the bot is otherwise willing to enter.
-    if matches!(decision, Decision::Enter(_)) {
-        if let Some(reason) = risk_manager.block_reason(now_unix_secs()) {
-            log::warn!(
-                "[XVENUE] risk gate {:?} blocking new entry. dev_bps={:?}",
-                reason,
-                dev
-            );
-            match reason {
-                BlockReason::DailyDdHalted => {
-                    summary.entries_blocked_by_daily_dd += 1;
-                }
-                BlockReason::SessionDdHalted => {
-                    summary.entries_blocked_by_session_dd += 1;
-                }
-                BlockReason::CircuitBreakerCooldown => {
-                    summary.entries_blocked_by_circuit_breaker += 1;
-                }
-            }
-            decision = Decision::Hold;
-        }
-    }
+    apply_entry_gates(
+        cfg,
+        &mut decision,
+        risk_manager,
+        stuck,
+        machine,
+        summary,
+        dev,
+    );
 
     match decision {
         Decision::Hold => {
