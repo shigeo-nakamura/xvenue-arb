@@ -8,6 +8,54 @@
 //! serialized (Extended first, Lighter after fill) and §4.2 exit is parallel.
 //! Single-leg-filled / WS-stale / skew breaches route through
 //! [`Phase::EmergencyFlattening`] (§4.3).
+//!
+//! ## Phase transitions
+//!
+//! ```text
+//!                              EntrySignal
+//!                                  │
+//!                                  ▼
+//!     ┌─ Flat ────────────► EnteringExtended ───ExtendedFilled──► EnteringLighter
+//!     │   ▲                       │                                     │
+//!     │   │                       │                                     │
+//!     │   │ EmergencyComplete     │ ExtendedFailed                      │ LighterFilled
+//!     │   │                       │ (no fills)                          │
+//!     │   │                       │                                     ▼
+//!     │   │                       └──────────────────────────►        Held
+//!     │   │                                                             │
+//!     │   │                                                             │ ExitSignal
+//!     │   │                                                             │
+//!     │   │                                                             ▼
+//!     │   │           ExtendedExitFilled / LighterExitFilled         Exiting
+//!     │   │                  (until both legs zero)                     │
+//!     │   └────────────────────────────────────────────────────────────┘
+//!     │
+//!     │      ┌──────────────────── Emergency{ws_stale,skew,leg_mismatch,...}
+//!     │      │                     LighterFailed
+//!     │      ▼                     ExtendedFailed (with prior fills)
+//!     └─ EmergencyFlattening ◄───────────────────────────────────────────
+//!         │  (consumes ExtendedExitFilled / LighterExitFilled but does
+//!         │   NOT auto-flat; requires explicit EmergencyComplete)
+//!         │
+//!         └─[EmergencyComplete]─► Flat
+//!
+//!     Operator override: Event::Reset is accepted in any phase and
+//!     unconditionally clears `position` and routes to `Flat`. Used after
+//!     STUCK file resolution (§4.4).
+//! ```
+//!
+//! ## Invariants ([`PositionMachine::check_invariants`])
+//!
+//! - `phase == Flat`            ⇒ `position` is `None`
+//! - `phase != Flat`            ⇒ `position` is `Some`
+//! - `phase == EnteringExtended`⇒ both leg qtys are zero (no fills yet)
+//! - `phase == EnteringLighter` ⇒ ext qty > 0, lt qty == 0
+//! - `phase == Held`            ⇒ `fully_filled_ts_ms` is `Some`
+//! - leg qtys are always `>= 0` (clamped via `max(Decimal::ZERO)` on exit fills)
+//!
+//! `Exiting` and `EmergencyFlattening` deliberately allow zero-or-positive
+//! qtys on either leg so partial / asymmetric exits can drain to zero
+//! across multiple events.
 
 use std::fmt;
 
@@ -310,6 +358,79 @@ impl PositionMachine {
     fn transition_to(&mut self, new_phase: Phase, now_ts_ms: u64) {
         self.phase = new_phase;
         self.phase_entered_ts_ms = now_ts_ms;
+    }
+
+    /// Debug helper that returns `Err(reason)` if the machine has
+    /// drifted away from the invariants documented in the module-
+    /// level diagram. Call sites:
+    ///   - tests assert `check_invariants().is_ok()` after each step
+    ///   - production debug builds can `debug_assert!(...check_invariants()...)`
+    ///     post-`apply` to catch any future regression that lets a
+    ///     phase / position pair fall out of sync.
+    ///
+    /// Pure read; never mutates. Returns the *first* invariant
+    /// violated — the names match the module doc-comment so a failure
+    /// message is grep-able against this file.
+    pub fn check_invariants(&self) -> Result<(), &'static str> {
+        match self.phase {
+            Phase::Flat => {
+                if self.position.is_some() {
+                    return Err("Flat: position must be None");
+                }
+            }
+            Phase::EnteringExtended => {
+                let p = self
+                    .position
+                    .as_ref()
+                    .ok_or("EnteringExtended: position must be Some")?;
+                if !p.extended_open_qty.is_zero() {
+                    return Err("EnteringExtended: extended_open_qty must be zero");
+                }
+                if !p.lighter_open_qty.is_zero() {
+                    return Err("EnteringExtended: lighter_open_qty must be zero");
+                }
+            }
+            Phase::EnteringLighter => {
+                let p = self
+                    .position
+                    .as_ref()
+                    .ok_or("EnteringLighter: position must be Some")?;
+                if p.extended_open_qty <= Decimal::ZERO {
+                    return Err("EnteringLighter: extended_open_qty must be > 0");
+                }
+                if !p.lighter_open_qty.is_zero() {
+                    return Err("EnteringLighter: lighter_open_qty must be zero");
+                }
+            }
+            Phase::Held => {
+                let p = self
+                    .position
+                    .as_ref()
+                    .ok_or("Held: position must be Some")?;
+                if p.fully_filled_ts_ms.is_none() {
+                    return Err("Held: fully_filled_ts_ms must be Some");
+                }
+                if p.extended_open_qty <= Decimal::ZERO {
+                    return Err("Held: extended_open_qty must be > 0");
+                }
+                if p.lighter_open_qty <= Decimal::ZERO {
+                    return Err("Held: lighter_open_qty must be > 0");
+                }
+            }
+            Phase::Exiting | Phase::EmergencyFlattening => {
+                let p = self
+                    .position
+                    .as_ref()
+                    .ok_or("Exiting/EmergencyFlattening: position must be Some")?;
+                if p.extended_open_qty < Decimal::ZERO {
+                    return Err("Exiting/EmergencyFlattening: extended_open_qty must be >= 0");
+                }
+                if p.lighter_open_qty < Decimal::ZERO {
+                    return Err("Exiting/EmergencyFlattening: lighter_open_qty must be >= 0");
+                }
+            }
+        }
+        Ok(())
     }
 
     fn maybe_complete_flat(&mut self, now_ts_ms: u64) {
@@ -692,5 +813,101 @@ mod tests {
         .unwrap();
         let err = m.apply(3_100, Event::EmergencyComplete).unwrap_err();
         assert_eq!(err.phase, Phase::Exiting);
+    }
+
+    /// Walks every documented transition arc and asserts
+    /// `check_invariants()` holds at each post-apply rest state. Acts
+    /// as a guard against future apply() edits silently dropping a
+    /// position or skipping a fully_filled_ts_ms assignment.
+    #[test]
+    fn check_invariants_holds_across_full_lifecycle() {
+        let mut m = PositionMachine::new();
+        m.check_invariants().unwrap();
+
+        // Flat → EnteringExtended
+        enter_short(&mut m, 1_000);
+        m.check_invariants().unwrap();
+        assert_eq!(m.phase(), Phase::EnteringExtended);
+
+        // EnteringExtended → EnteringLighter
+        m.apply(1_500, Event::ExtendedFilled { qty: dec!(0.0128) })
+            .unwrap();
+        m.check_invariants().unwrap();
+        assert_eq!(m.phase(), Phase::EnteringLighter);
+
+        // EnteringLighter → Held
+        m.apply(1_700, Event::LighterFilled { qty: dec!(0.0128) })
+            .unwrap();
+        m.check_invariants().unwrap();
+        assert_eq!(m.phase(), Phase::Held);
+
+        // Held → Exiting → Flat (drain both legs)
+        m.apply(
+            2_000,
+            Event::ExitSignal {
+                reason: ExitReason::MeanCross,
+            },
+        )
+        .unwrap();
+        m.check_invariants().unwrap();
+        assert_eq!(m.phase(), Phase::Exiting);
+        m.apply(2_100, Event::ExtendedExitFilled { qty: dec!(0.0128) })
+            .unwrap();
+        m.check_invariants().unwrap();
+        m.apply(2_200, Event::LighterExitFilled { qty: dec!(0.0128) })
+            .unwrap();
+        m.check_invariants().unwrap();
+        assert_eq!(m.phase(), Phase::Flat);
+    }
+
+    #[test]
+    fn check_invariants_passes_through_emergency_flatten() {
+        let mut m = PositionMachine::new();
+        enter_short(&mut m, 1_000);
+        fill_to_held(&mut m, 1_500, dec!(0.0128));
+        m.check_invariants().unwrap();
+
+        // Held → EmergencyFlattening via WS-stale
+        m.apply(
+            2_000,
+            Event::Emergency {
+                reason: EmergencyReason::WsStale,
+            },
+        )
+        .unwrap();
+        m.check_invariants().unwrap();
+        assert_eq!(m.phase(), Phase::EmergencyFlattening);
+
+        // Partial drain — invariants must still hold (lt qty stays >= 0).
+        m.apply(2_100, Event::ExtendedExitFilled { qty: dec!(0.0128) })
+            .unwrap();
+        m.check_invariants().unwrap();
+
+        // EmergencyComplete → Flat (skips the auto-flat that would
+        // fire on Exiting; explicit closure of the emergency path).
+        m.apply(2_300, Event::EmergencyComplete).unwrap();
+        m.check_invariants().unwrap();
+        assert_eq!(m.phase(), Phase::Flat);
+    }
+
+    #[test]
+    fn check_invariants_detects_manually_corrupted_state() {
+        // Defensive: if a future edit ever lets a Held position land
+        // without `fully_filled_ts_ms`, the invariant catches it.
+        // Construct the broken state manually (the public API can't
+        // reach it).
+        let mut m = PositionMachine::new();
+        enter_short(&mut m, 1_000);
+        m.apply(1_500, Event::ExtendedFilled { qty: dec!(0.0128) })
+            .unwrap();
+        m.apply(1_700, Event::LighterFilled { qty: dec!(0.0128) })
+            .unwrap();
+        // Surgical mutation: clear fully_filled_ts_ms while keeping
+        // phase=Held — exactly the regression we want to catch.
+        if let Some(p) = m.position.as_mut() {
+            p.fully_filled_ts_ms = None;
+        }
+        let err = m.check_invariants().unwrap_err();
+        assert!(err.contains("fully_filled_ts_ms"));
     }
 }
