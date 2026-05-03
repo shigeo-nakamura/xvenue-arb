@@ -117,7 +117,12 @@ async fn build_lighter(symbol: &str, dry_run: bool) -> anyhow::Result<Arc<dyn De
         base_url: lighter_config.base_url,
         websocket_url: lighter_config.websocket_url,
         tracked_symbols: vec![symbol.to_string()],
-        ob_stale_secs: None,
+        // Sole freshness gate for `read_mid` → `get_order_book` (no REST
+        // fallback exists for that path; cf. pairtrade's `get_ticker`
+        // which has a 30s gate + REST fallback). Set explicitly so the
+        // dependency on `DEFAULT_ORDERBOOK_STALE_SECS` is locally
+        // visible. See bot-strategy#303.
+        ob_stale_secs: Some(15),
     };
 
     let connector: Arc<dyn DexConnector> = if dry_run {

@@ -221,6 +221,13 @@ pub struct LivePaperSummary {
     /// completes; failed-exit / leg-mismatch cycles record `None`
     /// rather than overwriting with zero.
     pub last_realised_pnl_usd: Option<f64>,
+    /// Per-venue cumulative count of post-warmup `read_mid` errors
+    /// (bot-strategy#303). Each increment corresponds to one
+    /// `[XVENUE] tick error: read_mid {Venue}` WARN line. Pre-warmup
+    /// errors are debug-demoted and do not count. Surfaced in
+    /// `[STATUS]` so recurrence is visible without grepping logs.
+    pub read_mid_err_ext: u64,
+    pub read_mid_err_lt: u64,
 }
 
 /// Snapshot of an open live position needed to compute realised PnL
@@ -947,6 +954,7 @@ fn handle_skew_breach_emergency(
 async fn read_both_mids<H: VenueHub + ?Sized>(
     hub: &H,
     warmup: &mut VenueWarmup,
+    summary: &mut LivePaperSummary,
 ) -> Result<Option<(MidSnapshot, MidSnapshot)>> {
     let ext_snap = match hub.read_mid(Venue::Extended).await {
         Ok(s) => {
@@ -957,7 +965,10 @@ async fn read_both_mids<H: VenueHub + ?Sized>(
             log::debug!("[XVENUE] read_mid Extended pending (WS warm-up): {:?}", e);
             return Ok(None);
         }
-        Err(e) => return Err(e).context("read_mid Extended"),
+        Err(e) => {
+            summary.read_mid_err_ext += 1;
+            return Err(e).context("read_mid Extended");
+        }
     };
     let lt_snap = match hub.read_mid(Venue::Lighter).await {
         Ok(s) => {
@@ -968,7 +979,10 @@ async fn read_both_mids<H: VenueHub + ?Sized>(
             log::debug!("[XVENUE] read_mid Lighter pending (WS warm-up): {:?}", e);
             return Ok(None);
         }
-        Err(e) => return Err(e).context("read_mid Lighter"),
+        Err(e) => {
+            summary.read_mid_err_lt += 1;
+            return Err(e).context("read_mid Lighter");
+        }
     };
     Ok(Some((ext_snap, lt_snap)))
 }
@@ -1059,7 +1073,8 @@ async fn report_status_tick<H: VenueHub + ?Sized>(
         "[STATUS] ticks={} samples={} hold={} enter_l={} enter_s={} exit={} \
          ks_blocked={} stuck_blocked={} dd_blocked={} sd_blocked={} cb_blocked={} \
          ws_blocked={} ws_emerg={} skew_emerg={} ws_age_ext={:?} ws_age_lt={:?} \
-         ref_supp_ext={} ref_supp_lt={} dev_bps={:?}",
+         ref_supp_ext={} ref_supp_lt={} read_mid_err_ext={} read_mid_err_lt={} \
+         dev_bps={:?}",
         summary.ticks,
         summary.samples_committed,
         summary.decisions_hold,
@@ -1078,6 +1093,8 @@ async fn report_status_tick<H: VenueHub + ?Sized>(
         ws_age.lt_age_ms,
         summary.ext_book_suppressed_by_ref_guard,
         summary.lt_book_suppressed_by_ref_guard,
+        summary.read_mid_err_ext,
+        summary.read_mid_err_lt,
         summary.last_dev_bps,
     );
     if let Some(r) = reporter {
@@ -1111,7 +1128,7 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
     // Drain any pending SIGUSR1 — arms the STUCK file if needed.
     let _ = stuck.poll_sigusr1();
 
-    let Some((mut ext_snap, mut lt_snap)) = read_both_mids(hub, warmup).await? else {
+    let Some((mut ext_snap, mut lt_snap)) = read_both_mids(hub, warmup, summary).await? else {
         return Ok(());
     };
 
@@ -2711,6 +2728,86 @@ max_hold_sec: 60
             chain.contains("read_mid Extended"),
             "expected context-wrapped error, got: {chain}"
         );
+        // bot-strategy#303: Extended fails first, short-circuiting
+        // before the Lighter read — only the Extended counter advances.
+        assert_eq!(summary.read_mid_err_ext, 1);
+        assert_eq!(summary.read_mid_err_lt, 0);
+    }
+
+    #[tokio::test]
+    async fn read_mid_err_lt_counter_increments_when_only_lighter_fails() {
+        // bot-strategy#303: when Extended succeeds but Lighter fails
+        // post-warmup, only the Lighter counter should advance.
+        struct LighterFailHub {
+            ext_mid: Decimal,
+        }
+        #[async_trait::async_trait]
+        impl VenueHub for LighterFailHub {
+            async fn read_mid(&self, venue: Venue) -> Result<MidSnapshot> {
+                match venue {
+                    Venue::Extended => Ok(MidSnapshot {
+                        ts_ms: 0,
+                        mid: self.ext_mid,
+                        book_ok: true,
+                    }),
+                    Venue::Lighter => Err(anyhow::anyhow!(
+                        "order book snapshot unavailable (no recent update)"
+                    )),
+                }
+            }
+            async fn read_equity_usd(
+                &self,
+                _venue: Venue,
+            ) -> Result<Option<Decimal>> {
+                Ok(None)
+            }
+        }
+
+        let cfg = min_cfg();
+        let mut spread = SpreadEngine::new(cfg.spread_config());
+        let mut signal = SignalEngine::new(cfg.signal_config());
+        let mut machine = PositionMachine::new();
+        let mut summary = LivePaperSummary::default();
+        let mut open_qty = None;
+        let (_rm_dir, mut rm) = test_risk_manager();
+        let mut rg = test_reference_guard();
+        let (_st_dir, mut stuck) = test_stuck();
+        let mut warmup = VenueWarmup {
+            ext_ready: true,
+            lt_ready: true,
+        };
+        let mut ws_health = WsHealthMonitor::new(0);
+        let mut skew_monitor = SkewMonitor::new(0.0);
+        let hub = LighterFailHub {
+            ext_mid: Decimal::from(2000),
+        };
+        let err = run_one_tick(
+            &cfg,
+            &hub,
+            &mut spread,
+            &mut signal,
+            &mut machine,
+            &mut summary,
+            &mut open_qty,
+            None,
+            &mut rm,
+            &mut rg,
+            &mut stuck,
+            &mut warmup,
+            &mut ws_health,
+            &mut skew_monitor,
+            None,
+            &mut None,
+        )
+        .await
+        .expect_err("post-warmup Lighter read_mid Err must propagate");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("read_mid Lighter"),
+            "expected context-wrapped Lighter error, got: {chain}"
+        );
+        assert_eq!(summary.read_mid_err_ext, 0);
+        assert_eq!(summary.read_mid_err_lt, 1);
     }
 
     // ---------------------------------------------------------------
