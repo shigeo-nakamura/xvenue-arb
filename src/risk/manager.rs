@@ -29,7 +29,13 @@ use std::time::Instant;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+use super::gates::{self, utc_session_day};
 use super::persistence::{load_state, persist_state};
+
+// Re-exported so external callers keep using
+// `crate::risk::manager::BlockReason` while the type itself lives in
+// `gates`. See live.rs and the test suite.
+pub use super::gates::BlockReason;
 
 const RISK_HISTORY_BUFFER_CAP: usize = 200;
 const PERSIST_MIN_INTERVAL_SECS: u64 = 5;
@@ -101,25 +107,6 @@ pub struct RiskConfig {
     pub risk_state_path: PathBuf,
     /// Path the operator drops to clear a session-DD halt.
     pub risk_ack_path: PathBuf,
-}
-
-/// Reasons `can_enter()` returns false. Surfaced in `[RISK]` log
-/// lines and the auto-issue framework's error_summary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlockReason {
-    DailyDdHalted,
-    SessionDdHalted,
-    CircuitBreakerCooldown,
-}
-
-impl BlockReason {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            BlockReason::DailyDdHalted => "daily_dd",
-            BlockReason::SessionDdHalted => "session_dd",
-            BlockReason::CircuitBreakerCooldown => "circuit_breaker",
-        }
-    }
 }
 
 /// One entry in the bounded ring buffer of halt transitions.
@@ -220,23 +207,7 @@ impl RiskManager {
     /// proceed. Side-effect-free; the live loop reads this then
     /// passes the result to its summary counters.
     pub fn block_reason(&self, now_ts: i64) -> Option<BlockReason> {
-        if self.state.session_halted {
-            return Some(BlockReason::SessionDdHalted);
-        }
-        if self.config.max_daily_loss_bps > 0 {
-            let halted = self.daily_pnl_bps()
-                .map(|bps| bps <= -(self.config.max_daily_loss_bps as f64))
-                .unwrap_or(false);
-            if halted {
-                return Some(BlockReason::DailyDdHalted);
-            }
-        }
-        if let Some(until) = self.state.cb_until_ts {
-            if until > now_ts {
-                return Some(BlockReason::CircuitBreakerCooldown);
-            }
-        }
-        None
+        gates::compute_block_reason(&self.state, &self.config, now_ts)
     }
 
     /// Equity sample point. Updates the rolling peak, runs the
@@ -277,12 +248,7 @@ impl RiskManager {
         }
 
         // Rolling peak from the retained samples (plus the new one).
-        let peak = self
-            .state
-            .equity_samples
-            .iter()
-            .map(|s| s.equity)
-            .fold(equity, f64::max);
+        let peak = gates::rolling_peak(&self.state.equity_samples, equity);
 
         // Session DD check.
         if !self.state.session_halted && self.config.max_session_loss_bps > 0 && peak > 0.0 {
@@ -392,12 +358,7 @@ impl RiskManager {
 
     pub fn session_snapshot(&self) -> Option<SessionRiskSnapshot> {
         let current = self.last_equity?;
-        let peak = self
-            .state
-            .equity_samples
-            .iter()
-            .map(|s| s.equity)
-            .fold(current, f64::max);
+        let peak = gates::rolling_peak(&self.state.equity_samples, current);
         let dd_bps = if peak > 0.0 {
             ((peak - current) / peak) * 10_000.0
         } else {
@@ -443,10 +404,7 @@ impl RiskManager {
     }
 
     fn daily_pnl_bps(&self) -> Option<f64> {
-        if self.state.session_start_equity <= 0.0 {
-            return None;
-        }
-        Some(self.state.realized_pnl_today / self.state.session_start_equity * 10_000.0)
+        gates::daily_pnl_bps(&self.state)
     }
 
     fn maybe_roll_daily(&mut self, now_ts: i64) {
@@ -654,14 +612,6 @@ impl RiskManager {
         persist_state(&self.config.risk_state_path, &self.state);
         self.last_persist = Some(Instant::now());
     }
-}
-
-/// UTC day index, optionally shifted by the operator's daily reset
-/// hour. Used to detect day-boundary crossings without dragging
-/// chrono::DateTime through every comparison.
-fn utc_session_day(ts: i64, daily_reset_utc_hour: u8) -> i64 {
-    let shifted = ts - (daily_reset_utc_hour as i64) * 3_600;
-    shifted.div_euclid(86_400)
 }
 
 /// Wall-clock timestamp helper; used by the live loop and any caller
