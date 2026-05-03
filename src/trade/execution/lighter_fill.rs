@@ -45,11 +45,12 @@ pub struct LighterFillRequest {
     pub reduce_only: bool,
 }
 
-const DEFAULT_POLL_INTERVAL_MS: u64 = 25;
-
 pub struct LighterFillLoop<'a, V: VenueOps + ?Sized> {
     pub ops: &'a V,
     pub cfg: &'a LighterFillConfig,
+    /// Cached at construction time from `cfg.common.poll_interval_ms`
+    /// so `with_poll_interval` can override it for tests without
+    /// mutating the borrowed `cfg`.
     poll_interval_ms: u64,
 }
 
@@ -58,7 +59,7 @@ impl<'a, V: VenueOps + ?Sized> LighterFillLoop<'a, V> {
         Self {
             ops,
             cfg,
-            poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
+            poll_interval_ms: cfg.common.poll_interval_ms,
         }
     }
 
@@ -172,7 +173,7 @@ fn price_for_aggressive(side: OrderSide, book: &TopOfBook) -> Decimal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trade::execution::types::{LighterFillConfig, LighterOrderType};
+    use crate::trade::execution::types::{CommonExecutorConfig, LighterFillConfig, LighterOrderType};
     use crate::trade::execution::venue_ops::{
         OrderFillStatus, ScriptedResponse, ScriptedVenueOps, TopOfBook,
     };
@@ -180,6 +181,7 @@ mod tests {
 
     fn cfg_market() -> LighterFillConfig {
         LighterFillConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 25 },
             order_type: LighterOrderType::Market,
             fill_timeout_ms: 100,
         }
@@ -187,6 +189,7 @@ mod tests {
 
     fn cfg_aggressive() -> LighterFillConfig {
         LighterFillConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 25 },
             order_type: LighterOrderType::AggressiveLimit,
             fill_timeout_ms: 100,
         }
@@ -258,6 +261,7 @@ mod tests {
             }));
         });
         let cfg = LighterFillConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 25 },
             order_type: LighterOrderType::Market,
             fill_timeout_ms: 60,
         };

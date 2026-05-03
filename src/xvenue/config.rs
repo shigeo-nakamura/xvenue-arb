@@ -322,6 +322,9 @@ impl XvenueConfig {
     /// `Decision::Enter` / `Decision::Exit` for the Extended leg.
     pub fn extended_maker_config(&self) -> ExtendedMakerConfig {
         ExtendedMakerConfig {
+            common: crate::trade::execution::types::CommonExecutorConfig {
+                poll_interval_ms: 50,
+            },
             chase_ticks: self.extended_chase_ticks,
             chase_retries: self.extended_chase_retries,
             chase_timeout_ms: self.extended_chase_timeout_ms,
@@ -348,6 +351,9 @@ impl XvenueConfig {
         let order_type = parse_lighter_order_type(&self.lighter_order_type)
             .map_err(|e| anyhow::anyhow!(e))?;
         Ok(LighterFillConfig {
+            common: crate::trade::execution::types::CommonExecutorConfig {
+                poll_interval_ms: 25,
+            },
             order_type,
             fill_timeout_ms: self.lighter_fill_timeout_ms,
         })

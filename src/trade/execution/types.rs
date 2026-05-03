@@ -76,11 +76,29 @@ impl LighterTerminal {
     }
 }
 
+/// Knobs that show up on every per-venue executor — split out so
+/// `ExtendedMakerConfig` and `LighterFillConfig` can embed it instead
+/// of carrying parallel copies. Today this is just `poll_interval_ms`;
+/// keeping the struct around (rather than a bare field) makes future
+/// shared knobs (place-retry budget, etc.) additive without touching
+/// every construction site.
+#[derive(Debug, Clone)]
+pub struct CommonExecutorConfig {
+    /// How often `poll_until_terminal_or_deadline` re-polls the venue
+    /// for fill status. Lighter defaults tighter (25 ms) since fills
+    /// arrive in tens of ms; Extended defaults looser (50 ms) since
+    /// chase rounds are bounded by `chase_timeout_ms` already.
+    pub poll_interval_ms: u64,
+}
+
 /// Knobs for the Extended maker chase loop. Sourced from
 /// `XvenueConfig` so YAML drives behavior and unit tests can
 /// construct deterministic configs inline.
 #[derive(Debug, Clone)]
 pub struct ExtendedMakerConfig {
+    /// Common executor knobs (poll cadence, etc.). See
+    /// [`CommonExecutorConfig`].
+    pub common: CommonExecutorConfig,
     /// Number of book ticks to chase a stale post-only price by
     /// before re-cancelling and re-posting. 1 means "if the book
     /// moved, re-post at the new best price"; larger values let the
@@ -135,6 +153,9 @@ impl ExtendedMakerConfig {
 /// Knobs for the Lighter market / aggressive-limit fill flow.
 #[derive(Debug, Clone)]
 pub struct LighterFillConfig {
+    /// Common executor knobs (poll cadence, etc.). See
+    /// [`CommonExecutorConfig`].
+    pub common: CommonExecutorConfig,
     /// "market" or "limit". When "limit", the executor places an
     /// aggressive limit at the opposite-side top of book to maximize
     /// fill probability while picking up some price improvement on
@@ -217,6 +238,7 @@ mod tests {
     #[test]
     fn extended_config_rejects_zero_timeout() {
         let cfg = ExtendedMakerConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 50 },
             chase_ticks: 1,
             chase_retries: 3,
             chase_timeout_ms: 0,
@@ -230,6 +252,7 @@ mod tests {
     #[test]
     fn extended_config_rejects_zero_retries_no_fallback() {
         let cfg = ExtendedMakerConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 50 },
             chase_ticks: 1,
             chase_retries: 0,
             chase_timeout_ms: 500,
@@ -244,6 +267,7 @@ mod tests {
     fn extended_config_zero_retries_with_fallback_is_ok() {
         // Operator-emergency mode: skip maker, go straight to taker.
         let cfg = ExtendedMakerConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 50 },
             chase_ticks: 1,
             chase_retries: 0,
             chase_timeout_ms: 500,
@@ -257,6 +281,7 @@ mod tests {
     #[test]
     fn lighter_config_rejects_zero_timeout() {
         let cfg = LighterFillConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 25 },
             order_type: LighterOrderType::Market,
             fill_timeout_ms: 0,
         };

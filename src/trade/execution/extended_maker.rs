@@ -60,15 +60,14 @@ pub struct ExtendedEntryRequest {
     pub reduce_only: bool,
 }
 
-/// Per-round poll cadence. Tight enough that a 500 ms timeout still
-/// catches a fill within ~50 ms of the venue reporting it. Tests
-/// override via `ExtendedMakerLoop::with_poll_interval` so
-/// `tokio::time::pause` can step the clock without spinning.
-const DEFAULT_POLL_INTERVAL_MS: u64 = 50;
-
 pub struct ExtendedMakerLoop<'a, V: VenueOps + ?Sized> {
     pub ops: &'a V,
     pub cfg: &'a ExtendedMakerConfig,
+    /// Cached at construction time from `cfg.common.poll_interval_ms`
+    /// so `with_poll_interval` can override it for tests without
+    /// mutating the borrowed `cfg`. Tight enough that a 500 ms
+    /// timeout still catches a fill within ~50 ms of the venue
+    /// reporting it.
     poll_interval_ms: u64,
 }
 
@@ -77,7 +76,7 @@ impl<'a, V: VenueOps + ?Sized> ExtendedMakerLoop<'a, V> {
         Self {
             ops,
             cfg,
-            poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
+            poll_interval_ms: cfg.common.poll_interval_ms,
         }
     }
 
@@ -344,7 +343,7 @@ fn price_for_post_only(side: OrderSide, book: &super::venue_ops::TopOfBook) -> D
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trade::execution::types::ExtendedMakerConfig;
+    use crate::trade::execution::types::{CommonExecutorConfig, ExtendedMakerConfig};
     use crate::trade::execution::venue_ops::{
         OrderFillStatus, PlacedOrder, ScriptedResponse, ScriptedVenueOps, TopOfBook,
     };
@@ -352,6 +351,7 @@ mod tests {
 
     fn cfg_with_taker_fallback() -> ExtendedMakerConfig {
         ExtendedMakerConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 50 },
             chase_ticks: 1,
             chase_retries: 3,
             chase_timeout_ms: 500,
@@ -363,6 +363,7 @@ mod tests {
 
     fn cfg_no_fallback() -> ExtendedMakerConfig {
         ExtendedMakerConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 50 },
             chase_ticks: 1,
             chase_retries: 2,
             chase_timeout_ms: 500,
@@ -472,6 +473,7 @@ mod tests {
             }));
         });
         let cfg = ExtendedMakerConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 50 },
             chase_ticks: 1,
             chase_retries: 1, // single chase round, then fallback
             chase_timeout_ms: 100,
@@ -516,6 +518,7 @@ mod tests {
             }));
         });
         let cfg = ExtendedMakerConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 50 },
             chase_ticks: 1,
             chase_retries: 1,
             chase_timeout_ms: 200,
@@ -570,6 +573,7 @@ mod tests {
             }));
         });
         let cfg = ExtendedMakerConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 50 },
             chase_ticks: 1,
             chase_retries: 0,
             chase_timeout_ms: 500,
@@ -667,6 +671,7 @@ mod tests {
             }));
         });
         let cfg = ExtendedMakerConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 50 },
             chase_ticks: 1,
             chase_retries: 2,
             chase_timeout_ms: 100,
@@ -696,6 +701,7 @@ mod tests {
             }));
         });
         let cfg = ExtendedMakerConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 50 },
             chase_ticks: 1,
             chase_retries: 0,
             chase_timeout_ms: 100,
@@ -739,6 +745,7 @@ mod tests {
             }));
         });
         let cfg = ExtendedMakerConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 50 },
             chase_ticks: 1,
             chase_retries: 1,
             chase_timeout_ms: 100,
@@ -789,6 +796,7 @@ mod tests {
             }));
         });
         let cfg = ExtendedMakerConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 50 },
             chase_ticks: 1,
             chase_retries: 1,
             chase_timeout_ms: 100,
@@ -836,6 +844,7 @@ mod tests {
             }));
         });
         let cfg = ExtendedMakerConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 50 },
             chase_ticks: 1,
             chase_retries: 0,
             chase_timeout_ms: 50,
@@ -877,6 +886,7 @@ mod tests {
             }));
         });
         let cfg = ExtendedMakerConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 50 },
             chase_ticks: 1,
             chase_retries: 0,
             chase_timeout_ms: 50,

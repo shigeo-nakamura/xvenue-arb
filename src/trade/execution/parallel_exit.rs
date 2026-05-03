@@ -219,7 +219,8 @@ where
 mod tests {
     use super::*;
     use crate::trade::execution::types::{
-        ExecutionFailure, ExtendedMakerConfig, LighterFillConfig, LighterOrderType,
+        CommonExecutorConfig, ExecutionFailure, ExtendedMakerConfig, LighterFillConfig,
+        LighterOrderType,
     };
     use crate::trade::execution::venue_ops::{
         OrderFillStatus, ScriptedResponse, ScriptedVenueOps, TopOfBook,
@@ -230,6 +231,7 @@ mod tests {
 
     fn ext_cfg() -> ExtendedMakerConfig {
         ExtendedMakerConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 50 },
             chase_ticks: 1,
             chase_retries: 1,
             chase_timeout_ms: 100,
@@ -241,6 +243,7 @@ mod tests {
 
     fn lt_cfg() -> LighterFillConfig {
         LighterFillConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 25 },
             order_type: LighterOrderType::Market,
             fill_timeout_ms: 100,
         }
@@ -339,6 +342,7 @@ mod tests {
             }));
         });
         let ec = ExtendedMakerConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 50 },
             chase_ticks: 1,
             chase_retries: 1,
             chase_timeout_ms: 2000,
@@ -347,6 +351,7 @@ mod tests {
             taker_grace_poll_ms: 0,
         };
         let lc = LighterFillConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 25 },
             order_type: LighterOrderType::Market,
             fill_timeout_ms: 100,
         };
@@ -382,6 +387,7 @@ mod tests {
         // Lighter never gets a terminal — default zero non-terminal
         // polls until its `fill_timeout_ms` expires (2000 ms here).
         let ec = ExtendedMakerConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 50 },
             chase_ticks: 1,
             chase_retries: 1,
             chase_timeout_ms: 100,
@@ -390,6 +396,7 @@ mod tests {
             taker_grace_poll_ms: 0,
         };
         let lc = LighterFillConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 25 },
             order_type: LighterOrderType::Market,
             fill_timeout_ms: 2000,
         };
@@ -446,6 +453,7 @@ mod tests {
             }));
         });
         let ec = ExtendedMakerConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 50 },
             chase_ticks: 1,
             chase_retries: 1,
             chase_timeout_ms: 1000,
@@ -454,6 +462,7 @@ mod tests {
             taker_grace_poll_ms: 0,
         };
         let lc = LighterFillConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 25 },
             order_type: LighterOrderType::Market,
             fill_timeout_ms: 1000,
         };
@@ -501,6 +510,7 @@ mod tests {
         // straight to taker — that's the path that records the
         // reduce_only flag at the venue layer.
         let ec = ExtendedMakerConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 50 },
             chase_ticks: 1,
             chase_retries: 0,
             chase_timeout_ms: 100,
