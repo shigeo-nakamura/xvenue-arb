@@ -660,6 +660,73 @@ fn handle_ws_stale_emergency(
     true
 }
 
+/// Inventory-skew watchdog mirror of `handle_ws_stale_emergency`.
+/// Computes the position's current skew_usd, asks the skew monitor
+/// whether it has breached, and on breach routes the position machine
+/// into `EmergencyFlattening`. Returns `true` when the caller should
+/// bail out of the rest of the tick. Caller is expected to gate on
+/// `position.is_some()` first — this helper trusts that gate so the
+/// skew_monitor never sees the synthetic 0-skew of a flat machine.
+///
+/// Behaviour-preserving: same log lines, same paper-mode synth, same
+/// summary counter increment as the prior inline form.
+#[allow(clippy::too_many_arguments)]
+fn handle_skew_breach_emergency(
+    cfg: &XvenueConfig,
+    skew_monitor: &mut SkewMonitor,
+    machine: &mut PositionMachine,
+    open_qty: &mut Option<Decimal>,
+    summary: &mut LivePaperSummary,
+    ext_mid: Decimal,
+    lt_mid: Decimal,
+    now_ts_ms: u64,
+) -> bool {
+    let skew_dec = machine.inventory_skew_usd(ext_mid, lt_mid);
+    let skew_f = rust_decimal::prelude::ToPrimitive::to_f64(&skew_dec).unwrap_or(0.0);
+    let SkewOutcome::Breach { skew_usd, threshold_usd } = skew_monitor.evaluate(skew_f) else {
+        return false;
+    };
+
+    let event = Event::Emergency {
+        reason: super::state::EmergencyReason::SkewBreach,
+    };
+    match machine.apply(now_ts_ms, event) {
+        Ok(()) => {
+            log::error!(
+                "[XVENUE] inventory skew breach: skew_usd={:.2} \
+                 threshold_usd={:.2} → flattening",
+                skew_usd,
+                threshold_usd,
+            );
+            summary.skew_emergencies_emitted += 1;
+
+            // Same paper-mode short-circuit as ws_health — Group B
+            // will replace this with real flatten orders driving
+            // EmergencyComplete.
+            if cfg.dry_run {
+                if let Some(qty) = open_qty.take() {
+                    let _ = machine.apply(now_ts_ms, Event::ExtendedExitFilled { qty });
+                    let _ = machine.apply(now_ts_ms, Event::LighterExitFilled { qty });
+                }
+                let _ = machine.apply(now_ts_ms, Event::EmergencyComplete);
+                skew_monitor.reset_after_recovery();
+                log::warn!(
+                    "[XVENUE] paper-mode skew recovery: synthesised \
+                     EmergencyComplete (Group B will replace this in live)"
+                );
+            }
+        }
+        Err(e) => {
+            log::debug!(
+                "[XVENUE] skew breach ignored by state machine \
+                 (likely already flattening): {:?}",
+                e
+            );
+        }
+    }
+    true
+}
+
 /// Read the current mid from both venues, gated by the per-venue
 /// warm-up latch. Returns `Ok(None)` when either venue is still
 /// warming up — the caller should treat this as "skip the rest of
@@ -932,58 +999,19 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
     // Runs *after* the spread update so the spread engine still sees
     // this tick's data (we don't want a recovery tick discarded just
     // because the previous trip is still in flight).
-    if position.is_some() {
-        let skew_dec = machine.inventory_skew_usd(ext_snap.mid, lt_snap.mid);
-        let skew_f = rust_decimal::prelude::ToPrimitive::to_f64(&skew_dec).unwrap_or(0.0);
-        match skew_monitor.evaluate(skew_f) {
-            SkewOutcome::Breach { skew_usd, threshold_usd } => {
-                let event = Event::Emergency {
-                    reason: super::state::EmergencyReason::SkewBreach,
-                };
-                match machine.apply(now_ts_ms, event) {
-                    Ok(()) => {
-                        log::error!(
-                            "[XVENUE] inventory skew breach: skew_usd={:.2} \
-                             threshold_usd={:.2} → flattening",
-                            skew_usd,
-                            threshold_usd,
-                        );
-                        summary.skew_emergencies_emitted += 1;
-
-                        // Same paper-mode short-circuit as ws_health —
-                        // Group B will replace this with real flatten
-                        // orders driving EmergencyComplete.
-                        if cfg.dry_run {
-                            if let Some(qty) = open_qty.take() {
-                                let _ = machine.apply(
-                                    now_ts_ms,
-                                    Event::ExtendedExitFilled { qty },
-                                );
-                                let _ = machine.apply(
-                                    now_ts_ms,
-                                    Event::LighterExitFilled { qty },
-                                );
-                            }
-                            let _ = machine.apply(now_ts_ms, Event::EmergencyComplete);
-                            skew_monitor.reset_after_recovery();
-                            log::warn!(
-                                "[XVENUE] paper-mode skew recovery: synthesised \
-                                 EmergencyComplete (Group B will replace this in live)"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        log::debug!(
-                            "[XVENUE] skew breach ignored by state machine \
-                             (likely already flattening): {:?}",
-                            e
-                        );
-                    }
-                }
-                return Ok(());
-            }
-            SkewOutcome::Ok { .. } | SkewOutcome::Disabled => {}
-        }
+    if position.is_some()
+        && handle_skew_breach_emergency(
+            cfg,
+            skew_monitor,
+            machine,
+            open_qty,
+            summary,
+            ext_snap.mid,
+            lt_snap.mid,
+            now_ts_ms,
+        )
+    {
+        return Ok(());
     }
 
     // S5-3 forced flatten on session DD (#268). Runs before
