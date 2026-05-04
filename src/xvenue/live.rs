@@ -1489,7 +1489,9 @@ async fn handle_decision_enter<H: VenueHub + ?Sized>(
     }
     log::info!(
         "[XVENUE] LIVE ENTER start dir={:?} dev_bps={:?} ext_mid={} lt_mid={} \
-         notional={} ext_qty={} lt_qty={}",
+         notional={} ext_qty={} lt_qty={} \
+         ext_bid={} ext_ask={} lt_bid={} lt_ask={} \
+         lt_bid_size={} lt_ask_size={}",
         dir,
         dev,
         ext_snap.mid,
@@ -1497,6 +1499,12 @@ async fn handle_decision_enter<H: VenueHub + ?Sized>(
         notional,
         ext_qty,
         lt_qty,
+        ext_snap.bid,
+        ext_snap.ask,
+        lt_snap.bid,
+        lt_snap.ask,
+        lt_snap.bid_size,
+        lt_snap.ask_size,
     );
     let (ext_side, lt_side) = match dir {
         // Direction sign convention (cf. dev_breach test + signal.rs):
@@ -1715,12 +1723,22 @@ async fn handle_decision_exit(
     };
     log::info!(
         "[XVENUE] LIVE EXIT start reason={:?} dev_bps={:?} dir={:?} \
-         ext_qty={} lt_qty={}",
+         ext_qty={} lt_qty={} \
+         ext_mid={} lt_mid={} ext_bid={} ext_ask={} lt_bid={} lt_ask={} \
+         lt_bid_size={} lt_ask_size={}",
         reason,
         dev,
         position_dir,
         ext_qty,
         lt_qty,
+        ext_snap.mid,
+        lt_snap.mid,
+        ext_snap.bid,
+        ext_snap.ask,
+        lt_snap.bid,
+        lt_snap.ask,
+        lt_snap.bid_size,
+        lt_snap.ask_size,
     );
     let outcome = ParallelExitLoop::new(
         &*live.ext_ops,
