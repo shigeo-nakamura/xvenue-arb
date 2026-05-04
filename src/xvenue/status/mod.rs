@@ -477,7 +477,7 @@ fn render_positions(machine: &PositionMachine) -> Vec<StatusPosition> {
         out.push(StatusPosition {
             symbol: format!("EXT:{}", label),
             side: ext_side.to_string(),
-            size: p.extended_open_qty.to_string(),
+            size: p.extended_open_qty.normalize().to_string(),
             entry_price: None,
         });
     }
@@ -485,7 +485,7 @@ fn render_positions(machine: &PositionMachine) -> Vec<StatusPosition> {
         out.push(StatusPosition {
             symbol: format!("LT:{}", label),
             side: lt_side.to_string(),
-            size: p.lighter_open_qty.to_string(),
+            size: p.lighter_open_qty.normalize().to_string(),
             entry_price: None,
         });
     }
