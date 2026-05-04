@@ -69,6 +69,7 @@ impl ScriptedHub {
                 ts_ms: 0,
                 mid: dec!(1),
                 book_ok: true,
+                ..Default::default()
             })
         }
     }
@@ -155,6 +156,7 @@ pub fn mid(ts_ms: u64, value: f64) -> MidSnapshot {
         ts_ms,
         mid: Decimal::from_f64_retain(value).expect("non-finite mid in test"),
         book_ok: true,
+        ..Default::default()
     }
 }
 

@@ -58,6 +58,10 @@ impl VenueHub for LiveVenueHub {
             (None, Some(a)) => a.price,
             (None, None) => Decimal::ZERO,
         };
+        let bid_price = bid.map(|b| b.price).unwrap_or(Decimal::ZERO);
+        let ask_price = ask.map(|a| a.price).unwrap_or(Decimal::ZERO);
+        let bid_size = bid.map(|b| b.size).unwrap_or(Decimal::ZERO);
+        let ask_size = ask.map(|a| a.size).unwrap_or(Decimal::ZERO);
 
         // Live doesn't get a per-record timestamp (replay does); use
         // wall-clock at read time. dev_bps + persistence accumulate against
@@ -72,6 +76,10 @@ impl VenueHub for LiveVenueHub {
             ts_ms,
             mid,
             book_ok,
+            bid: bid_price,
+            ask: ask_price,
+            bid_size,
+            ask_size,
         })
     }
 

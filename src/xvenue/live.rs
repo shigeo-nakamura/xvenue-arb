@@ -26,6 +26,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use dex_connector::OrderSide as DcOrderSide;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use tokio::sync::oneshot;
 
@@ -86,7 +87,7 @@ impl VenueWarmup {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MidSnapshot {
     pub ts_ms: u64,
     pub mid: Decimal,
@@ -94,6 +95,15 @@ pub struct MidSnapshot {
     /// engine drops these (see bt.rs zero-size filter rationale,
     /// bot-strategy#166 part 1).
     pub book_ok: bool,
+    /// Top-of-book bid/ask + sizes. Added per bot-strategy#309 to enable
+    /// touch-to-touch signal (`cap_long = lt_bid - ext_ask`, etc.) and
+    /// book-depth filtering for the maker-on-Lighter redesign. Test
+    /// constructors that pre-date this leave them as `Decimal::ZERO`
+    /// via `Default` — the [STATUS] emitter handles zero gracefully.
+    pub bid: Decimal,
+    pub ask: Decimal,
+    pub bid_size: Decimal,
+    pub ask_size: Decimal,
 }
 
 /// Thin abstraction over the two venues. Production wires this to
@@ -127,6 +137,19 @@ pub struct LivePaperSummary {
     pub decisions_exit: u64,
     pub last_dev_bps: Option<f64>,
     pub last_decision_ts_ms: Option<u64>,
+    /// Touch-to-touch capturable spread + book depth, snapshotted per
+    /// tick. Added per bot-strategy#309 to enable maker-on-Lighter
+    /// redesign verification during DRY_RUN soak. None until the
+    /// upstream connector returns book depth (production live, not
+    /// scripted-hub tests). The [STATUS] emitter prints `None` for any
+    /// missing value; analysis tools can grep for `cap_long=` and
+    /// related fields once they appear.
+    pub last_cap_long_bps: Option<f64>,
+    pub last_cap_short_bps: Option<f64>,
+    pub last_ext_inside_bps: Option<f64>,
+    pub last_lt_inside_bps: Option<f64>,
+    pub last_lt_bid_size: Option<f64>,
+    pub last_lt_ask_size: Option<f64>,
     /// Count of `Decision::Enter` outcomes that were suppressed by the
     /// external KILL_SWITCH file (bot-strategy#244 D-1). Visible in
     /// `[STATUS]` log line and the shutdown summary so the operator
@@ -1074,7 +1097,8 @@ async fn report_status_tick<H: VenueHub + ?Sized>(
          ks_blocked={} stuck_blocked={} dd_blocked={} sd_blocked={} cb_blocked={} \
          ws_blocked={} ws_emerg={} skew_emerg={} ws_age_ext={:?} ws_age_lt={:?} \
          ref_supp_ext={} ref_supp_lt={} read_mid_err_ext={} read_mid_err_lt={} \
-         dev_bps={:?}",
+         dev_bps={:?} cap_long={:?} cap_short={:?} \
+         ext_inside={:?} lt_inside={:?} lt_bid_sz={:?} lt_ask_sz={:?}",
         summary.ticks,
         summary.samples_committed,
         summary.decisions_hold,
@@ -1096,6 +1120,12 @@ async fn report_status_tick<H: VenueHub + ?Sized>(
         summary.read_mid_err_ext,
         summary.read_mid_err_lt,
         summary.last_dev_bps,
+        summary.last_cap_long_bps,
+        summary.last_cap_short_bps,
+        summary.last_ext_inside_bps,
+        summary.last_lt_inside_bps,
+        summary.last_lt_bid_size,
+        summary.last_lt_ask_size,
     );
     if let Some(r) = reporter {
         refresh_equity(hub, r, risk_manager).await;
@@ -1223,6 +1253,38 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
 
     let dev = spread.current_dev_bps();
     summary.last_dev_bps = dev;
+
+    // Touch-to-touch + book-depth metrics for #309 redesign DRY_RUN
+    // soak. Cheap (a handful of f64 ops on each evaluated tick) and
+    // surfaced in the periodic [STATUS] log line. Only computes when
+    // both bid/ask are populated (skips scripted-hub tests where the
+    // default-zero connector returns 0/0).
+    if ext_snap.bid > Decimal::ZERO
+        && ext_snap.ask > Decimal::ZERO
+        && lt_snap.bid > Decimal::ZERO
+        && lt_snap.ask > Decimal::ZERO
+    {
+        let ext_bid = ext_snap.bid.to_f64().unwrap_or(0.0);
+        let ext_ask = ext_snap.ask.to_f64().unwrap_or(0.0);
+        let ext_mid = ext_snap.mid.to_f64().unwrap_or(0.0);
+        let lt_bid = lt_snap.bid.to_f64().unwrap_or(0.0);
+        let lt_ask = lt_snap.ask.to_f64().unwrap_or(0.0);
+        let lt_mid = lt_snap.mid.to_f64().unwrap_or(0.0);
+        let mid_avg = (ext_mid + lt_mid) / 2.0;
+        if mid_avg > 0.0 {
+            summary.last_cap_long_bps = Some((lt_bid - ext_ask) / mid_avg * 10_000.0);
+            summary.last_cap_short_bps = Some((ext_bid - lt_ask) / mid_avg * 10_000.0);
+        }
+        if ext_mid > 0.0 {
+            summary.last_ext_inside_bps = Some((ext_ask - ext_bid) / ext_mid * 10_000.0);
+        }
+        if lt_mid > 0.0 {
+            summary.last_lt_inside_bps = Some((lt_ask - lt_bid) / lt_mid * 10_000.0);
+        }
+        summary.last_lt_bid_size = Some(lt_snap.bid_size.to_f64().unwrap_or(0.0));
+        summary.last_lt_ask_size = Some(lt_snap.ask_size.to_f64().unwrap_or(0.0));
+    }
+
     if let (Some(r), Some(d)) = (reporter.as_deref_mut(), dev) {
         if committed {
             r.push_spread_point(now_ts_ms, d);
@@ -2749,6 +2811,7 @@ max_hold_sec: 60
                         ts_ms: 0,
                         mid: self.ext_mid,
                         book_ok: true,
+                        ..Default::default()
                     }),
                     Venue::Lighter => Err(anyhow::anyhow!(
                         "order book snapshot unavailable (no recent update)"
