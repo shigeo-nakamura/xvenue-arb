@@ -1785,6 +1785,7 @@ async fn handle_decision_enter<H: VenueHub + ?Sized>(
                         side: lt_side,
                         target_qty: lt_qty,
                         dust_qty: live.dust_qty,
+                        venue_min_qty: live.lt_min_qty,
                         reduce_only: false,
                     })
                     .await

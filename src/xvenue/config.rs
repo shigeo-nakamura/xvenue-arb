@@ -181,6 +181,19 @@ pub struct XvenueConfig {
     /// fallback round. Mirrors `extended_taker_grace_poll_ms` (#298).
     #[serde(default = "default_lighter_taker_grace_poll_ms")]
     pub lighter_taker_grace_poll_ms: u64,
+    /// bot-strategy#331 (Lighter mirror of #299): per-asset Lighter
+    /// venue minimum order size. The chase loop's "remaining ≤ floor"
+    /// gate uses `dust_qty.max(lighter_min_qty)`, so a residual below
+    /// this is treated as fully filled rather than passed to
+    /// `place_post_only` only to be rejected by Lighter with
+    /// `code:21706 invalid order base or quote amount`. The taker
+    /// fallback gate uses the same floor. ETH on Lighter typically
+    /// needs ~0.001 (~$2.40) — `base_amount=1` (= 0.0001 ETH) is
+    /// accepted by the connector's force-min logic but Lighter rejects
+    /// post_only on it. 0 (default) disables the guard, preserving
+    /// dust-only behavior for back-compat.
+    #[serde(default = "default_lighter_min_qty")]
+    pub lighter_min_qty: f64,
 
     // ---- Realised PnL fees (#268 S5-1) ----
     /// Per-side fee rate the realised-PnL helper subtracts on each
@@ -460,6 +473,13 @@ impl XvenueConfig {
             .unwrap_or(rust_decimal::Decimal::ZERO)
     }
 
+    /// bot-strategy#331: Lighter venue min order size, surfaced as
+    /// `Decimal` for `LiveExecution.lt_min_qty`. Mirrors `ext_min_qty`.
+    pub fn lt_min_qty(&self) -> rust_decimal::Decimal {
+        rust_decimal::Decimal::from_f64_retain(self.lighter_min_qty)
+            .unwrap_or(rust_decimal::Decimal::ZERO)
+    }
+
     /// Knobs for [`crate::trade::execution::lighter_maker::LighterMakerLoop`].
     /// Built from the same `lighter_chase_*` family of YAML fields as
     /// the Extended-side equivalent. The runner picks which loop to
@@ -594,6 +614,9 @@ fn default_lighter_chase_grace_poll_ms() -> u64 {
 }
 fn default_lighter_taker_grace_poll_ms() -> u64 {
     0
+}
+fn default_lighter_min_qty() -> f64 {
+    0.0
 }
 fn default_signal_mode() -> String {
     "mid_to_mid".to_string()

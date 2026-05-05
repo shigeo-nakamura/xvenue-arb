@@ -47,6 +47,7 @@ extended_taker_slippage_bps: 50   # bot-strategy#302: see eth.yaml for context.
 # ---- Execution: Lighter ----
 lighter_order_type: market
 lighter_fill_timeout_ms: 1000
+lighter_min_qty: 0.00005           # bot-strategy#331: BTC counterpart of ETH's 0.001. Inactive while `lighter_post_only` stays default-false on the BTC config; pre-set so a future flip doesn't have to re-derive the floor. Verify against the connector MarketModel before relying on it live.
 
 # ---- Risk ----
 ws_stale_emergency_ms: 5000

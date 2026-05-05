@@ -56,6 +56,15 @@ pub struct LighterMakerRequest {
     /// Below this residual, the loop treats the cycle as fully filled
     /// rather than chasing further or invoking taker fallback.
     pub dust_qty: Decimal,
+    /// bot-strategy#331 (Lighter mirror of #299): Lighter-side venue
+    /// minimum order size. The "remaining ≤ floor" gate (chase entry +
+    /// taker fallback) uses `dust_qty.max(venue_min_qty)`, so a
+    /// residual below this is treated as fully filled instead of
+    /// being passed to `place_post_only` only to be rejected by
+    /// Lighter with `code:21706 invalid order base or quote amount`.
+    /// 0 disables the guard (dust-only behavior, back-compat for
+    /// tests / non-Lighter venues).
+    pub venue_min_qty: Decimal,
     /// Reduce-only is required on exit / emergency-flatten paths so a
     /// race between place_post_only rounds can't accidentally flip the
     /// position to the opposite direction (mirrors the Extended-side
@@ -99,12 +108,24 @@ impl<'a, V: VenueOps + ?Sized> LighterMakerLoop<'a, V> {
         let mut total_filled = Decimal::ZERO;
         let mut last_failure: Option<ExecutionFailure> = None;
 
+        // bot-strategy#331 (Lighter mirror of #299): floor the
+        // "remaining ≤ X" gate at the Lighter venue minimum so a
+        // sub-min residual (typically left over after a partial fill
+        // on the previous chase round) is treated as fully filled
+        // instead of producing a `place_post_only` call Lighter
+        // rejects with `code:21706 invalid order base or quote
+        // amount`. The same floor gates the taker fallback below so
+        // the residual doesn't just trade the post_only WARN for an
+        // equivalent taker WARN. `venue_min_qty=0` (default / tests)
+        // preserves the previous dust-only behavior.
+        let min_floor = req.dust_qty.max(req.venue_min_qty);
+
         // Maker chase loop. `cfg.post_only = false` short-circuits
         // straight to taker — operator escape valve mirroring Extended.
         if self.cfg.post_only {
             for round in 0..self.cfg.chase_retries.max(1) {
                 let remaining = req.target_qty - total_filled;
-                if remaining <= req.dust_qty {
+                if remaining <= min_floor {
                     break;
                 }
 
@@ -120,7 +141,7 @@ impl<'a, V: VenueOps + ?Sized> LighterMakerLoop<'a, V> {
                             last_failure = Some(ExecutionFailure::Cancelled);
                             continue;
                         }
-                        if total_filled >= req.target_qty - req.dust_qty {
+                        if total_filled >= req.target_qty - min_floor {
                             return LighterTerminal::Filled { qty: total_filled };
                         }
                     }
@@ -137,7 +158,7 @@ impl<'a, V: VenueOps + ?Sized> LighterMakerLoop<'a, V> {
         }
 
         let residual = req.target_qty - total_filled;
-        if residual > req.dust_qty && self.cfg.taker_fallback {
+        if residual > min_floor && self.cfg.taker_fallback {
             match self.run_taker_round(&req, residual).await {
                 Ok(taker_filled) => {
                     total_filled += taker_filled;
@@ -418,6 +439,7 @@ mod tests {
             side: OrderSide::Long,
             target_qty: qty,
             dust_qty: dec!(0.0001),
+            venue_min_qty: Decimal::ZERO,
             reduce_only: false,
         }
     }
@@ -671,5 +693,121 @@ mod tests {
         let res = lp.run(req_long(dec!(0.5))).await;
         assert!(matches!(res, LighterTerminal::Failed { .. }));
         assert!(ops.snapshot_takers().is_empty());
+    }
+
+    /// bot-strategy#331: chase round 0 partial-fills the bulk of
+    /// `target_qty`, leaving a sub-min residual. With
+    /// `venue_min_qty=0` (default / pre-fix behavior) the loop went
+    /// on to round 1 and the connector returned 21706 because Lighter
+    /// rejects post_only on `base_amount=1`. With `venue_min_qty`
+    /// raised to a value above the residual, the loop must:
+    ///   - exit the chase after round 0 (no second post_only)
+    ///   - skip the taker fallback (residual ≤ floor)
+    ///   - return Filled{ qty=round0_filled }
+    ///
+    /// Test parameters:
+    /// - target_qty=0.02099165, round 0 fills 0.0209 → residual 0.00009165
+    /// - venue_min_qty=0.001, dust_qty=0.00001 → floor=0.001 > residual
+    /// - chase_retries=4 (production setting per #328) — without the
+    ///   guard, all 4 rounds would each post the residual; the test
+    ///   asserts only ONE post_only call so a regression that drops
+    ///   the floor surfaces as a count mismatch
+    #[tokio::test(start_paused = true)]
+    async fn chase_skips_round_when_residual_below_venue_min() {
+        let ops = primed_book(dec!(2370), dec!(2371));
+        ops.with_state(|s| {
+            // Round 0: terminal partial fill — 0.0209 of target
+            // 0.02099165 (mirrors live ETH chase round behavior with
+            // size_decimals=4 lot truncation).
+            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                filled_qty: dec!(0.0209),
+                terminal: true,
+                cancelled: false,
+            }));
+        });
+        let cfg = LighterMakerConfig {
+            chase_retries: 4,
+            chase_timeout_ms: 50,
+            chase_grace_poll_ms: 0,
+            ..cfg_with_taker_fallback()
+        };
+        let lp = LighterMakerLoop::new(&ops, &cfg).with_poll_interval(10);
+        let req = LighterMakerRequest {
+            symbol: "ETH".to_string(),
+            side: OrderSide::Short,
+            target_qty: dec!(0.02099165),
+            dust_qty: dec!(0.00001),
+            venue_min_qty: dec!(0.001),
+            reduce_only: false,
+        };
+        let res = lp.run(req).await;
+        assert_eq!(
+            res,
+            LighterTerminal::Filled { qty: dec!(0.0209) },
+            "sub-min residual must be treated as fully filled"
+        );
+        assert_eq!(
+            ops.snapshot_posts().len(),
+            1,
+            "exactly one post_only round — sub-min residual must NOT \
+             trigger a second place_post_only that Lighter would reject \
+             with code:21706 (#329 / #331)"
+        );
+        assert!(
+            ops.snapshot_takers().is_empty(),
+            "sub-min residual must NOT trigger taker fallback either — \
+             the taker would also be rejected on a sub-lot size"
+        );
+    }
+
+    /// bot-strategy#331: back-compat — `venue_min_qty=0` keeps the
+    /// pre-fix dust-only gating behavior. Same setup as the previous
+    /// test except `venue_min_qty=0`; the loop now sees
+    /// `remaining=0.00009165 > dust_qty=0.00001` and continues to the
+    /// next round / taker fallback. We only assert the count and the
+    /// fact that the post_only chase was NOT short-circuited; the
+    /// connector-level 21706 isn't modeled here so the second round
+    /// just sees a fresh non-terminal poll and either fills, exhausts,
+    /// or falls through to taker — all branches are covered by the
+    /// existing tests above.
+    #[tokio::test(start_paused = true)]
+    async fn chase_does_not_skip_when_venue_min_qty_zero() {
+        let ops = primed_book(dec!(2370), dec!(2371));
+        ops.with_state(|s| {
+            // Round 0: same partial fill as the guarded test.
+            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                filled_qty: dec!(0.0209),
+                terminal: true,
+                cancelled: false,
+            }));
+            // Round 1: terminal cancelled → loop exits chase.
+            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                filled_qty: Decimal::ZERO,
+                terminal: true,
+                cancelled: true,
+            }));
+        });
+        let cfg = LighterMakerConfig {
+            chase_retries: 4,
+            chase_timeout_ms: 50,
+            chase_grace_poll_ms: 0,
+            taker_fallback: false,
+            ..cfg_with_taker_fallback()
+        };
+        let lp = LighterMakerLoop::new(&ops, &cfg).with_poll_interval(10);
+        let req = LighterMakerRequest {
+            symbol: "ETH".to_string(),
+            side: OrderSide::Short,
+            target_qty: dec!(0.02099165),
+            dust_qty: dec!(0.00001),
+            venue_min_qty: Decimal::ZERO, // disabled — pre-fix behavior
+            reduce_only: false,
+        };
+        let _ = lp.run(req).await;
+        assert!(
+            ops.snapshot_posts().len() >= 2,
+            "with venue_min_qty=0 the chase must NOT short-circuit on \
+             a sub-min residual (back-compat)"
+        );
     }
 }

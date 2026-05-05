@@ -66,6 +66,13 @@ pub struct LiveExecution {
     /// with `Order size N below min M`. ETH on Extended is 0.01;
     /// BTC is smaller. 0 disables the guard (dust-only behavior).
     pub ext_min_qty: Decimal,
+    /// bot-strategy#331 (Lighter mirror of #299): Lighter-side venue
+    /// minimum order size. Surfaces to
+    /// `LighterMakerRequest.venue_min_qty` so the chase loop skips
+    /// sub-min residuals (after a partial fill) instead of feeding
+    /// `place_post_only` an amount Lighter rejects with
+    /// `code:21706 invalid order base or quote amount`. 0 disables.
+    pub lt_min_qty: Decimal,
     /// Reads each venue's open qty for the emergency-flatten round
     /// (#244 Sprint 4 step 3/3). Defaults to a [`NoopLegStateReader`]
     /// that surfaces an Err so the runner skips emergency rounds
@@ -92,6 +99,7 @@ impl LiveExecution {
             lt_symbol: cfg.symbol_lt.clone(),
             dust_qty: default_dust_qty(),
             ext_min_qty: cfg.ext_min_qty(),
+            lt_min_qty: cfg.lt_min_qty(),
             leg_reader: Arc::new(NoopLegStateReader),
         };
         exec.validate()?;
@@ -147,6 +155,9 @@ impl LiveExecution {
         }
         if self.ext_min_qty < Decimal::ZERO {
             anyhow::bail!("ext_min_qty must be >= 0; got {}", self.ext_min_qty);
+        }
+        if self.lt_min_qty < Decimal::ZERO {
+            anyhow::bail!("lt_min_qty must be >= 0; got {}", self.lt_min_qty);
         }
         if self.ext_symbol.trim().is_empty() {
             anyhow::bail!("ext_symbol must be non-empty");
@@ -228,6 +239,66 @@ leg_mismatch_timeout_ms: 5000
         // Legacy LighterFillLoop config is still populated — exit
         // path keeps using it even when entry flips to maker.
         assert_eq!(exec.lighter_fill_cfg.fill_timeout_ms, 1_000);
+    }
+
+    /// bot-strategy#331: `lighter_min_qty` YAML knob propagates into
+    /// `LiveExecution.lt_min_qty` so the chase loop's sub-lot residual
+    /// guard activates. Disabled by default (=0) for back-compat.
+    #[test]
+    fn lighter_min_qty_yaml_propagates_into_live_execution() {
+        let yaml = r#"
+agent_name: x
+symbol_ext: ETH-USD
+symbol_lt: ETH
+trade_size_pct: 0.05
+min_notional_usd: 20
+max_notional_usd: 1000
+binance_reference_symbol: ETHUSDT
+reference_max_dev_bps: 100
+lighter_min_qty: 0.001
+"#;
+        let c: XvenueConfig = serde_yaml::from_str(yaml).unwrap();
+        c.validate().unwrap();
+        let ext: Arc<dyn VenueOps> = Arc::new(ScriptedVenueOps::new());
+        let lt: Arc<dyn VenueOps> = Arc::new(ScriptedVenueOps::new());
+        let exec = LiveExecution::from_config(&c, ext, lt).unwrap();
+        // f64 0.001 is not exactly representable, so compare against
+        // the same `from_f64_retain` path the helper uses rather than
+        // a `dec!(0.001)` literal. Rounding to 6 dp strips the f64
+        // noise and matches what live sizing code does.
+        assert_eq!(exec.lt_min_qty.round_dp(6), dec!(0.001));
+    }
+
+    #[test]
+    fn lt_min_qty_defaults_to_zero_when_yaml_omits_it() {
+        let exec = LiveExecution::from_config(
+            &cfg(),
+            Arc::new(ScriptedVenueOps::new()),
+            Arc::new(ScriptedVenueOps::new()),
+        )
+        .unwrap();
+        assert_eq!(exec.lt_min_qty, Decimal::ZERO);
+    }
+
+    #[test]
+    fn validate_rejects_negative_lt_min_qty() {
+        let exec = LiveExecution {
+            ext_ops: Arc::new(ScriptedVenueOps::new()),
+            lt_ops: Arc::new(ScriptedVenueOps::new()),
+            extended_maker_cfg: cfg().extended_maker_config(),
+            lighter_fill_cfg: cfg().lighter_fill_config().unwrap(),
+            lighter_maker_cfg: cfg().lighter_maker_config(),
+            parallel_exit_cfg: cfg().parallel_exit_config(),
+            emergency_loop_cfg: cfg().emergency_loop_config(),
+            ext_symbol: "ETH-USD".into(),
+            lt_symbol: "ETH".into(),
+            dust_qty: dec!(0.00001),
+            ext_min_qty: Decimal::ZERO,
+            lt_min_qty: dec!(-0.001),
+            leg_reader: Arc::new(NoopLegStateReader),
+        };
+        let err = exec.validate().unwrap_err();
+        assert!(err.to_string().contains("lt_min_qty"));
     }
 
     #[test]
