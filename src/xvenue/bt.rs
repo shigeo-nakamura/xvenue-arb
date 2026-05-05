@@ -287,8 +287,7 @@ async fn run_bt_async(replay: &DualReplay, cfg: BtConfig) -> Result<BtSummary> {
             // Capture the just-committed bucket for parity diagnostics.
             // `last_spread_bps` and `rolling_mean` are post-push, so
             // they reflect the state after the new sample is included.
-            let bucket_ts = (ext_ts.min(lt_ts) / cfg.spread.bucket_ms)
-                * cfg.spread.bucket_ms;
+            let bucket_ts = (ext_ts.min(lt_ts) / cfg.spread.bucket_ms) * cfg.spread.bucket_ms;
             let s = spread.last_spread_bps().unwrap_or(0.0);
             let m = spread.rolling_mean().unwrap_or(0.0);
             buckets.push(BucketRecord {
@@ -347,15 +346,7 @@ async fn run_bt_async(replay: &DualReplay, cfg: BtConfig) -> Result<BtSummary> {
                 machine.apply(ts_ms, Event::LighterExitFilled { qty })?;
 
                 let dev_at_exit = dev.unwrap_or(0.0);
-                let record = settle_trade(
-                    &cfg,
-                    leg,
-                    ts_ms,
-                    dev_at_exit,
-                    ext_mid,
-                    lt_mid,
-                    reason,
-                );
+                let record = settle_trade(&cfg, leg, ts_ms, dev_at_exit, ext_mid, lt_mid, reason);
                 trades.push(record);
             }
         }
@@ -383,10 +374,7 @@ async fn run_bt_async(replay: &DualReplay, cfg: BtConfig) -> Result<BtSummary> {
 /// phantom spread that the Phase 0 v2 Python sim avoids by computing
 /// mid from bid/ask. This was the dominant source of the Rust-vs-Python
 /// BT divergence (bot-strategy#166).
-async fn read_snapshot(
-    c: &Arc<ReplayConnector>,
-    symbol: &str,
-) -> Result<(Decimal, bool)> {
+async fn read_snapshot(c: &Arc<ReplayConnector>, symbol: &str) -> Result<(Decimal, bool)> {
     use dex_connector::DexConnector;
     let ob = c
         .get_order_book(symbol, 1)
@@ -462,12 +450,10 @@ fn settle_trade(
         * cfg.trade_notional_usd
         * two
         / bps_div;
-    let ext_slip = decimal_from_f64(cfg.extended_round_trip_slippage_bps)
-        .unwrap_or(Decimal::ZERO)
+    let ext_slip = decimal_from_f64(cfg.extended_round_trip_slippage_bps).unwrap_or(Decimal::ZERO)
         * cfg.trade_notional_usd
         / bps_div;
-    let lt_slip = decimal_from_f64(cfg.lighter_round_trip_slippage_bps)
-        .unwrap_or(Decimal::ZERO)
+    let lt_slip = decimal_from_f64(cfg.lighter_round_trip_slippage_bps).unwrap_or(Decimal::ZERO)
         * cfg.trade_notional_usd
         / bps_div;
     let fees = ext_fee + lt_fee + ext_slip + lt_slip;
@@ -516,8 +502,7 @@ fn mid_dev_bps(venue_mid: Decimal, ref_mid: f64) -> f64 {
 /// minutes that did parse, which matches the Phase 0 sim's behavior.
 fn load_binance_ref(path: &str) -> Result<std::collections::HashMap<u64, f64>> {
     use std::io::BufRead;
-    let f = std::fs::File::open(path)
-        .map_err(|e| anyhow!("open binance ref {}: {}", path, e))?;
+    let f = std::fs::File::open(path).map_err(|e| anyhow!("open binance ref {}: {}", path, e))?;
     let r = std::io::BufReader::new(f);
     let mut out = std::collections::HashMap::new();
     for line in r.lines() {
@@ -533,8 +518,14 @@ fn load_binance_ref(path: &str) -> Result<std::collections::HashMap<u64, f64>> {
             Some(t) => t,
             None => continue,
         };
-        let high = v.get("high").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok());
-        let low = v.get("low").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok());
+        let high = v
+            .get("high")
+            .and_then(|x| x.as_str())
+            .and_then(|s| s.parse::<f64>().ok());
+        let low = v
+            .get("low")
+            .and_then(|x| x.as_str())
+            .and_then(|s| s.parse::<f64>().ok());
         match (high, low) {
             (Some(h), Some(l)) if h > 0.0 && l > 0.0 && h >= l => {
                 out.insert(ts_ms, 0.5 * (h + l));
@@ -776,7 +767,7 @@ mod tests {
             let ts_ms = 1_776_000_000_000 + i * 1_000;
             let lt_mid = 78_000.0_f64;
             let ext_mid = match i {
-                60..130 => lt_mid * 1.002, // first pump
+                60..130 => lt_mid * 1.002,  // first pump
                 180..250 => lt_mid * 1.002, // second pump
                 _ => lt_mid,
             };
@@ -844,8 +835,8 @@ mod tests {
         let ref_path = dir.path().join("ref.jsonl");
         std::fs::write(&ref_path, ref_lines.join("\n")).unwrap();
 
-        let replay = DualReplay::new(ext_path.to_str().unwrap(), lt_path.to_str().unwrap())
-            .unwrap();
+        let replay =
+            DualReplay::new(ext_path.to_str().unwrap(), lt_path.to_str().unwrap()).unwrap();
         let mut cfg = BtConfig::default();
         cfg.signal.min_warmup_samples = 30;
         cfg.signal.persistence_sec = 5;
@@ -892,16 +883,16 @@ mod tests {
             c
         };
 
-        let replay = DualReplay::new(ext_path.to_str().unwrap(), lt_path.to_str().unwrap())
-            .unwrap();
+        let replay =
+            DualReplay::new(ext_path.to_str().unwrap(), lt_path.to_str().unwrap()).unwrap();
         let baseline = run_bt(&replay, make_cfg()).unwrap();
         assert_eq!(baseline.trades.len(), 1);
         let baseline_net = baseline.trades[0].net_pnl_usd;
 
         // Re-run with 5 bps round-trip slippage on Lighter. With $100
         // notional, the slippage cost should be 5 * 100 / 10000 = $0.05.
-        let replay2 = DualReplay::new(ext_path.to_str().unwrap(), lt_path.to_str().unwrap())
-            .unwrap();
+        let replay2 =
+            DualReplay::new(ext_path.to_str().unwrap(), lt_path.to_str().unwrap()).unwrap();
         let mut cfg = make_cfg();
         cfg.lighter_round_trip_slippage_bps = 5.0;
         let with_slip = run_bt(&replay2, cfg).unwrap();
@@ -911,7 +902,9 @@ mod tests {
         assert!(
             (diff - 0.05).abs() < 1e-6,
             "expected 5 bps slippage to cost $0.05, baseline {} - slip {} = {}",
-            baseline_net, slip_net, diff
+            baseline_net,
+            slip_net,
+            diff
         );
     }
 }

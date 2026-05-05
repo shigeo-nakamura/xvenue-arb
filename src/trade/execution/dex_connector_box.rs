@@ -1,20 +1,20 @@
 use async_trait::async_trait;
-use dex_connector::{
-    BalanceResponse, CanceledOrdersResponse, CreateOrderResponse, DexConnector, DexError,
-    FilledOrdersResponse, LastTradesResponse, OpenOrdersResponse,
-    OrderBookSnapshot, OrderSide, TickerResponse, TpSl, TriggerOrderStyle,
-};
-#[cfg(feature = "lighter-sdk")]
-use dex_connector::{create_lighter_connector, LighterConnector, LighterConnectorConfig};
 #[cfg(feature = "extended-sdk")]
 use dex_connector::create_extended_connector;
+#[cfg(feature = "lighter-sdk")]
+use dex_connector::{create_lighter_connector, LighterConnector, LighterConnectorConfig};
+use dex_connector::{
+    BalanceResponse, CanceledOrdersResponse, CreateOrderResponse, DexConnector, DexError,
+    FilledOrdersResponse, LastTradesResponse, OpenOrdersResponse, OrderBookSnapshot, OrderSide,
+    TickerResponse, TpSl, TriggerOrderStyle,
+};
 
 use rust_decimal::Decimal;
 
-#[cfg(feature = "lighter-sdk")]
-use crate::config::get_lighter_config_from_env;
 #[cfg(feature = "extended-sdk")]
 use crate::config::get_extended_config_from_env;
+#[cfg(feature = "lighter-sdk")]
+use crate::config::get_lighter_config_from_env;
 use crate::rate_limit_notifier::{notify_lighter_waf_cooldown, notify_rate_limit};
 use lazy_static::lazy_static;
 use std::env;
@@ -111,9 +111,7 @@ impl DexConnectorBox {
                         ob_stale_secs: None,
                     };
                     let tmp_connector = LighterConnector::new(tmp_config)?;
-                    account_index = tmp_connector
-                        .discover_account_index(wallet_address)
-                        .await?;
+                    account_index = tmp_connector.discover_account_index(wallet_address).await?;
                 }
 
                 let connector_config = LighterConnectorConfig {

@@ -218,7 +218,11 @@ impl<'a, V: VenueOps + ?Sized> ExtendedMakerLoop<'a, V> {
         };
         log::info!(
             "[XVENUE/extmaker] post_only placed round={} side={:?} qty={} price={} order_id={}",
-            round, req.side, remaining, price, placed.order_id
+            round,
+            req.side,
+            remaining,
+            price,
+            placed.order_id
         );
 
         let outcome = poll_until_terminal_or_deadline(
@@ -232,7 +236,10 @@ impl<'a, V: VenueOps + ?Sized> ExtendedMakerLoop<'a, V> {
         .await;
         log::info!(
             "[XVENUE/extmaker] post_only round={} done filled={} cancelled={} order_id={}",
-            round, outcome.filled_this_round, outcome.terminal_cancelled, placed.order_id
+            round,
+            outcome.filled_this_round,
+            outcome.terminal_cancelled,
+            placed.order_id
         );
 
         // Cancel residual regardless of outcome — Idempotent on the
@@ -261,7 +268,10 @@ impl<'a, V: VenueOps + ?Sized> ExtendedMakerLoop<'a, V> {
         };
         log::info!(
             "[XVENUE/extmaker] taker placed side={:?} qty={} reduce_only={} order_id={}",
-            req.side, residual, req.reduce_only, placed.order_id
+            req.side,
+            residual,
+            req.reduce_only,
+            placed.order_id
         );
         let mut outcome = poll_until_terminal_or_deadline(
             self.ops,
@@ -274,7 +284,9 @@ impl<'a, V: VenueOps + ?Sized> ExtendedMakerLoop<'a, V> {
         .await;
         log::info!(
             "[XVENUE/extmaker] taker done filled={} cancelled={} order_id={}",
-            outcome.filled_this_round, outcome.terminal_cancelled, placed.order_id
+            outcome.filled_this_round,
+            outcome.terminal_cancelled,
+            placed.order_id
         );
 
         // bot-strategy#298: WS-lag grace re-poll. The 2026-05-03
@@ -292,13 +304,20 @@ impl<'a, V: VenueOps + ?Sized> ExtendedMakerLoop<'a, V> {
             && self.cfg.taker_grace_poll_ms > 0
         {
             tokio::time::sleep(Duration::from_millis(self.cfg.taker_grace_poll_ms)).await;
-            match self.ops.poll_fill_status(&req.symbol, &placed.order_id).await {
+            match self
+                .ops
+                .poll_fill_status(&req.symbol, &placed.order_id)
+                .await
+            {
                 Ok(s) => {
                     if s.filled_qty > Decimal::ZERO {
                         log::info!(
                             "[XVENUE/extmaker] taker grace-recovered \
                              filled={} terminal={} cancelled={} order_id={}",
-                            s.filled_qty, s.terminal, s.cancelled, placed.order_id
+                            s.filled_qty,
+                            s.terminal,
+                            s.cancelled,
+                            placed.order_id
                         );
                         outcome = PollOutcome {
                             filled_this_round: s.filled_qty,
@@ -308,14 +327,17 @@ impl<'a, V: VenueOps + ?Sized> ExtendedMakerLoop<'a, V> {
                         log::warn!(
                             "[XVENUE/extmaker] taker grace-poll no-late-fill \
                              terminal={} cancelled={} order_id={}",
-                            s.terminal, s.cancelled, placed.order_id
+                            s.terminal,
+                            s.cancelled,
+                            placed.order_id
                         );
                     }
                 }
                 Err(e) => {
                     log::warn!(
                         "[XVENUE/extmaker] taker grace-poll err={:?} order_id={}",
-                        e, placed.order_id
+                        e,
+                        placed.order_id
                     );
                 }
             }
@@ -362,7 +384,9 @@ mod tests {
 
     fn cfg_with_taker_fallback() -> ExtendedMakerConfig {
         ExtendedMakerConfig {
-            common: CommonExecutorConfig { poll_interval_ms: 50 },
+            common: CommonExecutorConfig {
+                poll_interval_ms: 50,
+            },
             chase_ticks: 1,
             chase_retries: 3,
             chase_timeout_ms: 500,
@@ -374,7 +398,9 @@ mod tests {
 
     fn cfg_no_fallback() -> ExtendedMakerConfig {
         ExtendedMakerConfig {
-            common: CommonExecutorConfig { poll_interval_ms: 50 },
+            common: CommonExecutorConfig {
+                poll_interval_ms: 50,
+            },
             chase_ticks: 1,
             chase_retries: 2,
             chase_timeout_ms: 500,
@@ -405,11 +431,12 @@ mod tests {
                 best_ask: dec!(78001),
             };
             // Single poll returns terminal-filled with the full qty.
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.1),
-                terminal: true,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.1),
+                    terminal: true,
+                    cancelled: false,
+                }));
         });
         let cfg = cfg_with_taker_fallback();
         let lp = ExtendedMakerLoop::new(&ops, &cfg).with_poll_interval(10);
@@ -466,25 +493,30 @@ mod tests {
             // enough non-terminal-zero responses so they fall
             // through to default and the maker times out.
             for _ in 0..6 {
-                s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                    filled_qty: Decimal::ZERO,
-                    terminal: false,
-                    cancelled: false,
-                }));
+                s.poll_fill
+                    .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                        filled_qty: Decimal::ZERO,
+                        terminal: false,
+                        cancelled: false,
+                    }));
             }
-            s.place_taker.push_back(ScriptedResponse::PlacedOrder(PlacedOrder {
-                order_id: "taker-1".into(),
-            }));
+            s.place_taker
+                .push_back(ScriptedResponse::PlacedOrder(PlacedOrder {
+                    order_id: "taker-1".into(),
+                }));
             // Taker poll returns terminal-filled — popped after the
             // maker's 6 non-terminal polls.
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.1),
-                terminal: true,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.1),
+                    terminal: true,
+                    cancelled: false,
+                }));
         });
         let cfg = ExtendedMakerConfig {
-            common: CommonExecutorConfig { poll_interval_ms: 50 },
+            common: CommonExecutorConfig {
+                poll_interval_ms: 50,
+            },
             chase_ticks: 1,
             chase_retries: 1, // single chase round, then fallback
             chase_timeout_ms: 100,
@@ -511,25 +543,30 @@ mod tests {
             };
             // FIFO order: first push = first popped.
             // Maker round 1 polls — partial 0.04, then terminal at 0.04.
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.04),
-                terminal: false,
-                cancelled: false,
-            }));
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.04),
-                terminal: true,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.04),
+                    terminal: false,
+                    cancelled: false,
+                }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.04),
+                    terminal: true,
+                    cancelled: false,
+                }));
             // Taker fallback poll: fills the 0.06 residual.
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.06),
-                terminal: true,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.06),
+                    terminal: true,
+                    cancelled: false,
+                }));
         });
         let cfg = ExtendedMakerConfig {
-            common: CommonExecutorConfig { poll_interval_ms: 50 },
+            common: CommonExecutorConfig {
+                poll_interval_ms: 50,
+            },
             chase_ticks: 1,
             chase_retries: 1,
             chase_timeout_ms: 200,
@@ -552,11 +589,12 @@ mod tests {
                 best_bid: dec!(78000),
                 best_ask: dec!(78001),
             };
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.1),
-                terminal: true,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.1),
+                    terminal: true,
+                    cancelled: false,
+                }));
         });
         let cfg = cfg_with_taker_fallback();
         let lp = ExtendedMakerLoop::new(&ops, &cfg).with_poll_interval(10);
@@ -577,14 +615,17 @@ mod tests {
                 best_bid: dec!(78000),
                 best_ask: dec!(78001),
             };
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.1),
-                terminal: true,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.1),
+                    terminal: true,
+                    cancelled: false,
+                }));
         });
         let cfg = ExtendedMakerConfig {
-            common: CommonExecutorConfig { poll_interval_ms: 50 },
+            common: CommonExecutorConfig {
+                poll_interval_ms: 50,
+            },
             chase_ticks: 1,
             chase_retries: 0,
             chase_timeout_ms: 500,
@@ -622,13 +663,15 @@ mod tests {
                 best_bid: dec!(78000),
                 best_ask: dec!(78001),
             };
-            s.place_post_only.push_back(ScriptedResponse::Err("auth fail".into()));
+            s.place_post_only
+                .push_back(ScriptedResponse::Err("auth fail".into()));
             // Taker succeeds.
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.1),
-                terminal: true,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.1),
+                    terminal: true,
+                    cancelled: false,
+                }));
         });
         let cfg = cfg_with_taker_fallback();
         let lp = ExtendedMakerLoop::new(&ops, &cfg).with_poll_interval(10);
@@ -645,7 +688,8 @@ mod tests {
                 best_bid: dec!(78000),
                 best_ask: dec!(78001),
             };
-            s.place_post_only.push_back(ScriptedResponse::Err("auth fail".into()));
+            s.place_post_only
+                .push_back(ScriptedResponse::Err("auth fail".into()));
         });
         let cfg = cfg_no_fallback();
         let lp = ExtendedMakerLoop::new(&ops, &cfg).with_poll_interval(10);
@@ -669,20 +713,24 @@ mod tests {
                 best_ask: dec!(78001),
             };
             // FIFO: round 1 first → terminal-cancelled with zero fill.
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.0),
-                terminal: true,
-                cancelled: true,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.0),
+                    terminal: true,
+                    cancelled: true,
+                }));
             // Round 2 next → terminal-filled.
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.1),
-                terminal: true,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.1),
+                    terminal: true,
+                    cancelled: false,
+                }));
         });
         let cfg = ExtendedMakerConfig {
-            common: CommonExecutorConfig { poll_interval_ms: 50 },
+            common: CommonExecutorConfig {
+                poll_interval_ms: 50,
+            },
             chase_ticks: 1,
             chase_retries: 2,
             chase_timeout_ms: 100,
@@ -705,14 +753,17 @@ mod tests {
                 best_bid: dec!(78000),
                 best_ask: dec!(78001),
             };
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.1),
-                terminal: true,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.1),
+                    terminal: true,
+                    cancelled: false,
+                }));
         });
         let cfg = ExtendedMakerConfig {
-            common: CommonExecutorConfig { poll_interval_ms: 50 },
+            common: CommonExecutorConfig {
+                poll_interval_ms: 50,
+            },
             chase_ticks: 1,
             chase_retries: 0,
             chase_timeout_ms: 100,
@@ -749,14 +800,17 @@ mod tests {
             };
             // Single chase round fills 0.021 of the 0.0216 target.
             // residual = 0.0006 < venue_min_qty (0.01) → no taker.
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.021),
-                terminal: true,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.021),
+                    terminal: true,
+                    cancelled: false,
+                }));
         });
         let cfg = ExtendedMakerConfig {
-            common: CommonExecutorConfig { poll_interval_ms: 50 },
+            common: CommonExecutorConfig {
+                poll_interval_ms: 50,
+            },
             chase_ticks: 1,
             chase_retries: 1,
             chase_timeout_ms: 100,
@@ -794,20 +848,24 @@ mod tests {
             };
             // post_only round 0: 0.021 of 0.0216 (zero-fill cancelled
             // would loop, so report terminal-filled with the partial).
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.021),
-                terminal: true,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.021),
+                    terminal: true,
+                    cancelled: false,
+                }));
             // Taker poll fills the 0.0006 residual.
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.0006),
-                terminal: true,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.0006),
+                    terminal: true,
+                    cancelled: false,
+                }));
         });
         let cfg = ExtendedMakerConfig {
-            common: CommonExecutorConfig { poll_interval_ms: 50 },
+            common: CommonExecutorConfig {
+                poll_interval_ms: 50,
+            },
             chase_ticks: 1,
             chase_retries: 1,
             chase_timeout_ms: 100,
@@ -842,20 +900,24 @@ mod tests {
             // Maker stage skipped (post_only=false); straight to taker.
             // First poll-loop reports filled=0 cancelled=false until
             // the deadline (FillStatus with terminal=false stays open).
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: Decimal::ZERO,
-                terminal: false,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: Decimal::ZERO,
+                    terminal: false,
+                    cancelled: false,
+                }));
             // The grace re-poll sees the late fill.
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.021),
-                terminal: true,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.021),
+                    terminal: true,
+                    cancelled: false,
+                }));
         });
         let cfg = ExtendedMakerConfig {
-            common: CommonExecutorConfig { poll_interval_ms: 50 },
+            common: CommonExecutorConfig {
+                poll_interval_ms: 50,
+            },
             chase_ticks: 1,
             chase_retries: 0,
             chase_timeout_ms: 50,
@@ -884,20 +946,24 @@ mod tests {
                 best_ask: dec!(2301),
             };
             // Initial taker poll: never terminal.
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: Decimal::ZERO,
-                terminal: false,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: Decimal::ZERO,
+                    terminal: false,
+                    cancelled: false,
+                }));
             // Grace re-poll: still no fill.
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: Decimal::ZERO,
-                terminal: false,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: Decimal::ZERO,
+                    terminal: false,
+                    cancelled: false,
+                }));
         });
         let cfg = ExtendedMakerConfig {
-            common: CommonExecutorConfig { poll_interval_ms: 50 },
+            common: CommonExecutorConfig {
+                poll_interval_ms: 50,
+            },
             chase_ticks: 1,
             chase_retries: 0,
             chase_timeout_ms: 50,

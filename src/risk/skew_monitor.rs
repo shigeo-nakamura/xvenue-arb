@@ -161,7 +161,10 @@ mod tests {
         let mut m = SkewMonitor::new(50.0);
         let res = m.evaluate(50.01);
         match res {
-            SkewOutcome::Breach { skew_usd, threshold_usd } => {
+            SkewOutcome::Breach {
+                skew_usd,
+                threshold_usd,
+            } => {
                 assert!((skew_usd - 50.01).abs() < 1e-9);
                 assert_eq!(threshold_usd, 50.0);
             }

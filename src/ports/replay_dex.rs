@@ -7,8 +7,8 @@ use dex_connector::{
     TriggerOrderStyle,
 };
 use rand;
-use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
@@ -193,7 +193,10 @@ impl ReplayConnector {
             .map_err(|e| DexError::Other(format!("failed to read bincode file: {}", e)))?;
         let bincode_data: Vec<BincodeDataEntry> = bincode::deserialize(&bytes)
             .map_err(|e| DexError::Other(format!("failed to deserialize bincode: {}", e)))?;
-        Ok(bincode_data.into_iter().map(DumpedDataEntry::from).collect())
+        Ok(bincode_data
+            .into_iter()
+            .map(DumpedDataEntry::from)
+            .collect())
     }
 
     /// Convert a JSONL file to bincode format. Used by the convert-data tool.
@@ -232,8 +235,10 @@ impl ReplayConnector {
             filtered.len(),
             interval_secs
         );
-        let bincode_data: Vec<BincodeDataEntry> =
-            filtered.iter().map(|e| BincodeDataEntry::from(*e)).collect();
+        let bincode_data: Vec<BincodeDataEntry> = filtered
+            .iter()
+            .map(|e| BincodeDataEntry::from(*e))
+            .collect();
         let bytes = bincode::serialize(&bincode_data)
             .map_err(|e| DexError::Other(format!("failed to serialize bincode: {}", e)))?;
         std::fs::write(output, bytes)

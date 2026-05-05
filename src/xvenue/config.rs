@@ -506,8 +506,8 @@ impl XvenueConfig {
     /// `Result` so a bad value caught only at use-site surfaces an
     /// error instead of panicking.
     pub fn lighter_fill_config(&self) -> Result<LighterFillConfig> {
-        let order_type = parse_lighter_order_type(&self.lighter_order_type)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let order_type =
+            parse_lighter_order_type(&self.lighter_order_type).map_err(|e| anyhow::anyhow!(e))?;
         Ok(LighterFillConfig {
             common: crate::trade::execution::types::CommonExecutorConfig {
                 poll_interval_ms: 25,
@@ -1015,9 +1015,8 @@ lighter_order_type: post-only
             "configs/xvenue-arb/debot-xvenue-arb-eth.yaml",
             "configs/xvenue-arb/debot-xvenue-arb-btc.yaml",
         ] {
-            let cfg = XvenueConfig::from_yaml_path(p).unwrap_or_else(|e| {
-                panic!("failed to load shipped config {}: {:?}", p, e)
-            });
+            let cfg = XvenueConfig::from_yaml_path(p)
+                .unwrap_or_else(|e| panic!("failed to load shipped config {}: {:?}", p, e));
             // Sanity: signal/spread builders round-trip without panic.
             let _ = cfg.signal_config();
             let _ = cfg.spread_config();

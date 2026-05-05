@@ -11,12 +11,12 @@ fn main() {
 
     let input = &args[1];
     let output = &args[2];
-    let interval_secs: u64 = args
-        .get(3)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(5);
+    let interval_secs: u64 = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(5);
 
-    eprintln!("Converting {} -> {} (interval={}s) ...", input, output, interval_secs);
+    eprintln!(
+        "Converting {} -> {} (interval={}s) ...",
+        input, output, interval_secs
+    );
     match debot::ports::replay_dex::ReplayConnector::convert_jsonl_to_bincode_with_interval(
         input,
         output,

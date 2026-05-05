@@ -181,11 +181,9 @@ fn strip_quote_suffix(symbol: &str) -> String {
 #[async_trait]
 impl LegStateReader for LiveLegStateReader {
     async fn read_leg_qtys(&self) -> Result<LegQtys> {
-        let (ext_pos, lt_pos) = tokio::try_join!(
-            self.ext_conn.get_positions(),
-            self.lt_conn.get_positions(),
-        )
-        .map_err(|e| anyhow!("get_positions: {}", e))?;
+        let (ext_pos, lt_pos) =
+            tokio::try_join!(self.ext_conn.get_positions(), self.lt_conn.get_positions(),)
+                .map_err(|e| anyhow!("get_positions: {}", e))?;
         let ext = ext_pos
             .iter()
             .find(|p| p.symbol == self.ext_symbol)
@@ -264,12 +262,18 @@ where
             // mask the Extended-side counter or vice versa — the
             // tripwire counter is per-call, not per-venue.
             if !qtys.ext.is_zero() {
-                if !self.try_close(self.ext_ops, VenueLabel::Extended, tripwire).await {
+                if !self
+                    .try_close(self.ext_ops, VenueLabel::Extended, tripwire)
+                    .await
+                {
                     return EmergencyLoopOutcome::Stuck;
                 }
             }
             if !qtys.lt.is_zero() {
-                if !self.try_close(self.lt_ops, VenueLabel::Lighter, tripwire).await {
+                if !self
+                    .try_close(self.lt_ops, VenueLabel::Lighter, tripwire)
+                    .await
+                {
                     return EmergencyLoopOutcome::Stuck;
                 }
             }
@@ -502,13 +506,11 @@ mod tests {
         ext_ops.with_state(|s| {
             // 4 errs, then Ok, then 4 errs.
             for _ in 0..4 {
-                s.close_all
-                    .push_back(ScriptedResponse::Err("blip".into()));
+                s.close_all.push_back(ScriptedResponse::Err("blip".into()));
             }
             s.close_all.push_back(ScriptedResponse::Ok);
             for _ in 0..4 {
-                s.close_all
-                    .push_back(ScriptedResponse::Err("blip".into()));
+                s.close_all.push_back(ScriptedResponse::Err("blip".into()));
             }
         });
         // Keep Extended permanently non-zero so the loop keeps trying.
@@ -567,8 +569,7 @@ mod tests {
         // Round 3: ext fail (5) → arms STUCK; lt is not attempted
         //                          this round because the loop returns
         //                          Stuck immediately on arm.
-        let total_calls =
-            ext_ops.snapshot_close_alls().len() + lt_ops.snapshot_close_alls().len();
+        let total_calls = ext_ops.snapshot_close_alls().len() + lt_ops.snapshot_close_alls().len();
         assert_eq!(total_calls, 5);
     }
 

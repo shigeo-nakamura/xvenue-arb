@@ -273,12 +273,10 @@ impl StuckTripwire {
         let kill = self.config.enter_timeout_consec_fail_to_kill;
         if kill == 0 {
             // Gate disabled — count for visibility only.
-            self.enter_timeout_consec_fail =
-                self.enter_timeout_consec_fail.saturating_add(1);
+            self.enter_timeout_consec_fail = self.enter_timeout_consec_fail.saturating_add(1);
             return false;
         }
-        self.enter_timeout_consec_fail =
-            self.enter_timeout_consec_fail.saturating_add(1);
+        self.enter_timeout_consec_fail = self.enter_timeout_consec_fail.saturating_add(1);
         if self.enter_timeout_consec_fail >= kill {
             log::error!(
                 "[KILL_SWITCH] enter-timeout consec fails={} >= kill={} — arming STUCK",
@@ -542,9 +540,7 @@ mod tests {
     fn reduce_only_progression_returns_true_only_at_threshold() {
         let tmp = TempDir::new().unwrap();
         let mut t = StuckTripwire::new_for_test(cfg_in(&tmp));
-        let returns: Vec<bool> = (0..5)
-            .map(|_| t.record_reduce_only_failure())
-            .collect();
+        let returns: Vec<bool> = (0..5).map(|_| t.record_reduce_only_failure()).collect();
         assert_eq!(returns, vec![false, false, false, false, true]);
     }
 

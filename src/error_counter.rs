@@ -314,7 +314,11 @@ mod tests {
     fn fake_log(counters: &Counters, ts: i64, level: Level, msg: &str) {
         if is_ws_recovery_event(msg) {
             let cutoff = ts - WS_DEFER_WINDOW_SECS;
-            counters.pending_ws.lock().unwrap().retain(|e| e.ts < cutoff);
+            counters
+                .pending_ws
+                .lock()
+                .unwrap()
+                .retain(|e| e.ts < cutoff);
         }
         flush_expired_pending_ws(counters, ts);
         if level != Level::Error && level != Level::Warn {
@@ -325,11 +329,15 @@ mod tests {
         }
         let truncated = msg.to_string();
         if is_ws_transient_event(&truncated) {
-            counters.pending_ws.lock().unwrap().push_back(PendingWsEntry {
-                ts,
-                level,
-                message: truncated,
-            });
+            counters
+                .pending_ws
+                .lock()
+                .unwrap()
+                .push_back(PendingWsEntry {
+                    ts,
+                    level,
+                    message: truncated,
+                });
         } else {
             counters.recent.lock().unwrap().push_back((ts, level));
             if level == Level::Error {
@@ -381,12 +389,37 @@ mod tests {
         let c = make_counters();
         let t0 = 1_000_000;
         // Simulate the #260 sequence verbatim (~27s window).
-        fake_log(&c, t0, Level::Error, "WebSocket error: IO error: Connection reset by peer (os error 104)");
-        fake_log(&c, t0, Level::Error, "WebSocket IO error detail: kind=ConnectionReset, error=Connection reset by peer");
+        fake_log(
+            &c,
+            t0,
+            Level::Error,
+            "WebSocket error: IO error: Connection reset by peer (os error 104)",
+        );
+        fake_log(
+            &c,
+            t0,
+            Level::Error,
+            "WebSocket IO error detail: kind=ConnectionReset, error=Connection reset by peer",
+        );
         fake_log(&c, t0 + 18, Level::Warn, "[XVENUE] tick error: read_mid Lighter\n\nCaused by:\n    get_order_book(ETH, 1): Other(\"order book snapshot unavailable (no recent update)\")");
-        fake_log(&c, t0 + 23, Level::Warn, "[XVENUE] tick error: read_mid Lighter");
-        fake_log(&c, t0 + 27, Level::Info, "WebSocket connected successfully: ...");
-        fake_log(&c, t0 + 27, Level::Info, "WebSocket subscriptions sent successfully");
+        fake_log(
+            &c,
+            t0 + 23,
+            Level::Warn,
+            "[XVENUE] tick error: read_mid Lighter",
+        );
+        fake_log(
+            &c,
+            t0 + 27,
+            Level::Info,
+            "WebSocket connected successfully: ...",
+        );
+        fake_log(
+            &c,
+            t0 + 27,
+            Level::Info,
+            "WebSocket subscriptions sent successfully",
+        );
         assert!(
             c.pending_ws.lock().unwrap().is_empty(),
             "recovery within window must drain pending WS entries"
@@ -401,8 +434,18 @@ mod tests {
         let _g = _serialize();
         let c = make_counters();
         let t0 = 2_000_000;
-        fake_log(&c, t0, Level::Error, "WebSocket error: IO error: Connection reset by peer (os error 104)");
-        fake_log(&c, t0 + 5, Level::Warn, "[XVENUE] tick error: read_mid Lighter");
+        fake_log(
+            &c,
+            t0,
+            Level::Error,
+            "WebSocket error: IO error: Connection reset by peer (os error 104)",
+        );
+        fake_log(
+            &c,
+            t0 + 5,
+            Level::Warn,
+            "[XVENUE] tick error: read_mid Lighter",
+        );
         let (e0, w0) = snap_counts(&c, t0 + 30);
         assert_eq!((e0, w0), (0, 0), "pre-deadline must not commit");
         let (e1, w1) = snap_counts(&c, t0 + WS_DEFER_WINDOW_SECS + 10);
@@ -415,10 +458,20 @@ mod tests {
         let _g = _serialize();
         let c = make_counters();
         let t0 = 3_000_000;
-        fake_log(&c, t0, Level::Error, "WebSocket error: IO error: Connection reset by peer");
+        fake_log(
+            &c,
+            t0,
+            Level::Error,
+            "WebSocket error: IO error: Connection reset by peer",
+        );
         let (e0, _) = snap_counts(&c, t0 + WS_DEFER_WINDOW_SECS + 1);
         assert_eq!(e0, 1, "post-deadline ERROR commits");
-        fake_log(&c, t0 + 120, Level::Info, "WebSocket connected successfully: ...");
+        fake_log(
+            &c,
+            t0 + 120,
+            Level::Info,
+            "WebSocket connected successfully: ...",
+        );
         let (e1, _) = snap_counts(&c, t0 + 130);
         assert_eq!(e1, 1, "late recovery cannot uncommit");
     }
@@ -448,7 +501,12 @@ mod tests {
         assert_eq!(e0, 1);
 
         set_counting_suppressed(true);
-        fake_log(&c, t0 + 5, Level::Error, "[UNHEDGED] BTC/ETH close failed err=ServerResponse(\"Maintenance mode\")");
+        fake_log(
+            &c,
+            t0 + 5,
+            Level::Error,
+            "[UNHEDGED] BTC/ETH close failed err=ServerResponse(\"Maintenance mode\")",
+        );
         fake_log(&c, t0 + 6, Level::Warn, "[XVENUE/extmaker] place_taker err=create_order_taker_ioc ETH-USD: Server response error: Maintenance mode");
         let (e1, w1) = snap_counts(&c, t0 + 10);
         assert_eq!(e1, 1, "ERROR must not increment while suppressed");

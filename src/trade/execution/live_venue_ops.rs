@@ -110,16 +110,8 @@ impl VenueOps for LiveVenueOps {
             .get_order_book(symbol, 1)
             .await
             .map_err(|e| anyhow!("get_order_book {}: {}", symbol, e))?;
-        let best_bid = snap
-            .bids
-            .first()
-            .map(|l| l.price)
-            .unwrap_or(Decimal::ZERO);
-        let best_ask = snap
-            .asks
-            .first()
-            .map(|l| l.price)
-            .unwrap_or(Decimal::ZERO);
+        let best_bid = snap.bids.first().map(|l| l.price).unwrap_or(Decimal::ZERO);
+        let best_ask = snap.asks.first().map(|l| l.price).unwrap_or(Decimal::ZERO);
         Ok(TopOfBook { best_bid, best_ask })
     }
 
@@ -180,11 +172,7 @@ impl VenueOps for LiveVenueOps {
             .map_err(|e| anyhow!("cancel_order {} {}: {}", symbol, order_id, e))
     }
 
-    async fn poll_fill_status(
-        &self,
-        symbol: &str,
-        order_id: &str,
-    ) -> Result<OrderFillStatus> {
+    async fn poll_fill_status(&self, symbol: &str, order_id: &str) -> Result<OrderFillStatus> {
         let (filled, canceled, open) = tokio::try_join!(
             self.conn.get_filled_orders(symbol),
             self.conn.get_canceled_orders(symbol),
@@ -223,7 +211,8 @@ impl VenueOps for LiveVenueOps {
                 .find(|o| o.order_id == order_id && o.is_rejected);
             log::warn!(
                 "[XVENUE/extmaker] order rejected by venue order_id={} detail={:?}",
-                order_id, detail
+                order_id,
+                detail
             );
         }
 
@@ -458,17 +447,10 @@ mod tests {
         async fn cancel_all_orders(&self, _: Option<String>) -> Result<(), DexError> {
             Ok(())
         }
-        async fn cancel_orders(
-            &self,
-            _: Option<String>,
-            _: Vec<String>,
-        ) -> Result<(), DexError> {
+        async fn cancel_orders(&self, _: Option<String>, _: Vec<String>) -> Result<(), DexError> {
             Ok(())
         }
-        async fn close_all_positions(
-            &self,
-            symbol: Option<String>,
-        ) -> Result<(), DexError> {
+        async fn close_all_positions(&self, symbol: Option<String>) -> Result<(), DexError> {
             let mut g = self.state.lock().unwrap();
             g.close_all_calls.push(symbol);
             if let Some(msg) = g.close_all_err.take() {
@@ -605,10 +587,7 @@ mod tests {
         let ops = LiveVenueOps::new(stub_arc.clone());
         ops.cancel("BTC-USD", "order-42").await.unwrap();
         let calls = stub_arc.state.lock().unwrap().cancel_order_calls.clone();
-        assert_eq!(
-            calls,
-            vec![("BTC-USD".to_string(), "order-42".to_string())]
-        );
+        assert_eq!(calls, vec![("BTC-USD".to_string(), "order-42".to_string())]);
     }
 
     #[tokio::test]

@@ -99,7 +99,8 @@ impl<'a, V: VenueOps + ?Sized> LighterFillLoop<'a, V> {
         // Aggressive-limit with a non-positive price would be
         // rejected by the venue; surface it as VenueRejected before
         // burning a place call.
-        if matches!(self.cfg.order_type, LighterOrderType::AggressiveLimit) && price <= Decimal::ZERO
+        if matches!(self.cfg.order_type, LighterOrderType::AggressiveLimit)
+            && price <= Decimal::ZERO
         {
             return LighterTerminal::Failed {
                 reason: ExecutionFailure::VenueRejected,
@@ -159,7 +160,6 @@ impl<'a, V: VenueOps + ?Sized> LighterFillLoop<'a, V> {
             }
         }
     }
-
 }
 
 #[async_trait]
@@ -184,7 +184,9 @@ fn price_for_aggressive(side: OrderSide, book: &TopOfBook) -> Decimal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trade::execution::types::{CommonExecutorConfig, LighterFillConfig, LighterOrderType};
+    use crate::trade::execution::types::{
+        CommonExecutorConfig, LighterFillConfig, LighterOrderType,
+    };
     use crate::trade::execution::venue_ops::{
         OrderFillStatus, ScriptedResponse, ScriptedVenueOps, TopOfBook,
     };
@@ -192,7 +194,9 @@ mod tests {
 
     fn cfg_market() -> LighterFillConfig {
         LighterFillConfig {
-            common: CommonExecutorConfig { poll_interval_ms: 25 },
+            common: CommonExecutorConfig {
+                poll_interval_ms: 25,
+            },
             order_type: LighterOrderType::Market,
             fill_timeout_ms: 100,
         }
@@ -200,7 +204,9 @@ mod tests {
 
     fn cfg_aggressive() -> LighterFillConfig {
         LighterFillConfig {
-            common: CommonExecutorConfig { poll_interval_ms: 25 },
+            common: CommonExecutorConfig {
+                poll_interval_ms: 25,
+            },
             order_type: LighterOrderType::AggressiveLimit,
             fill_timeout_ms: 100,
         }
@@ -221,11 +227,12 @@ mod tests {
     async fn market_fills_in_one_poll() {
         let ops = ScriptedVenueOps::new();
         ops.with_state(|s| {
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.1),
-                terminal: true,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.1),
+                    terminal: true,
+                    cancelled: false,
+                }));
         });
         let cfg = cfg_market();
         let lp = LighterFillLoop::new(&ops, &cfg).with_poll_interval(10);
@@ -260,19 +267,23 @@ mod tests {
         ops.with_state(|s| {
             // Several non-terminal partials, then default-zero polls
             // run out the clock. Aggregator keeps the max.
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.04),
-                terminal: false,
-                cancelled: false,
-            }));
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.06),
-                terminal: false,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.04),
+                    terminal: false,
+                    cancelled: false,
+                }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.06),
+                    terminal: false,
+                    cancelled: false,
+                }));
         });
         let cfg = LighterFillConfig {
-            common: CommonExecutorConfig { poll_interval_ms: 25 },
+            common: CommonExecutorConfig {
+                poll_interval_ms: 25,
+            },
             order_type: LighterOrderType::Market,
             fill_timeout_ms: 60,
         };
@@ -292,11 +303,12 @@ mod tests {
                 best_bid: dec!(78000),
                 best_ask: dec!(78001),
             };
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.1),
-                terminal: true,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.1),
+                    terminal: true,
+                    cancelled: false,
+                }));
         });
         let cfg = cfg_aggressive();
         let lp = LighterFillLoop::new(&ops, &cfg).with_poll_interval(10);
@@ -335,7 +347,8 @@ mod tests {
     async fn place_error_returns_venue_rejected() {
         let ops = ScriptedVenueOps::new();
         ops.with_state(|s| {
-            s.place_taker.push_back(ScriptedResponse::Err("rate limit".into()));
+            s.place_taker
+                .push_back(ScriptedResponse::Err("rate limit".into()));
         });
         let cfg = cfg_market();
         let lp = LighterFillLoop::new(&ops, &cfg).with_poll_interval(10);
@@ -367,11 +380,12 @@ mod tests {
     async fn venue_cancel_before_fill_returns_cancelled() {
         let ops = ScriptedVenueOps::new();
         ops.with_state(|s| {
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: Decimal::ZERO,
-                terminal: true,
-                cancelled: true,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: Decimal::ZERO,
+                    terminal: true,
+                    cancelled: true,
+                }));
         });
         let cfg = cfg_market();
         let lp = LighterFillLoop::new(&ops, &cfg).with_poll_interval(10);
@@ -388,11 +402,12 @@ mod tests {
     async fn reduce_only_flag_propagates() {
         let ops = ScriptedVenueOps::new();
         ops.with_state(|s| {
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.1),
-                terminal: true,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.1),
+                    terminal: true,
+                    cancelled: false,
+                }));
         });
         let cfg = cfg_market();
         let lp = LighterFillLoop::new(&ops, &cfg).with_poll_interval(10);

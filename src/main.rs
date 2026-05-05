@@ -178,10 +178,14 @@ async fn run() -> anyhow::Result<()> {
         let extended = build_extended(&cfg.symbol_ext).await?;
 
         log::info!("[BOOT] starting Lighter connector");
-        lighter.start().await
+        lighter
+            .start()
+            .await
             .map_err(|e| anyhow::anyhow!("lighter.start: {:?}", e))?;
         log::info!("[BOOT] starting Extended connector");
-        extended.start().await
+        extended
+            .start()
+            .await
             .map_err(|e| anyhow::anyhow!("extended.start: {:?}", e))?;
 
         let hub = Arc::new(LiveVenueHub {
@@ -214,8 +218,7 @@ async fn run() -> anyhow::Result<()> {
             cfg.symbol_lt.clone(),
         ));
         let live_exec = Arc::new(
-            LiveExecution::from_config(&cfg, ext_ops, lt_ops)?
-                .with_leg_reader(leg_reader),
+            LiveExecution::from_config(&cfg, ext_ops, lt_ops)?.with_leg_reader(leg_reader),
         );
 
         // Wire SIGTERM + SIGINT to a oneshot so the loop exits cleanly.
@@ -269,7 +272,10 @@ async fn main() -> std::io::Result<()> {
     log::info!("xvenue-arb starting (bot-strategy#166 Phase 2 paper trading)");
     if let Err(e) = run().await {
         log::error!("[FATAL] {:?}", e);
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            e.to_string(),
+        ));
     }
     Ok(())
 }

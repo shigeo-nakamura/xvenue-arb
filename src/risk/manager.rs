@@ -241,10 +241,9 @@ impl RiskManager {
             Some(last) => now_ts - last.ts >= self.config.session_dd_sample_secs as i64,
         };
         if due {
-            self.state.equity_samples.push(EquitySample {
-                ts: now_ts,
-                equity,
-            });
+            self.state
+                .equity_samples
+                .push(EquitySample { ts: now_ts, equity });
         }
 
         // Rolling peak from the retained samples (plus the new one).
@@ -321,7 +320,10 @@ impl RiskManager {
                         instance_id: self.instance_id.clone(),
                         kind: "daily_dd".into(),
                         event_type: "activated".into(),
-                        reason: Some(format!("bps={:.1} thresh={}", bps, self.config.max_daily_loss_bps)),
+                        reason: Some(format!(
+                            "bps={:.1} thresh={}",
+                            bps, self.config.max_daily_loss_bps
+                        )),
                         detail: Some(serde_json::json!({
                             "realized_pnl_today": self.state.realized_pnl_today,
                             "session_start_equity": self.state.session_start_equity,
@@ -340,8 +342,8 @@ impl RiskManager {
             return None;
         }
         let bps = self.daily_pnl_bps().unwrap_or(0.0);
-        let halted = self.config.max_daily_loss_bps > 0
-            && bps <= -(self.config.max_daily_loss_bps as f64);
+        let halted =
+            self.config.max_daily_loss_bps > 0 && bps <= -(self.config.max_daily_loss_bps as f64);
         Some(DailyRiskSnapshot {
             daily_pnl: self.state.realized_pnl_today,
             daily_pnl_bps: bps,
@@ -414,7 +416,10 @@ impl RiskManager {
             // here would freeze a 0 baseline forever.
             return;
         }
-        let prev_day = utc_session_day(self.state.session_start_ts, self.config.daily_reset_utc_hour);
+        let prev_day = utc_session_day(
+            self.state.session_start_ts,
+            self.config.daily_reset_utc_hour,
+        );
         let cur_day = utc_session_day(now_ts, self.config.daily_reset_utc_hour);
         if cur_day > prev_day {
             log::info!(
@@ -538,13 +543,10 @@ impl RiskManager {
 
     fn maybe_arm_cooldown(&mut self, now_ts: i64) {
         let losses = self.state.consecutive_losses;
-        let secs = if self.config.cb_tier2_threshold > 0
-            && losses >= self.config.cb_tier2_threshold
+        let secs = if self.config.cb_tier2_threshold > 0 && losses >= self.config.cb_tier2_threshold
         {
             self.config.cb_tier2_cooldown_secs
-        } else if self.config.cb_tier1_threshold > 0
-            && losses >= self.config.cb_tier1_threshold
-        {
+        } else if self.config.cb_tier1_threshold > 0 && losses >= self.config.cb_tier1_threshold {
             self.config.cb_tier1_cooldown_secs
         } else {
             return;
@@ -552,7 +554,11 @@ impl RiskManager {
         let until = now_ts + secs;
         // Take the more conservative (later) of any active cooldown
         // and the new one.
-        let final_until = self.state.cb_until_ts.map(|prev| prev.max(until)).unwrap_or(until);
+        let final_until = self
+            .state
+            .cb_until_ts
+            .map(|prev| prev.max(until))
+            .unwrap_or(until);
         self.state.cb_until_ts = Some(final_until);
         log::warn!(
             "[RISK] circuit_breaker armed: losses={} cooldown_secs={} until_ts={}",
@@ -874,7 +880,10 @@ mod tests {
         assert_eq!(utc_session_day(t0 + 86_400, 0) - utc_session_day(t0, 0), 1);
         // Reset-hour offset shifts where the day boundary lands but
         // does not change the 1-day delta.
-        assert_eq!(utc_session_day(t0 + 86_400, 12) - utc_session_day(t0, 12), 1);
+        assert_eq!(
+            utc_session_day(t0 + 86_400, 12) - utc_session_day(t0, 12),
+            1
+        );
         // A 12-hour shift can land an instant in the previous bucket
         // when reset_hour is set to bring midnight forward.
         let mid_day: i64 = 1_700_000_000 + 6 * 3_600;

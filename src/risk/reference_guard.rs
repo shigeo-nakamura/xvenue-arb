@@ -257,11 +257,7 @@ async fn poll_loop(symbol: String, state: Arc<RwLock<Option<ReferenceMid>>>) {
         "https://api.binance.com/api/v3/klines?symbol={}&interval=1m&limit=1",
         symbol
     );
-    log::info!(
-        "[REF_GUARD] polling {} every {}s",
-        url,
-        POLL_INTERVAL_SECS
-    );
+    log::info!("[REF_GUARD] polling {} every {}s", url, POLL_INTERVAL_SECS);
     let mut ivl = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
     ivl.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -386,7 +382,13 @@ mod tests {
         // Reference observed 5 minutes ago — over the 3 minute cap.
         let r = ref_mid(2_000.0, 5 * 60);
         let breached = 2_000.0 * (1.0 + 100.0 / 10_000.0);
-        let (e, l) = g.evaluate(60_000, breached, breached, Some(&r), chrono::Utc::now().timestamp());
+        let (e, l) = g.evaluate(
+            60_000,
+            breached,
+            breached,
+            Some(&r),
+            chrono::Utc::now().timestamp(),
+        );
         assert_eq!(e, RefCheckOutcome::Stale);
         assert_eq!(l, RefCheckOutcome::Stale);
     }

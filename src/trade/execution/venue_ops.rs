@@ -259,7 +259,8 @@ impl VenueOps for ScriptedVenueOps {
     ) -> Result<PlacedOrder> {
         let resp_opt = {
             let mut g = self.inner.lock().unwrap();
-            g.posts.push((symbol.to_string(), side, qty, price, reduce_only));
+            g.posts
+                .push((symbol.to_string(), side, qty, price, reduce_only));
             g.place_post_only.pop_front()
         };
         match resp_opt {
@@ -312,11 +313,7 @@ impl VenueOps for ScriptedVenueOps {
         }
     }
 
-    async fn poll_fill_status(
-        &self,
-        _symbol: &str,
-        _order_id: &str,
-    ) -> Result<OrderFillStatus> {
+    async fn poll_fill_status(&self, _symbol: &str, _order_id: &str) -> Result<OrderFillStatus> {
         let mut g = self.inner.lock().unwrap();
         if let Some(resp) = g.poll_fill.pop_front() {
             match resp {
@@ -404,7 +401,8 @@ mod tests {
     async fn scripted_err_propagates() {
         let ops = ScriptedVenueOps::new();
         ops.with_state(|s| {
-            s.place_post_only.push_back(ScriptedResponse::Err("boom".into()));
+            s.place_post_only
+                .push_back(ScriptedResponse::Err("boom".into()));
         });
         let err = ops
             .place_post_only("BTC-USD", OrderSide::Long, dec!(0.1), dec!(78000), false)

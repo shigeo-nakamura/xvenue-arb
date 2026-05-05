@@ -58,8 +58,7 @@ pub fn compute_notional_usd(
     // qty rounding in `notional_to_qty`.
     let raw = (total * pct).round_dp(8);
     let min_d = Decimal::from_f64_retain(min_notional_usd).unwrap_or(Decimal::ZERO);
-    let max_d =
-        Decimal::from_f64_retain(max_notional_usd).unwrap_or_else(|| dec!(1_000_000));
+    let max_d = Decimal::from_f64_retain(max_notional_usd).unwrap_or_else(|| dec!(1_000_000));
     if raw < min_d {
         return SizeOutcome::BelowMin;
     }
@@ -100,8 +99,7 @@ mod tests {
     #[test]
     fn caps_at_max_notional_when_equity_grows() {
         // 5% of $40k = $2000 raw, but max is $1000 — must clamp.
-        let r =
-            compute_notional_usd(Some(dec!(20_000)), Some(dec!(20_000)), 0.05, 20.0, 1_000.0);
+        let r = compute_notional_usd(Some(dec!(20_000)), Some(dec!(20_000)), 0.05, 20.0, 1_000.0);
         assert_eq!(r, SizeOutcome::Use(dec!(1_000)));
     }
 

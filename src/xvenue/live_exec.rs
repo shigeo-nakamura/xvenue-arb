@@ -113,7 +113,6 @@ impl LiveExecution {
         self.leg_reader = reader;
         self
     }
-
 }
 
 /// Default [`LegStateReader`] used when production hasn't wired
@@ -319,11 +318,19 @@ lighter_min_qty: 0.001
         let lt: Arc<dyn VenueOps> = Arc::new(ScriptedVenueOps::new());
         let mut exec = LiveExecution::from_config(&c, ext.clone(), lt.clone()).unwrap();
         exec.ext_symbol = "  ".to_string();
-        assert!(exec.validate().unwrap_err().to_string().contains("ext_symbol"));
+        assert!(exec
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("ext_symbol"));
 
         let mut exec = LiveExecution::from_config(&c, ext, lt).unwrap();
         exec.lt_symbol = "".to_string();
-        assert!(exec.validate().unwrap_err().to_string().contains("lt_symbol"));
+        assert!(exec
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("lt_symbol"));
     }
 
     #[test]

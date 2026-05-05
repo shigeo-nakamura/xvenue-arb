@@ -117,7 +117,11 @@ impl Args {
             .get(k)
             .ok_or_else(|| anyhow!("missing required --{}", k))?;
         raw.split(',')
-            .map(|s| s.trim().parse::<f64>().map_err(|e| anyhow!("--{}: {:?}", k, e)))
+            .map(|s| {
+                s.trim()
+                    .parse::<f64>()
+                    .map_err(|e| anyhow!("--{}: {:?}", k, e))
+            })
             .collect()
     }
 
@@ -127,7 +131,11 @@ impl Args {
             .get(k)
             .ok_or_else(|| anyhow!("missing required --{}", k))?;
         raw.split(',')
-            .map(|s| s.trim().parse::<u64>().map_err(|e| anyhow!("--{}: {:?}", k, e)))
+            .map(|s| {
+                s.trim()
+                    .parse::<u64>()
+                    .map_err(|e| anyhow!("--{}: {:?}", k, e))
+            })
             .collect()
     }
 }
@@ -136,14 +144,11 @@ fn build_base(args: &Args, symbol: &str) -> Result<BtConfig> {
     let mut cfg = BtConfig::default();
     cfg.symbol_extended = symbol.to_string();
     cfg.symbol_lighter = symbol.to_string();
-    cfg.trade_notional_usd = args
-        .opt::<Decimal>("notional", Decimal::from(100))?;
+    cfg.trade_notional_usd = args.opt::<Decimal>("notional", Decimal::from(100))?;
     cfg.extended_taker_fee_bps = args.opt::<f64>("ext-fee-bps", 2.5)?;
     cfg.lighter_taker_fee_bps = args.opt::<f64>("lt-fee-bps", 0.0)?;
-    cfg.extended_round_trip_slippage_bps =
-        args.opt::<f64>("ext-slippage-bps", 0.0)?;
-    cfg.lighter_round_trip_slippage_bps =
-        args.opt::<f64>("lt-slippage-bps", 0.0)?;
+    cfg.extended_round_trip_slippage_bps = args.opt::<f64>("ext-slippage-bps", 0.0)?;
+    cfg.lighter_round_trip_slippage_bps = args.opt::<f64>("lt-slippage-bps", 0.0)?;
     cfg.signal.min_warmup_samples = args.opt::<usize>("warmup-samples", 60)?;
     cfg.spread.bucket_ms = args.opt::<u64>("bucket-ms", 1_000)?;
     // Phase 0 v2 parity diagnostic. When set, Enter fires at the bar
@@ -154,15 +159,12 @@ fn build_base(args: &Args, symbol: &str) -> Result<BtConfig> {
         cfg.signal.entry_check_threshold_at_fire = false;
     }
     cfg.signal.funding_cycle_sec = args.opt::<u64>("funding-cycle-sec", 0)?;
-    cfg.signal.funding_lockout_pre_sec =
-        args.opt::<u64>("funding-lockout-pre-sec", 1_800)?;
-    cfg.signal.funding_lockout_post_sec =
-        args.opt::<u64>("funding-lockout-post-sec", 1_800)?;
+    cfg.signal.funding_lockout_pre_sec = args.opt::<u64>("funding-lockout-pre-sec", 1_800)?;
+    cfg.signal.funding_lockout_post_sec = args.opt::<u64>("funding-lockout-post-sec", 1_800)?;
     if let Some(p) = args.map.get("binance-ref-jsonl") {
         cfg.binance_ref_path = Some(p.clone());
     }
-    cfg.binance_ref_max_dev_bps =
-        args.opt::<f64>("binance-ref-max-dev-bps", 0.0)?;
+    cfg.binance_ref_max_dev_bps = args.opt::<f64>("binance-ref-max-dev-bps", 0.0)?;
     Ok(cfg)
 }
 
@@ -180,8 +182,8 @@ fn run_single(argv: &[String]) -> Result<()> {
 
     let ext_dump = args.req_str("ext-dump")?;
     let lt_dump = args.req_str("lt-dump")?;
-    let replay = DualReplay::new(ext_dump, lt_dump)
-        .map_err(|e| anyhow!("DualReplay::new: {:?}", e))?;
+    let replay =
+        DualReplay::new(ext_dump, lt_dump).map_err(|e| anyhow!("DualReplay::new: {:?}", e))?;
 
     let summary = run_bt(&replay, cfg.clone())?;
 
@@ -295,8 +297,8 @@ fn run_grid_cmd(argv: &[String]) -> Result<()> {
 
     let ext_dump = args.req_str("ext-dump")?;
     let lt_dump = args.req_str("lt-dump")?;
-    let replay = DualReplay::new(ext_dump, lt_dump)
-        .map_err(|e| anyhow!("DualReplay::new: {:?}", e))?;
+    let replay =
+        DualReplay::new(ext_dump, lt_dump).map_err(|e| anyhow!("DualReplay::new: {:?}", e))?;
 
     let n = spec.cell_count();
     eprintln!("grid: {} cells", n);
@@ -319,7 +321,14 @@ fn run_grid_cmd(argv: &[String]) -> Result<()> {
     let top_n: usize = args.opt("top-n", 20usize)?;
     println!(
         "{:>8} {:>11} {:>10} {:>10} {:>8} {:>14} {:>9} {:>11}",
-        "thresh", "persist_s", "maxhold_s", "rolling_s", "trades", "net_pnl_usd", "win%", "mean_bps"
+        "thresh",
+        "persist_s",
+        "maxhold_s",
+        "rolling_s",
+        "trades",
+        "net_pnl_usd",
+        "win%",
+        "mean_bps"
     );
     for r in results.iter().take(top_n) {
         println!(
@@ -335,7 +344,10 @@ fn run_grid_cmd(argv: &[String]) -> Result<()> {
         );
     }
     if results.len() > top_n {
-        eprintln!("... {} more cells; raise --top-n to see all", results.len() - top_n);
+        eprintln!(
+            "... {} more cells; raise --top-n to see all",
+            results.len() - top_n
+        );
     }
     Ok(())
 }

@@ -223,7 +223,11 @@ impl<'a, V: VenueOps + ?Sized> LighterMakerLoop<'a, V> {
         };
         log::info!(
             "[XVENUE/lightmaker] post_only placed round={} side={:?} qty={} price={} order_id={}",
-            round, req.side, remaining, price, placed.order_id
+            round,
+            req.side,
+            remaining,
+            price,
+            placed.order_id
         );
 
         let mut outcome = poll_until_terminal_or_deadline(
@@ -237,7 +241,10 @@ impl<'a, V: VenueOps + ?Sized> LighterMakerLoop<'a, V> {
         .await;
         log::info!(
             "[XVENUE/lightmaker] post_only round={} done filled={} cancelled={} order_id={}",
-            round, outcome.filled_this_round, outcome.terminal_cancelled, placed.order_id
+            round,
+            outcome.filled_this_round,
+            outcome.terminal_cancelled,
+            placed.order_id
         );
 
         // Cancel residual regardless of outcome — idempotent on the
@@ -261,13 +268,21 @@ impl<'a, V: VenueOps + ?Sized> LighterMakerLoop<'a, V> {
             && self.cfg.chase_grace_poll_ms > 0
         {
             tokio::time::sleep(Duration::from_millis(self.cfg.chase_grace_poll_ms)).await;
-            match self.ops.poll_fill_status(&req.symbol, &placed.order_id).await {
+            match self
+                .ops
+                .poll_fill_status(&req.symbol, &placed.order_id)
+                .await
+            {
                 Ok(s) => {
                     if s.filled_qty > Decimal::ZERO {
                         log::info!(
                             "[XVENUE/lightmaker] post_only round={} grace-recovered \
                              filled={} terminal={} cancelled={} order_id={}",
-                            round, s.filled_qty, s.terminal, s.cancelled, placed.order_id
+                            round,
+                            s.filled_qty,
+                            s.terminal,
+                            s.cancelled,
+                            placed.order_id
                         );
                         outcome = PollOutcome {
                             filled_this_round: s.filled_qty,
@@ -277,14 +292,19 @@ impl<'a, V: VenueOps + ?Sized> LighterMakerLoop<'a, V> {
                         log::debug!(
                             "[XVENUE/lightmaker] post_only round={} grace-poll no-late-fill \
                              terminal={} cancelled={} order_id={}",
-                            round, s.terminal, s.cancelled, placed.order_id
+                            round,
+                            s.terminal,
+                            s.cancelled,
+                            placed.order_id
                         );
                     }
                 }
                 Err(e) => {
                     log::warn!(
                         "[XVENUE/lightmaker] post_only round={} grace-poll err={:?} order_id={}",
-                        round, e, placed.order_id
+                        round,
+                        e,
+                        placed.order_id
                     );
                 }
             }
@@ -311,7 +331,10 @@ impl<'a, V: VenueOps + ?Sized> LighterMakerLoop<'a, V> {
         };
         log::info!(
             "[XVENUE/lightmaker] taker placed side={:?} qty={} reduce_only={} order_id={}",
-            req.side, residual, req.reduce_only, placed.order_id
+            req.side,
+            residual,
+            req.reduce_only,
+            placed.order_id
         );
         let mut outcome = poll_until_terminal_or_deadline(
             self.ops,
@@ -324,7 +347,9 @@ impl<'a, V: VenueOps + ?Sized> LighterMakerLoop<'a, V> {
         .await;
         log::info!(
             "[XVENUE/lightmaker] taker done filled={} cancelled={} order_id={}",
-            outcome.filled_this_round, outcome.terminal_cancelled, placed.order_id
+            outcome.filled_this_round,
+            outcome.terminal_cancelled,
+            placed.order_id
         );
 
         let _ = self.ops.cancel(&req.symbol, &placed.order_id).await;
@@ -340,13 +365,20 @@ impl<'a, V: VenueOps + ?Sized> LighterMakerLoop<'a, V> {
             && self.cfg.taker_grace_poll_ms > 0
         {
             tokio::time::sleep(Duration::from_millis(self.cfg.taker_grace_poll_ms)).await;
-            match self.ops.poll_fill_status(&req.symbol, &placed.order_id).await {
+            match self
+                .ops
+                .poll_fill_status(&req.symbol, &placed.order_id)
+                .await
+            {
                 Ok(s) => {
                     if s.filled_qty > Decimal::ZERO {
                         log::info!(
                             "[XVENUE/lightmaker] taker grace-recovered \
                              filled={} terminal={} cancelled={} order_id={}",
-                            s.filled_qty, s.terminal, s.cancelled, placed.order_id
+                            s.filled_qty,
+                            s.terminal,
+                            s.cancelled,
+                            placed.order_id
                         );
                         outcome = PollOutcome {
                             filled_this_round: s.filled_qty,
@@ -356,14 +388,17 @@ impl<'a, V: VenueOps + ?Sized> LighterMakerLoop<'a, V> {
                         log::warn!(
                             "[XVENUE/lightmaker] taker grace-poll no-late-fill \
                              terminal={} cancelled={} order_id={}",
-                            s.terminal, s.cancelled, placed.order_id
+                            s.terminal,
+                            s.cancelled,
+                            placed.order_id
                         );
                     }
                 }
                 Err(e) => {
                     log::warn!(
                         "[XVENUE/lightmaker] taker grace-poll err={:?} order_id={}",
-                        e, placed.order_id
+                        e,
+                        placed.order_id
                     );
                 }
             }
@@ -409,7 +444,9 @@ mod tests {
 
     fn cfg_with_taker_fallback() -> LighterMakerConfig {
         LighterMakerConfig {
-            common: CommonExecutorConfig { poll_interval_ms: 25 },
+            common: CommonExecutorConfig {
+                poll_interval_ms: 25,
+            },
             chase_ticks: 1,
             chase_retries: 3,
             chase_timeout_ms: 250,
@@ -422,7 +459,9 @@ mod tests {
 
     fn cfg_no_fallback() -> LighterMakerConfig {
         LighterMakerConfig {
-            common: CommonExecutorConfig { poll_interval_ms: 25 },
+            common: CommonExecutorConfig {
+                poll_interval_ms: 25,
+            },
             chase_ticks: 1,
             chase_retries: 2,
             chase_timeout_ms: 250,
@@ -460,11 +499,12 @@ mod tests {
     async fn post_only_fills_in_one_round() {
         let ops = primed_book(dec!(2000), dec!(2001));
         ops.with_state(|s| {
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.5),
-                terminal: true,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.5),
+                    terminal: true,
+                    cancelled: false,
+                }));
         });
         let cfg = cfg_with_taker_fallback();
         let lp = LighterMakerLoop::new(&ops, &cfg).with_poll_interval(10);
@@ -483,16 +523,18 @@ mod tests {
         // chase_retries=1; residual > dust → taker round consumes the
         // second push.
         ops.with_state(|s| {
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.4),
-                terminal: true,
-                cancelled: false,
-            }));
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.1),
-                terminal: true,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.4),
+                    terminal: true,
+                    cancelled: false,
+                }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.1),
+                    terminal: true,
+                    cancelled: false,
+                }));
         });
         let cfg = LighterMakerConfig {
             chase_retries: 1,
@@ -523,11 +565,12 @@ mod tests {
     async fn post_only_disabled_goes_straight_to_taker() {
         let ops = primed_book(dec!(2000), dec!(2001));
         ops.with_state(|s| {
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.5),
-                terminal: true,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.5),
+                    terminal: true,
+                    cancelled: false,
+                }));
         });
         let cfg = LighterMakerConfig {
             post_only: false,
@@ -562,11 +605,12 @@ mod tests {
     async fn post_only_price_picks_correct_side() {
         let ops = primed_book(dec!(2000), dec!(2001));
         ops.with_state(|s| {
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.5),
-                terminal: true,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.5),
+                    terminal: true,
+                    cancelled: false,
+                }));
         });
         let cfg = cfg_with_taker_fallback();
         let lp = LighterMakerLoop::new(&ops, &cfg).with_poll_interval(10);
@@ -583,11 +627,12 @@ mod tests {
     /// re-poll pops.
     fn push_non_terminal_polls(s: &mut ScriptedVenueOpsState, n: usize) {
         for _ in 0..n {
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: Decimal::ZERO,
-                terminal: false,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: Decimal::ZERO,
+                    terminal: false,
+                    cancelled: false,
+                }));
         }
     }
 
@@ -610,11 +655,12 @@ mod tests {
         let ops = primed_book(dec!(2000), dec!(2001));
         ops.with_state(|s| {
             push_non_terminal_polls(s, 3);
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.5),
-                terminal: true,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.5),
+                    terminal: true,
+                    cancelled: false,
+                }));
         });
         let cfg = LighterMakerConfig {
             chase_retries: 1,
@@ -646,11 +692,12 @@ mod tests {
         let ops = primed_book(dec!(2000), dec!(2001));
         ops.with_state(|s| {
             push_non_terminal_polls(s, 6);
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.5),
-                terminal: true,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.5),
+                    terminal: true,
+                    cancelled: false,
+                }));
         });
         let cfg = LighterMakerConfig {
             chase_retries: 1,
@@ -719,11 +766,12 @@ mod tests {
             // Round 0: terminal partial fill — 0.0209 of target
             // 0.02099165 (mirrors live ETH chase round behavior with
             // size_decimals=4 lot truncation).
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.0209),
-                terminal: true,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.0209),
+                    terminal: true,
+                    cancelled: false,
+                }));
         });
         let cfg = LighterMakerConfig {
             chase_retries: 4,
@@ -775,17 +823,19 @@ mod tests {
         let ops = primed_book(dec!(2370), dec!(2371));
         ops.with_state(|s| {
             // Round 0: same partial fill as the guarded test.
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: dec!(0.0209),
-                terminal: true,
-                cancelled: false,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.0209),
+                    terminal: true,
+                    cancelled: false,
+                }));
             // Round 1: terminal cancelled → loop exits chase.
-            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
-                filled_qty: Decimal::ZERO,
-                terminal: true,
-                cancelled: true,
-            }));
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: Decimal::ZERO,
+                    terminal: true,
+                    cancelled: true,
+                }));
         });
         let cfg = LighterMakerConfig {
             chase_retries: 4,

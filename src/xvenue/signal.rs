@@ -373,14 +373,8 @@ mod tests {
     #[test]
     fn effective_dev_touch_to_touch_returns_none_when_caps_missing() {
         let mode = SignalMode::TouchToTouch;
-        assert_eq!(
-            effective_dev_bps(mode, Some(7.0), None, Some(2.0)),
-            None
-        );
-        assert_eq!(
-            effective_dev_bps(mode, Some(7.0), Some(2.0), None),
-            None
-        );
+        assert_eq!(effective_dev_bps(mode, Some(7.0), None, Some(2.0)), None);
+        assert_eq!(effective_dev_bps(mode, Some(7.0), Some(2.0), None), None);
     }
 
     #[test]
@@ -708,25 +702,13 @@ mod tests {
         let mut s = SignalEngine::new(c);
         // ts 3500s into the cycle (= 100s before settle). Lockout pre
         // window started at 3300s. So 3500 is in lockout.
-        assert_eq!(
-            s.decide(3_500_000, Some(7.0), true, None),
-            Decision::Hold
-        );
+        assert_eq!(s.decide(3_500_000, Some(7.0), true, None), Decision::Hold);
         // Even after enough wall-clock for persistence, still blocked.
-        assert_eq!(
-            s.decide(3_516_000, Some(7.0), true, None),
-            Decision::Hold
-        );
+        assert_eq!(s.decide(3_516_000, Some(7.0), true, None), Decision::Hold);
         // Past settle by 200s — still in post-window (post=300).
-        assert_eq!(
-            s.decide(3_800_000, Some(7.0), true, None),
-            Decision::Hold
-        );
+        assert_eq!(s.decide(3_800_000, Some(7.0), true, None), Decision::Hold);
         // Past settle by 400s — clear of lockout. Breach starts fresh.
-        assert_eq!(
-            s.decide(4_000_000, Some(7.0), true, None),
-            Decision::Hold
-        );
+        assert_eq!(s.decide(4_000_000, Some(7.0), true, None), Decision::Hold);
         assert_eq!(
             s.decide(4_016_000, Some(7.0), true, None),
             Decision::Enter(SpreadDirection::Short)

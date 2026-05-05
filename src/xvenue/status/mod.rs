@@ -364,9 +364,7 @@ impl StatusReporter {
             },
             VenueState {
                 venue: "lighter",
-                ws_age_ms: self
-                    .last_lt_book_ok_ms
-                    .map(|t| now_ts_ms.saturating_sub(t)),
+                ws_age_ms: self.last_lt_book_ok_ms.map(|t| now_ts_ms.saturating_sub(t)),
                 last_fill_ts: self.last_lt_fill_ts,
             },
         ];
@@ -526,7 +524,11 @@ fn resolve_path(id: &Option<String>) -> PathBuf {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .map(PathBuf::from)
-        .or_else(|| env::var("HOME").ok().map(|h| PathBuf::from(h).join("debot_status")))
+        .or_else(|| {
+            env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join("debot_status"))
+        })
         .unwrap_or_else(|| PathBuf::from("."));
     match id {
         Some(id) => dir.join(id).join("status.json"),
@@ -628,17 +630,14 @@ reference_max_dev_bps: 100
         let raw = std::fs::read_to_string(r.path()).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v.get("dry_run").and_then(|x| x.as_bool()), Some(false));
-        assert_eq!(v.get("dex").and_then(|x| x.as_str()), Some("lighter+extended"));
         assert_eq!(
-            v.get("agent").and_then(|x| x.as_str()),
-            Some("test")
+            v.get("dex").and_then(|x| x.as_str()),
+            Some("lighter+extended")
         );
+        assert_eq!(v.get("agent").and_then(|x| x.as_str()), Some("test"));
         assert_eq!(v.get("pnl_total").and_then(|x| x.as_f64()), Some(1_000.0));
         assert_eq!(v.get("pnl_today").and_then(|x| x.as_f64()), Some(0.0));
-        assert_eq!(
-            v.get("pnl_source").and_then(|x| x.as_str()),
-            Some("equity")
-        );
+        assert_eq!(v.get("pnl_source").and_then(|x| x.as_str()), Some("equity"));
         assert_eq!(v.get("position_count").and_then(|x| x.as_u64()), Some(0));
         assert_eq!(v.get("has_position").and_then(|x| x.as_bool()), Some(false));
         assert!(v.get("ts").is_some());
@@ -720,18 +719,18 @@ dry_run: true
         let venues = v.get("venues").and_then(|v| v.as_array()).unwrap();
         let by_venue: HashMap<&str, &serde_json::Value> = venues
             .iter()
-            .filter_map(|x| {
-                x.get("venue")
-                    .and_then(|s| s.as_str())
-                    .map(|n| (n, x))
-            })
+            .filter_map(|x| x.get("venue").and_then(|s| s.as_str()).map(|n| (n, x)))
             .collect();
         assert_eq!(
-            by_venue["extended"].get("ws_age_ms").and_then(|x| x.as_u64()),
+            by_venue["extended"]
+                .get("ws_age_ms")
+                .and_then(|x| x.as_u64()),
             Some(4_000)
         );
         assert_eq!(
-            by_venue["lighter"].get("ws_age_ms").and_then(|x| x.as_u64()),
+            by_venue["lighter"]
+                .get("ws_age_ms")
+                .and_then(|x| x.as_u64()),
             Some(3_000)
         );
     }
@@ -790,10 +789,7 @@ dry_run: true
         let pts = v.get("spread_series").and_then(|x| x.as_array()).unwrap();
         assert_eq!(pts.len(), SPREAD_SERIES_CAP);
         // Oldest 50 dropped — first ts_ms should be 50 * 1000.
-        assert_eq!(
-            pts[0].get("ts_ms").and_then(|x| x.as_u64()),
-            Some(50_000)
-        );
+        assert_eq!(pts[0].get("ts_ms").and_then(|x| x.as_u64()), Some(50_000));
     }
 
     #[test]
@@ -809,7 +805,11 @@ dry_run: true
         // New reporter, same path → baseline reloads.
         let mut r2 = reporter_in(&tmp, &cfg);
         r2.update_equity(1_050.0);
-        assert!((r2.pnl_today - 50.0).abs() < 1e-9, "pnl_today={}", r2.pnl_today);
+        assert!(
+            (r2.pnl_today - 50.0).abs() < 1e-9,
+            "pnl_today={}",
+            r2.pnl_today
+        );
     }
 
     #[test]
@@ -879,11 +879,15 @@ dry_run: true
             .filter_map(|x| x.get("venue").and_then(|s| s.as_str()).map(|n| (n, x)))
             .collect();
         assert_eq!(
-            by_venue["extended"].get("last_fill_ts").and_then(|x| x.as_i64()),
+            by_venue["extended"]
+                .get("last_fill_ts")
+                .and_then(|x| x.as_i64()),
             Some(60)
         );
         assert_eq!(
-            by_venue["lighter"].get("last_fill_ts").and_then(|x| x.as_i64()),
+            by_venue["lighter"]
+                .get("last_fill_ts")
+                .and_then(|x| x.as_i64()),
             Some(90)
         );
     }

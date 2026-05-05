@@ -168,10 +168,7 @@ mod tests {
             Ok(self.book.lock().unwrap().clone())
         }
 
-        async fn get_balance(
-            &self,
-            _symbol: Option<&str>,
-        ) -> Result<BalanceResponse, DexError> {
+        async fn get_balance(&self, _symbol: Option<&str>) -> Result<BalanceResponse, DexError> {
             let delay = *self.balance_delay_ms.lock().unwrap();
             if delay > 0 {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
@@ -267,11 +264,7 @@ mod tests {
         async fn cancel_all_orders(&self, _: Option<String>) -> Result<(), DexError> {
             unimplemented!()
         }
-        async fn cancel_orders(
-            &self,
-            _: Option<String>,
-            _: Vec<String>,
-        ) -> Result<(), DexError> {
+        async fn cancel_orders(&self, _: Option<String>, _: Vec<String>) -> Result<(), DexError> {
             unimplemented!()
         }
         async fn close_all_positions(&self, _: Option<String>) -> Result<(), DexError> {

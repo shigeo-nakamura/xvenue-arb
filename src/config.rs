@@ -245,4 +245,3 @@ pub async fn get_extended_config_from_env() -> Result<ExtendedConfig, ConfigErro
         websocket_url,
     })
 }
-
