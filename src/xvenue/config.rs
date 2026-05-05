@@ -167,6 +167,20 @@ pub struct XvenueConfig {
     /// dangling.
     #[serde(default = "default_true")]
     pub lighter_taker_fallback: bool,
+    /// bot-strategy#322: WS-lag grace re-poll for chase rounds. After a
+    /// post_only round terminates `filled=0 cancelled=false`, sleep this
+    /// many ms and re-poll once before treating the round as a no-fill.
+    /// Lighter's WS fill propagation runs 0-500 ms; the original 200 ms
+    /// `chase_timeout_ms` was shorter than typical WS latency, so fills
+    /// landed at the venue but the chase loop placed a fresh order on
+    /// top, stacking exposure (live observation: 25/25 cycles emergency-
+    /// flattened with multiple fills per failed cycle). 0 disables.
+    #[serde(default = "default_lighter_chase_grace_poll_ms")]
+    pub lighter_chase_grace_poll_ms: u64,
+    /// Same as `lighter_chase_grace_poll_ms` but for the Lighter taker
+    /// fallback round. Mirrors `extended_taker_grace_poll_ms` (#298).
+    #[serde(default = "default_lighter_taker_grace_poll_ms")]
+    pub lighter_taker_grace_poll_ms: u64,
 
     // ---- Realised PnL fees (#268 S5-1) ----
     /// Per-side fee rate the realised-PnL helper subtracts on each
@@ -461,6 +475,8 @@ impl XvenueConfig {
             chase_timeout_ms: self.lighter_chase_timeout_ms,
             taker_fallback: self.lighter_taker_fallback,
             post_only: self.lighter_post_only,
+            chase_grace_poll_ms: self.lighter_chase_grace_poll_ms,
+            taker_grace_poll_ms: self.lighter_taker_grace_poll_ms,
         }
     }
 
@@ -572,6 +588,12 @@ fn default_lighter_chase_retries() -> u32 {
 }
 fn default_lighter_chase_timeout_ms() -> u64 {
     250
+}
+fn default_lighter_chase_grace_poll_ms() -> u64 {
+    0
+}
+fn default_lighter_taker_grace_poll_ms() -> u64 {
+    0
 }
 fn default_signal_mode() -> String {
     "mid_to_mid".to_string()

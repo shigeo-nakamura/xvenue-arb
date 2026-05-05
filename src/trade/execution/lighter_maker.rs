@@ -36,6 +36,8 @@
 //!   fill latency is ~50 ms with no observed history of late-fill
 //!   races, so the simpler chase loop applies.
 
+use std::time::Duration;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use dex_connector::OrderSide;
@@ -203,7 +205,7 @@ impl<'a, V: VenueOps + ?Sized> LighterMakerLoop<'a, V> {
             round, req.side, remaining, price, placed.order_id
         );
 
-        let outcome = poll_until_terminal_or_deadline(
+        let mut outcome = poll_until_terminal_or_deadline(
             self.ops,
             &req.symbol,
             &placed.order_id,
@@ -220,6 +222,52 @@ impl<'a, V: VenueOps + ?Sized> LighterMakerLoop<'a, V> {
         // Cancel residual regardless of outcome — idempotent on the
         // mock, harmless on a venue that has already terminated.
         let _ = self.ops.cancel(&req.symbol, &placed.order_id).await;
+
+        // bot-strategy#322: WS-lag grace re-poll. Lighter's WS fill
+        // propagation is 0-500 ms; with the original 200 ms
+        // `chase_timeout_ms`, fills landed at the venue but the chase
+        // round timed out reporting `filled=0 cancelled=false`, then
+        // the next round placed a fresh order on top — stacking
+        // exposure that emergency-flatten then had to unwind. The
+        // grace re-poll (after cancel, so a still-resting order has
+        // its fate decided) catches the late fill and threads it
+        // through to `total_filled` so the loop sees one cycle, one
+        // fill. Mirrors the Extended-side #298 pattern but applies
+        // here to chase rounds (not just taker) because Lighter chase
+        // rounds were observed to fill late.
+        if outcome.filled_this_round.is_zero()
+            && !outcome.terminal_cancelled
+            && self.cfg.chase_grace_poll_ms > 0
+        {
+            tokio::time::sleep(Duration::from_millis(self.cfg.chase_grace_poll_ms)).await;
+            match self.ops.poll_fill_status(&req.symbol, &placed.order_id).await {
+                Ok(s) => {
+                    if s.filled_qty > Decimal::ZERO {
+                        log::info!(
+                            "[XVENUE/lightmaker] post_only round={} grace-recovered \
+                             filled={} terminal={} cancelled={} order_id={}",
+                            round, s.filled_qty, s.terminal, s.cancelled, placed.order_id
+                        );
+                        outcome = PollOutcome {
+                            filled_this_round: s.filled_qty,
+                            terminal_cancelled: s.cancelled,
+                        };
+                    } else {
+                        log::debug!(
+                            "[XVENUE/lightmaker] post_only round={} grace-poll no-late-fill \
+                             terminal={} cancelled={} order_id={}",
+                            round, s.terminal, s.cancelled, placed.order_id
+                        );
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[XVENUE/lightmaker] post_only round={} grace-poll err={:?} order_id={}",
+                        round, e, placed.order_id
+                    );
+                }
+            }
+        }
 
         Ok(outcome)
     }
@@ -244,7 +292,7 @@ impl<'a, V: VenueOps + ?Sized> LighterMakerLoop<'a, V> {
             "[XVENUE/lightmaker] taker placed side={:?} qty={} reduce_only={} order_id={}",
             req.side, residual, req.reduce_only, placed.order_id
         );
-        let outcome = poll_until_terminal_or_deadline(
+        let mut outcome = poll_until_terminal_or_deadline(
             self.ops,
             &req.symbol,
             &placed.order_id,
@@ -259,6 +307,47 @@ impl<'a, V: VenueOps + ?Sized> LighterMakerLoop<'a, V> {
         );
 
         let _ = self.ops.cancel(&req.symbol, &placed.order_id).await;
+
+        // bot-strategy#322: same WS-lag grace re-poll as the chase
+        // round (and identical in shape to Extended's #298 fix). A
+        // Lighter taker IOC that filled at the venue can take >200 ms
+        // to surface in the connector cache; without this, every
+        // entry whose chase exhausts ends in spurious Timeout +
+        // emergency flatten.
+        if outcome.filled_this_round.is_zero()
+            && !outcome.terminal_cancelled
+            && self.cfg.taker_grace_poll_ms > 0
+        {
+            tokio::time::sleep(Duration::from_millis(self.cfg.taker_grace_poll_ms)).await;
+            match self.ops.poll_fill_status(&req.symbol, &placed.order_id).await {
+                Ok(s) => {
+                    if s.filled_qty > Decimal::ZERO {
+                        log::info!(
+                            "[XVENUE/lightmaker] taker grace-recovered \
+                             filled={} terminal={} cancelled={} order_id={}",
+                            s.filled_qty, s.terminal, s.cancelled, placed.order_id
+                        );
+                        outcome = PollOutcome {
+                            filled_this_round: s.filled_qty,
+                            terminal_cancelled: s.cancelled,
+                        };
+                    } else {
+                        log::warn!(
+                            "[XVENUE/lightmaker] taker grace-poll no-late-fill \
+                             terminal={} cancelled={} order_id={}",
+                            s.terminal, s.cancelled, placed.order_id
+                        );
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[XVENUE/lightmaker] taker grace-poll err={:?} order_id={}",
+                        e, placed.order_id
+                    );
+                }
+            }
+        }
+
         if outcome.filled_this_round > Decimal::ZERO {
             Ok(outcome.filled_this_round)
         } else if outcome.terminal_cancelled {
@@ -293,7 +382,7 @@ mod tests {
     use super::*;
     use crate::trade::execution::types::{CommonExecutorConfig, LighterMakerConfig};
     use crate::trade::execution::venue_ops::{
-        OrderFillStatus, ScriptedResponse, ScriptedVenueOps, TopOfBook,
+        OrderFillStatus, ScriptedResponse, ScriptedVenueOps, ScriptedVenueOpsState, TopOfBook,
     };
     use rust_decimal_macros::dec;
 
@@ -305,6 +394,8 @@ mod tests {
             chase_timeout_ms: 250,
             taker_fallback: true,
             post_only: true,
+            chase_grace_poll_ms: 0,
+            taker_grace_poll_ms: 0,
         }
     }
 
@@ -316,6 +407,8 @@ mod tests {
             chase_timeout_ms: 250,
             taker_fallback: false,
             post_only: true,
+            chase_grace_poll_ms: 0,
+            taker_grace_poll_ms: 0,
         }
     }
 
@@ -460,5 +553,123 @@ mod tests {
         let (_, _, _, price, _) = &posts[0];
         // Long → buy post-only at best_bid (2000)
         assert_eq!(*price, dec!(2000));
+    }
+
+    /// Push N non-terminal poll responses. The grace-poll tests need
+    /// the queue to feed exactly the round's poll-loop iterations so
+    /// the late-fill (pushed last) sits at the position the grace
+    /// re-poll pops.
+    fn push_non_terminal_polls(s: &mut ScriptedVenueOpsState, n: usize) {
+        for _ in 0..n {
+            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                filled_qty: Decimal::ZERO,
+                terminal: false,
+                cancelled: false,
+            }));
+        }
+    }
+
+    /// bot-strategy#322: chase round timed out at filled=0 cancelled=false,
+    /// then a late WS fill surfaces during the grace window. Loop must
+    /// pick up the late fill instead of placing another order on top.
+    /// Without this fix, the chase round's `cancelled=false filled=0`
+    /// outcome fell through to either the next chase round (stacking)
+    /// or to taker — both observed live as orders that stacked on
+    /// Lighter and then needed emergency-flatten unwinding.
+    ///
+    /// Test parameters:
+    /// - chase_timeout_ms=20, poll_interval=10 → 3 polls per chase round
+    /// - chase_retries=1, taker_fallback=false → grace is the ONLY path
+    ///   to a successful fill
+    /// - Queue layout: 3 non-terminals (consumed by chase polls) +
+    ///   1 late-fill (consumed by chase grace re-poll)
+    #[tokio::test(start_paused = true)]
+    async fn chase_grace_poll_recovers_late_fill() {
+        let ops = primed_book(dec!(2000), dec!(2001));
+        ops.with_state(|s| {
+            push_non_terminal_polls(s, 3);
+            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                filled_qty: dec!(0.5),
+                terminal: true,
+                cancelled: false,
+            }));
+        });
+        let cfg = LighterMakerConfig {
+            chase_retries: 1,
+            chase_timeout_ms: 20,
+            chase_grace_poll_ms: 200,
+            taker_fallback: false,
+            ..cfg_with_taker_fallback()
+        };
+        let lp = LighterMakerLoop::new(&ops, &cfg).with_poll_interval(10);
+        let res = lp.run(req_long(dec!(0.5))).await;
+        assert_eq!(
+            res,
+            LighterTerminal::Filled { qty: dec!(0.5) },
+            "grace re-poll must surface the late fill (taker_fallback=false \
+             so any other path returns Failed)"
+        );
+        // Critical invariant: only ONE post_only place call. Without
+        // grace, the loop would have placed a fresh order on top of the
+        // late-filling order — exactly the live bug from #322.
+        assert_eq!(ops.snapshot_posts().len(), 1, "no order stacking");
+        assert!(ops.snapshot_takers().is_empty(), "taker_fallback=false");
+    }
+
+    /// bot-strategy#322: taker round timed out filled=0 cancelled=false,
+    /// late fill during grace must be counted. Mirrors Extended #298.
+    /// Queue: 3 (chase polls) + 3 (taker polls) + 1 (taker grace re-poll).
+    #[tokio::test(start_paused = true)]
+    async fn taker_grace_poll_recovers_late_fill() {
+        let ops = primed_book(dec!(2000), dec!(2001));
+        ops.with_state(|s| {
+            push_non_terminal_polls(s, 6);
+            s.poll_fill.push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                filled_qty: dec!(0.5),
+                terminal: true,
+                cancelled: false,
+            }));
+        });
+        let cfg = LighterMakerConfig {
+            chase_retries: 1,
+            chase_timeout_ms: 20,
+            chase_grace_poll_ms: 0, // skip chase grace so chase exhausts cleanly
+            taker_grace_poll_ms: 200,
+            ..cfg_with_taker_fallback()
+        };
+        let lp = LighterMakerLoop::new(&ops, &cfg).with_poll_interval(10);
+        let res = lp.run(req_long(dec!(0.5))).await;
+        assert_eq!(
+            res,
+            LighterTerminal::Filled { qty: dec!(0.5) },
+            "taker grace re-poll must surface the late fill"
+        );
+        assert_eq!(ops.snapshot_takers().len(), 1, "exactly one taker round");
+    }
+
+    /// Grace poll runs but no late fill ever arrives — must keep
+    /// behaving as the no-grace path (Failed/Timeout). Defends against
+    /// a bug where the grace branch inadvertently masks a true exhaust.
+    #[tokio::test(start_paused = true)]
+    async fn chase_grace_poll_no_late_fill_still_exhausts() {
+        let ops = primed_book(dec!(2000), dec!(2001));
+        ops.with_state(|s| {
+            // All polls (round + grace) get non-terminal — fill never
+            // lands. With queue empty after 3 polls + 1 grace, the
+            // mock falls back to default_fill which is also non-
+            // terminal, so any extra polls behave the same.
+            push_non_terminal_polls(s, 4);
+        });
+        let cfg = LighterMakerConfig {
+            chase_retries: 1,
+            chase_timeout_ms: 20,
+            chase_grace_poll_ms: 100,
+            taker_fallback: false,
+            ..cfg_no_fallback()
+        };
+        let lp = LighterMakerLoop::new(&ops, &cfg).with_poll_interval(10);
+        let res = lp.run(req_long(dec!(0.5))).await;
+        assert!(matches!(res, LighterTerminal::Failed { .. }));
+        assert!(ops.snapshot_takers().is_empty());
     }
 }

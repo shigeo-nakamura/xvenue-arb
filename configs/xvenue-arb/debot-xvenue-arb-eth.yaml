@@ -71,9 +71,17 @@ extended_taker_slippage_bps: 50   # bot-strategy#302: slippage budget for the IO
 # LighterFillLoop (taker) — see live.rs handle_decision_enter branching;
 # ParallelExitLoop refactor to support maker is a separate change.
 lighter_post_only: true
-lighter_chase_retries: 4              # 4 × 200ms = 800ms worst-case Lighter chase
-lighter_chase_timeout_ms: 200
-lighter_taker_fallback: true          # if 4 chase rounds fail, taker the residual so cross-venue exposure doesn't dangle
+# bot-strategy#322 timing widened. Original 4×200ms was shorter than
+# Lighter's WS fill-propagation latency (observed 0-500ms, sometimes
+# higher) — the chase round timed out reporting filled=0 then placed
+# a fresh order on top, stacking exposure that emergency flatten then
+# unwound at slippage cost. 2×800ms still fits leg_mismatch budget
+# (1600 + ext 2000 = 3600 vs 10000 limit).
+lighter_chase_retries: 2              # 2 × 800ms = 1600ms worst-case Lighter chase
+lighter_chase_timeout_ms: 800
+lighter_chase_grace_poll_ms: 500      # #322: post-cancel grace re-poll for chase rounds (catches WS-lag late fills before next round places fresh order)
+lighter_taker_grace_poll_ms: 1000     # #322: same grace re-poll for the taker fallback round (mirrors extended_taker_grace_poll_ms / #298)
+lighter_taker_fallback: true          # if chase rounds fail, taker the residual so cross-venue exposure doesn't dangle
 # Legacy LighterFillLoop knobs — still active on the EXIT side via
 # ParallelExitLoop. Keep set so a future revert to lighter_post_only:false
 # (or an exit cycle) still has sane defaults.

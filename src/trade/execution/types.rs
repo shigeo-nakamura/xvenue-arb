@@ -174,6 +174,22 @@ pub struct LighterMakerConfig {
     /// The runner uses this flag to pick which loop to drive; the maker
     /// loop itself only runs when this is true.
     pub post_only: bool,
+    /// bot-strategy#322: after a chase round terminates with
+    /// `filled=0 cancelled=false` (i.e. the deadline elapsed before
+    /// the venue WS feed surfaced a fill or cancel), wait this many ms
+    /// and poll the order one more time before treating the round as
+    /// "no fill" and placing the next chase order. Lighter's WS fill
+    /// propagation is 0-500 ms; without this grace, a fill that landed
+    /// at the venue ~250 ms after placement gets missed AND the next
+    /// round places a fresh order, stacking exposure on the venue. The
+    /// grace re-poll catches the late fill so `total_filled` reflects
+    /// reality and we don't double-fill. 0 disables.
+    /// `lighter_chase_grace_poll_ms` in YAML.
+    pub chase_grace_poll_ms: u64,
+    /// Same as `chase_grace_poll_ms` but for the taker fallback round.
+    /// Mirrors `ExtendedMakerConfig::taker_grace_poll_ms`. 0 disables.
+    /// `lighter_taker_grace_poll_ms` in YAML.
+    pub taker_grace_poll_ms: u64,
 }
 
 impl LighterMakerConfig {
@@ -337,6 +353,8 @@ mod tests {
             chase_timeout_ms: 0,
             taker_fallback: true,
             post_only: true,
+            chase_grace_poll_ms: 0,
+            taker_grace_poll_ms: 0,
         };
         assert!(cfg.validate().is_err());
     }
@@ -350,6 +368,8 @@ mod tests {
             chase_timeout_ms: 250,
             taker_fallback: false,
             post_only: true,
+            chase_grace_poll_ms: 0,
+            taker_grace_poll_ms: 0,
         };
         assert!(cfg.validate().is_err());
     }
@@ -365,6 +385,8 @@ mod tests {
             chase_timeout_ms: 250,
             taker_fallback: false,
             post_only: false,
+            chase_grace_poll_ms: 0,
+            taker_grace_poll_ms: 0,
         };
         assert!(cfg.validate().is_ok());
     }
@@ -378,6 +400,8 @@ mod tests {
             chase_timeout_ms: 250,
             taker_fallback: true,
             post_only: true,
+            chase_grace_poll_ms: 0,
+            taker_grace_poll_ms: 0,
         };
         assert_eq!(cfg.worst_case_budget_ms(), 1_000);
         // chase_retries=0 still costs at least one round.
