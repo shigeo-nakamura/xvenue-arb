@@ -178,6 +178,16 @@ pub struct LivePaperSummary {
     /// for the maker fill premise to hold). 0 when the filter is
     /// disabled (`lt_book_max_eth: None`).
     pub entries_blocked_by_book_depth: u64,
+    /// bot-strategy#309 step 5: would-be maker fill telemetry, only
+    /// populated in paper-mode (dry_run + no live executor). Each
+    /// `Decision::Enter` increments `attempts`, the depth-conditional
+    /// fill model contributes its sampled outcome to `fills`, and the
+    /// raw probability accumulates in `p_sum` so the [STATUS] line can
+    /// report `p_sum / attempts` as the running mean. Phase 0 exit
+    /// gate: `fills / attempts ≥ 0.5`.
+    pub would_be_maker_attempts: u64,
+    pub would_be_maker_fills: u64,
+    pub would_be_maker_p_sum: f64,
     /// Number of ticks where the WS staleness watchdog flipped to
     /// `Stale` (#244 Group C / `risk::ws_health`). Counts the trip,
     /// not every tick the latch stays armed — the runner emits one
@@ -833,6 +843,64 @@ fn book_depth_blocks_entry(
     size_f > max
 }
 
+/// bot-strategy#309 step 5: would-be Lighter maker fill outcome for
+/// DRY_RUN soak telemetry. Models a single Bernoulli draw:
+///   `p = clamp_to_unit(1 - our_size / depth_at_touch)`
+/// with the queue side picked from the entry direction (Long → ask,
+/// Short → bid). The model is intentionally simple — soak's job is to
+/// feed the post-hoc analyst raw `(direction, size, depth)` tuples in
+/// the log; this in-process draw is just a single-glance fill rate so
+/// the operator can confirm the Phase 0 ≥ 50% gate without having to
+/// re-derive it from logs every time.
+///
+/// Returns `None` when sizing or book is unavailable (caller should
+/// skip the telemetry but still count the would-be attempt).
+///
+/// `seed` is mixed into the RNG for reproducibility — production
+/// callers pass `now_ts_ms` so re-running analysis on a logged tuple
+/// yields the same draw.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WouldBeMakerOutcome {
+    pub depth_eth: f64,
+    pub our_size_eth: f64,
+    pub fill_p: f64,
+    pub sampled_fill: bool,
+}
+
+fn would_be_maker_fill_outcome(
+    dir: SpreadDirection,
+    our_size: Decimal,
+    lt_snap: &MidSnapshot,
+    seed: u64,
+) -> Option<WouldBeMakerOutcome> {
+    let our_size_eth = our_size.to_f64().filter(|s| s.is_finite() && *s > 0.0)?;
+    let depth = match dir {
+        SpreadDirection::Long => lt_snap.ask_size,
+        SpreadDirection::Short => lt_snap.bid_size,
+    };
+    let depth_eth = depth
+        .to_f64()
+        .filter(|d| d.is_finite() && *d > 0.0)?;
+    // Linear-decay-by-depth model: p = max(0, 1 - our_size / depth).
+    // Bounded to [0, 1] so noisy book reads don't propagate as a >1
+    // probability into the draw.
+    let raw = 1.0 - (our_size_eth / depth_eth);
+    let fill_p = raw.clamp(0.0, 1.0);
+    // Deterministic sample from a per-decision seed. Using StdRng so
+    // tests + post-hoc analysis can replay an exact log line and get
+    // the same sampled_fill outcome the live bot recorded.
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let draw: f64 = rng.gen();
+    let sampled_fill = draw < fill_p;
+    Some(WouldBeMakerOutcome {
+        depth_eth,
+        our_size_eth,
+        fill_p,
+        sampled_fill,
+    })
+}
+
 /// S5-3 forced flatten on session DD (#268). Runs *before* signal.decide
 /// so a HALTed position routes to `EmergencyFlattening` rather than
 /// letting the strategy decide a natural exit (which could chase for
@@ -1137,6 +1205,16 @@ async fn report_status_tick<H: VenueHub + ?Sized>(
     reporter: Option<&mut StatusReporter>,
 ) {
     let ws_age = ws_health.ws_age(wall_clock_ms());
+    let wb_fill_rate = if summary.would_be_maker_attempts > 0 {
+        summary.would_be_maker_fills as f64 / summary.would_be_maker_attempts as f64
+    } else {
+        0.0
+    };
+    let wb_p_avg = if summary.would_be_maker_attempts > 0 {
+        summary.would_be_maker_p_sum / summary.would_be_maker_attempts as f64
+    } else {
+        0.0
+    };
     log::info!(
         "[STATUS] ticks={} samples={} hold={} enter_l={} enter_s={} exit={} \
          ks_blocked={} stuck_blocked={} dd_blocked={} sd_blocked={} cb_blocked={} \
@@ -1144,7 +1222,8 @@ async fn report_status_tick<H: VenueHub + ?Sized>(
          ws_age_ext={:?} ws_age_lt={:?} \
          ref_supp_ext={} ref_supp_lt={} read_mid_err_ext={} read_mid_err_lt={} \
          dev_bps={:?} cap_long={:?} cap_short={:?} \
-         ext_inside={:?} lt_inside={:?} lt_bid_sz={:?} lt_ask_sz={:?}",
+         ext_inside={:?} lt_inside={:?} lt_bid_sz={:?} lt_ask_sz={:?} \
+         wb_attempts={} wb_fills={} wb_fill_rate={:.4} wb_p_avg={:.4}",
         summary.ticks,
         summary.samples_committed,
         summary.decisions_hold,
@@ -1173,6 +1252,10 @@ async fn report_status_tick<H: VenueHub + ?Sized>(
         summary.last_lt_inside_bps,
         summary.last_lt_bid_size,
         summary.last_lt_ask_size,
+        summary.would_be_maker_attempts,
+        summary.would_be_maker_fills,
+        wb_fill_rate,
+        wb_p_avg,
     );
     if let Some(r) = reporter {
         refresh_equity(hub, r, risk_manager).await;
@@ -1499,6 +1582,33 @@ async fn handle_decision_enter<H: VenueHub + ?Sized>(
             qty,
             cfg.dry_run,
         );
+
+        // bot-strategy#309 step 5: would-be maker fill telemetry. Each
+        // paper-mode entry counts as a would-be attempt; the helper
+        // returns None when the book read is unusable (e.g. scripted-
+        // hub tests with default-zero sizes), in which case we still
+        // record the attempt but skip the fill / probability update.
+        // The depth + our_size fields go into the log line so post-hoc
+        // analysis can recompute the fill rate under a different model.
+        summary.would_be_maker_attempts += 1;
+        if let Some(out) =
+            would_be_maker_fill_outcome(dir, qty, lt_snap, now_ts_ms)
+        {
+            summary.would_be_maker_p_sum += out.fill_p;
+            if out.sampled_fill {
+                summary.would_be_maker_fills += 1;
+            }
+            log::info!(
+                "[XVENUE] WOULD-BE MAKER dir={:?} our_size_eth={:.6} \
+                 depth_eth={:.6} fill_p={:.4} sampled_fill={}",
+                dir,
+                out.our_size_eth,
+                out.depth_eth,
+                out.fill_p,
+                out.sampled_fill,
+            );
+        }
+
         return Ok(());
     }
 
@@ -2250,6 +2360,107 @@ mod tests {
             &snap,
             Some(2.0)
         ));
+    }
+
+    #[test]
+    fn would_be_outcome_zero_p_when_we_swamp_the_book() {
+        // Our 5 ETH order vs 1 ETH ask depth → fill_p clamped to 0.
+        let snap = lt_snap_with_sizes(Decimal::ZERO, Decimal::from(1));
+        let out = would_be_maker_fill_outcome(
+            SpreadDirection::Long,
+            Decimal::from(5),
+            &snap,
+            42,
+        )
+        .expect("snapshot has positive ask depth");
+        assert_eq!(out.fill_p, 0.0);
+        assert!(!out.sampled_fill, "p=0 must never sample to true");
+    }
+
+    #[test]
+    fn would_be_outcome_full_p_when_book_is_huge() {
+        // 0.01 ETH order vs 100 ETH bid depth → fill_p ≈ 0.9999.
+        // With a deterministic seed the draw must be < p so we get a
+        // sampled fill.
+        let snap = lt_snap_with_sizes(Decimal::from(100), Decimal::ZERO);
+        let out = would_be_maker_fill_outcome(
+            SpreadDirection::Short,
+            d(1, 2), // 0.01
+            &snap,
+            7,
+        )
+        .expect("snapshot has positive bid depth");
+        assert!(out.fill_p > 0.999, "expected near-1 p; got {}", out.fill_p);
+        assert!(out.sampled_fill);
+    }
+
+    #[test]
+    fn would_be_outcome_picks_correct_side_per_direction() {
+        // Long looks at ask_size, Short looks at bid_size.
+        let snap = lt_snap_with_sizes(Decimal::from(10), d(1, 2));
+        let long_out = would_be_maker_fill_outcome(
+            SpreadDirection::Long,
+            Decimal::from(1),
+            &snap,
+            1,
+        )
+        .unwrap();
+        // ask_size = 0.01, our_size = 1 → p = 0
+        assert_eq!(long_out.fill_p, 0.0);
+        assert_eq!(long_out.depth_eth, 0.01);
+
+        let short_out = would_be_maker_fill_outcome(
+            SpreadDirection::Short,
+            Decimal::from(1),
+            &snap,
+            1,
+        )
+        .unwrap();
+        // bid_size = 10, our_size = 1 → p = 0.9
+        assert!((short_out.fill_p - 0.9).abs() < 1e-9);
+        assert_eq!(short_out.depth_eth, 10.0);
+    }
+
+    #[test]
+    fn would_be_outcome_none_when_book_empty() {
+        let snap = lt_snap_with_sizes(Decimal::ZERO, Decimal::ZERO);
+        assert!(would_be_maker_fill_outcome(
+            SpreadDirection::Long,
+            Decimal::from(1),
+            &snap,
+            0
+        )
+        .is_none());
+        assert!(would_be_maker_fill_outcome(
+            SpreadDirection::Short,
+            Decimal::from(1),
+            &snap,
+            0
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn would_be_outcome_deterministic_for_same_seed() {
+        // Reproducibility: same (dir, size, depth, seed) must produce
+        // the same draw — so post-hoc analysis on a logged tuple
+        // returns the bot's recorded outcome exactly.
+        let snap = lt_snap_with_sizes(Decimal::ZERO, Decimal::from(2));
+        let a = would_be_maker_fill_outcome(
+            SpreadDirection::Long,
+            Decimal::from(1),
+            &snap,
+            12345,
+        )
+        .unwrap();
+        let b = would_be_maker_fill_outcome(
+            SpreadDirection::Long,
+            Decimal::from(1),
+            &snap,
+            12345,
+        )
+        .unwrap();
+        assert_eq!(a, b);
     }
 
     #[test]
