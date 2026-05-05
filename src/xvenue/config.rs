@@ -18,7 +18,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use super::signal::SignalConfig;
+use super::signal::{SignalConfig, SignalMode};
 use super::spread::SpreadConfig;
 use crate::risk::kill_switch::StuckTripwireConfig;
 use crate::risk::manager::RiskConfig;
@@ -52,6 +52,15 @@ pub struct XvenueConfig {
     pub min_warmup_samples: usize,
 
     // ---- Signal engine ----
+    /// "mid_to_mid" (default, legacy v2 behavior) or "touch_to_touch"
+    /// (bot-strategy#309 maker-on-Lighter redesign — feeds the
+    /// directional inside-spread caps `cap_long_bps` / `cap_short_bps`
+    /// instead of the rolling-mean dev). Touch-to-touch values are
+    /// smaller in scale (max ~12 bps observed in 5.28d ETH dump vs
+    /// ~30 bps for mid-to-mid), so operators flipping the mode also
+    /// need to drop `abs_threshold_bps` (recommended starting point: 1.0).
+    #[serde(default = "default_signal_mode")]
+    pub signal_mode: String,
     #[serde(default = "default_abs_threshold_bps")]
     pub abs_threshold_bps: f64,
     #[serde(default = "default_persistence_sec")]
@@ -276,7 +285,19 @@ impl XvenueConfig {
                 self.lighter_order_type
             );
         }
+        if parse_signal_mode(&self.signal_mode).is_none() {
+            anyhow::bail!(
+                "signal_mode must be \"mid_to_mid\" or \"touch_to_touch\"; got {}",
+                self.signal_mode
+            );
+        }
         Ok(())
+    }
+
+    pub fn signal_mode_enum(&self) -> SignalMode {
+        // validate() guarantees this Some — fall back to the legacy
+        // mode rather than panic if someone bypasses validate().
+        parse_signal_mode(&self.signal_mode).unwrap_or(SignalMode::MidToMid)
     }
 
     pub fn spread_config(&self) -> SpreadConfig {
@@ -320,6 +341,7 @@ impl XvenueConfig {
             max_hold_sec: self.max_hold_sec,
             force_close_dev_bps: self.force_close_dev_bps,
             min_warmup_samples: self.min_warmup_samples,
+            signal_mode: self.signal_mode_enum(),
             entry_check_threshold_at_fire: self.entry_check_threshold_at_fire,
             funding_cycle_sec: self.funding_cycle_sec,
             funding_lockout_pre_sec: self.funding_lockout_pre_sec,
@@ -451,6 +473,17 @@ fn default_extended_taker_slippage_bps() -> u32 {
 }
 fn default_lighter_order_type() -> String {
     "market".to_string()
+}
+fn default_signal_mode() -> String {
+    "mid_to_mid".to_string()
+}
+
+fn parse_signal_mode(s: &str) -> Option<SignalMode> {
+    match s {
+        "mid_to_mid" => Some(SignalMode::MidToMid),
+        "touch_to_touch" => Some(SignalMode::TouchToTouch),
+        _ => None,
+    }
 }
 fn default_lighter_fill_timeout_ms() -> u64 {
     1_000
@@ -625,6 +658,52 @@ reference_max_dev_bps: 100
         let cfg: XvenueConfig = serde_yaml::from_str(yaml).unwrap();
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("trade_size_pct"));
+    }
+
+    #[test]
+    fn signal_mode_default_is_mid_to_mid() {
+        let cfg = parse(minimal_yaml());
+        assert_eq!(cfg.signal_mode, "mid_to_mid");
+        assert_eq!(cfg.signal_mode_enum(), SignalMode::MidToMid);
+        assert_eq!(cfg.signal_config().signal_mode, SignalMode::MidToMid);
+    }
+
+    #[test]
+    fn signal_mode_touch_to_touch_round_trips() {
+        let yaml = r#"
+agent_name: x
+symbol_ext: ETH-USD
+symbol_lt: ETH
+trade_size_pct: 0.05
+min_notional_usd: 20
+max_notional_usd: 1000
+binance_reference_symbol: ETHUSDT
+reference_max_dev_bps: 100
+signal_mode: touch_to_touch
+abs_threshold_bps: 1.0
+"#;
+        let cfg = parse(yaml);
+        assert_eq!(cfg.signal_mode_enum(), SignalMode::TouchToTouch);
+        assert_eq!(cfg.signal_config().signal_mode, SignalMode::TouchToTouch);
+        assert_eq!(cfg.signal_config().abs_threshold_bps, 1.0);
+    }
+
+    #[test]
+    fn rejects_unknown_signal_mode() {
+        let yaml = r#"
+agent_name: x
+symbol_ext: ETH-USD
+symbol_lt: ETH
+trade_size_pct: 0.05
+min_notional_usd: 20
+max_notional_usd: 1000
+binance_reference_symbol: ETHUSDT
+reference_max_dev_bps: 100
+signal_mode: bogus
+"#;
+        let cfg: XvenueConfig = serde_yaml::from_str(yaml).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("signal_mode"));
     }
 
     #[test]

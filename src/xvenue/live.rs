@@ -32,7 +32,9 @@ use tokio::sync::oneshot;
 
 use super::config::XvenueConfig;
 use super::live_exec::LiveExecution;
-use super::signal::{Decision, ExitReason, PositionSummary, SignalEngine, SpreadDirection};
+use super::signal::{
+    effective_dev_bps, Decision, ExitReason, PositionSummary, SignalEngine, SpreadDirection,
+};
 use super::sizing::{compute_notional_usd, notional_to_qty, SizeOutcome};
 use super::spread::SpreadEngine;
 use super::state::{EmergencyReason, Event, PositionMachine};
@@ -1293,7 +1295,18 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
     }
     let is_warm = spread.is_warm(cfg.min_warmup_samples);
 
-    let mut decision = signal.decide(now_ts_ms, dev, is_warm, position);
+    // bot-strategy#309 step 3: route the configured signal source into
+    // SignalEngine. Mid-to-mid (default) preserves the legacy v2 path;
+    // touch-to-touch maps the directional inside-spread caps onto the
+    // signed scale decide() expects.
+    let signal_dev = effective_dev_bps(
+        signal.config().signal_mode,
+        dev,
+        summary.last_cap_long_bps,
+        summary.last_cap_short_bps,
+    );
+
+    let mut decision = signal.decide(now_ts_ms, signal_dev, is_warm, position);
 
     apply_entry_gates(
         cfg,

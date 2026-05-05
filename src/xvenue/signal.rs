@@ -8,6 +8,29 @@
 //! no I/O — `decide` is fed `(now_ms, dev_bps, is_warm, position)` and
 //! returns a `Decision` that the execution layer translates into orders.
 
+/// Which signal source the entry/exit decisions read off of.
+///
+/// `MidToMid` (default) feeds `dev = spread - μ_roll` from the rolling
+/// spread engine — the original v2 behavior.
+///
+/// `TouchToTouch` (bot-strategy#309) feeds the inside-spread capturable
+/// quantity computed live in `live.rs`:
+///   `cap_long  = (lt_bid - ext_ask) / mid * 10000`  → Long capturable
+///   `cap_short = (ext_bid - lt_ask) / mid * 10000`  → Short capturable
+/// Use the [`effective_dev_bps`] helper to map the directional caps onto
+/// the single signed scale that [`SignalEngine::decide`] expects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalMode {
+    MidToMid,
+    TouchToTouch,
+}
+
+impl Default for SignalMode {
+    fn default() -> Self {
+        SignalMode::MidToMid
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SignalConfig {
     pub abs_threshold_bps: f64,
@@ -16,6 +39,9 @@ pub struct SignalConfig {
     pub max_hold_sec: u64,
     pub force_close_dev_bps: f64,
     pub min_warmup_samples: usize,
+    /// bot-strategy#309 maker-on-Lighter redesign. Picks which spread
+    /// metric the SignalEngine consumes; see [`SignalMode`].
+    pub signal_mode: SignalMode,
     /// When true (Rust default), `Decision::Enter` only fires on a tick
     /// where `|dev| >= abs_threshold_bps` is still satisfied AND the
     /// breach has lasted `persistence_sec`. When false (Phase 0 v2
@@ -52,10 +78,42 @@ impl Default for SignalConfig {
             max_hold_sec: 600,
             force_close_dev_bps: 30.0,
             min_warmup_samples: 60,
+            signal_mode: SignalMode::MidToMid,
             entry_check_threshold_at_fire: true,
             funding_cycle_sec: 0,
             funding_lockout_pre_sec: 1_800,
             funding_lockout_post_sec: 1_800,
+        }
+    }
+}
+
+/// Map the configured signal source onto the signed scale that
+/// [`SignalEngine::decide`] expects (positive → Short bias, negative →
+/// Long bias). Returns `None` when the required inputs are unavailable
+/// — caller treats as `Decision::Hold`.
+///
+/// `TouchToTouch` picks the better direction: whichever cap is larger
+/// becomes the active signal. `cap_short` and `cap_long` cannot both
+/// be positive at the same time (would require `lt_bid > ext_ask` AND
+/// `ext_bid > lt_ask`, which contradicts `bid < ask` on at least one
+/// venue), so the direction selection is unambiguous when there is any
+/// edge to be had.
+pub fn effective_dev_bps(
+    mode: SignalMode,
+    dev_bps: Option<f64>,
+    cap_long_bps: Option<f64>,
+    cap_short_bps: Option<f64>,
+) -> Option<f64> {
+    match mode {
+        SignalMode::MidToMid => dev_bps,
+        SignalMode::TouchToTouch => {
+            let l = cap_long_bps?;
+            let s = cap_short_bps?;
+            if s >= l {
+                Some(s)
+            } else {
+                Some(-l)
+            }
         }
     }
 }
@@ -274,11 +332,67 @@ mod tests {
             max_hold_sec: 600,
             force_close_dev_bps: 30.0,
             min_warmup_samples: 10,
+            signal_mode: SignalMode::MidToMid,
             entry_check_threshold_at_fire: true,
             funding_cycle_sec: 0,
             funding_lockout_pre_sec: 1_800,
             funding_lockout_post_sec: 1_800,
         }
+    }
+
+    #[test]
+    fn effective_dev_mid_to_mid_passes_through() {
+        let mode = SignalMode::MidToMid;
+        assert_eq!(
+            effective_dev_bps(mode, Some(7.0), Some(2.0), Some(-1.0)),
+            Some(7.0)
+        );
+        assert_eq!(effective_dev_bps(mode, None, Some(2.0), Some(2.0)), None);
+    }
+
+    #[test]
+    fn effective_dev_touch_to_touch_picks_short_when_larger() {
+        let mode = SignalMode::TouchToTouch;
+        // cap_short capturable, cap_long negative — short wins, signed positive
+        assert_eq!(
+            effective_dev_bps(mode, Some(0.0), Some(-3.0), Some(2.5)),
+            Some(2.5)
+        );
+    }
+
+    #[test]
+    fn effective_dev_touch_to_touch_picks_long_when_larger() {
+        let mode = SignalMode::TouchToTouch;
+        // cap_long capturable, cap_short negative — long wins, signed negative
+        assert_eq!(
+            effective_dev_bps(mode, Some(0.0), Some(4.0), Some(-1.5)),
+            Some(-4.0)
+        );
+    }
+
+    #[test]
+    fn effective_dev_touch_to_touch_returns_none_when_caps_missing() {
+        let mode = SignalMode::TouchToTouch;
+        assert_eq!(
+            effective_dev_bps(mode, Some(7.0), None, Some(2.0)),
+            None
+        );
+        assert_eq!(
+            effective_dev_bps(mode, Some(7.0), Some(2.0), None),
+            None
+        );
+    }
+
+    #[test]
+    fn effective_dev_touch_to_touch_breaks_tie_to_short() {
+        // When both caps are equal (the negligible / edge case), we
+        // prefer Short — matches the >= comparator and keeps behavior
+        // deterministic.
+        let mode = SignalMode::TouchToTouch;
+        assert_eq!(
+            effective_dev_bps(mode, Some(0.0), Some(2.0), Some(2.0)),
+            Some(2.0)
+        );
     }
 
     #[test]
