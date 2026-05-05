@@ -150,6 +150,56 @@ impl ExtendedMakerConfig {
     }
 }
 
+/// Knobs for the Lighter post-only chase loop (bot-strategy#309 step 6).
+/// Mirrors [`ExtendedMakerConfig`] for the maker-on-Lighter redesign.
+/// Active only when YAML sets `lighter_post_only: true`; the legacy
+/// market / aggressive-limit path stays the default until the dex-
+/// connector verification gate passes.
+#[derive(Debug, Clone)]
+pub struct LighterMakerConfig {
+    pub common: CommonExecutorConfig,
+    /// Number of book ticks to chase a stale post-only price by before
+    /// re-cancelling and re-posting. `lighter_chase_ticks` in YAML.
+    pub chase_ticks: u64,
+    /// How many full place-cancel-replace cycles to run before declaring
+    /// chase exhausted. `lighter_chase_retries` in YAML.
+    pub chase_retries: u32,
+    /// Per-cycle deadline. `lighter_chase_timeout_ms` in YAML.
+    pub chase_timeout_ms: u64,
+    /// When true, after `chase_retries` cycles all fail, place a taker
+    /// order for the residual qty. `lighter_taker_fallback` in YAML.
+    pub taker_fallback: bool,
+    /// `lighter_post_only` — when false the maker stage is skipped
+    /// entirely and execution stays on the legacy `LighterFillLoop` path.
+    /// The runner uses this flag to pick which loop to drive; the maker
+    /// loop itself only runs when this is true.
+    pub post_only: bool,
+}
+
+impl LighterMakerConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.chase_timeout_ms == 0 {
+            return Err("lighter_chase_timeout_ms must be > 0".into());
+        }
+        if self.post_only && self.chase_retries == 0 && !self.taker_fallback {
+            return Err(
+                "lighter_chase_retries=0 with taker_fallback=false would never place an order"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// bot-strategy#288 invariant: the worst-case chase budget plus the
+    /// Extended taker deadline must fit inside `leg_mismatch_timeout_ms`
+    /// so a slow Lighter chase can't stretch past the cross-venue
+    /// recovery window. Returns the worst-case Lighter budget in ms.
+    pub fn worst_case_budget_ms(&self) -> u64 {
+        let retries = self.chase_retries.max(1) as u64;
+        retries.saturating_mul(self.chase_timeout_ms)
+    }
+}
+
 /// Knobs for the Lighter market / aggressive-limit fill flow.
 #[derive(Debug, Clone)]
 pub struct LighterFillConfig {
@@ -276,6 +326,66 @@ mod tests {
             taker_grace_poll_ms: 0,
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn lighter_maker_config_rejects_zero_timeout() {
+        let cfg = LighterMakerConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 25 },
+            chase_ticks: 1,
+            chase_retries: 3,
+            chase_timeout_ms: 0,
+            taker_fallback: true,
+            post_only: true,
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn lighter_maker_config_rejects_zero_retries_no_fallback() {
+        let cfg = LighterMakerConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 25 },
+            chase_ticks: 1,
+            chase_retries: 0,
+            chase_timeout_ms: 250,
+            taker_fallback: false,
+            post_only: true,
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn lighter_maker_config_disabled_post_only_is_ok() {
+        // post_only=false short-circuits — the loop is unused and
+        // validate() should not complain about chase budget.
+        let cfg = LighterMakerConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 25 },
+            chase_ticks: 1,
+            chase_retries: 0,
+            chase_timeout_ms: 250,
+            taker_fallback: false,
+            post_only: false,
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn lighter_maker_worst_case_budget_multiplies_retries_and_timeout() {
+        let cfg = LighterMakerConfig {
+            common: CommonExecutorConfig { poll_interval_ms: 25 },
+            chase_ticks: 1,
+            chase_retries: 4,
+            chase_timeout_ms: 250,
+            taker_fallback: true,
+            post_only: true,
+        };
+        assert_eq!(cfg.worst_case_budget_ms(), 1_000);
+        // chase_retries=0 still costs at least one round.
+        let zero = LighterMakerConfig {
+            chase_retries: 0,
+            ..cfg.clone()
+        };
+        assert_eq!(zero.worst_case_budget_ms(), 250);
     }
 
     #[test]

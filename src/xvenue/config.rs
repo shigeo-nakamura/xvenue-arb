@@ -25,7 +25,7 @@ use crate::risk::manager::RiskConfig;
 use crate::trade::execution::emergency_loop::EmergencyLoopConfig;
 use crate::trade::execution::parallel_exit::ParallelExitConfig;
 use crate::trade::execution::types::{
-    parse_lighter_order_type, ExtendedMakerConfig, LighterFillConfig,
+    parse_lighter_order_type, ExtendedMakerConfig, LighterFillConfig, LighterMakerConfig,
 };
 
 #[derive(Debug, Clone, Deserialize)]
@@ -145,6 +145,28 @@ pub struct XvenueConfig {
     /// over 5.28d at $50 notional, conservative thr=1.0 thin=1.0).
     #[serde(default)]
     pub lt_book_max_eth: Option<f64>,
+    /// bot-strategy#309 step 6: switch the Lighter leg from the legacy
+    /// `LighterFillLoop` (market / aggressive-limit taker) to the new
+    /// `LighterMakerLoop` (post-only chase + taker fallback). Default
+    /// false — preserves legacy taker behavior. Flip after the
+    /// dex-connector verification gate (see lighter_maker.rs module
+    /// docs) and Phase 0 soak completion.
+    #[serde(default)]
+    pub lighter_post_only: bool,
+    /// Number of book ticks to chase a stale Lighter post-only price
+    /// by. Mirrors `extended_chase_ticks`.
+    #[serde(default = "default_lighter_chase_ticks")]
+    pub lighter_chase_ticks: u64,
+    #[serde(default = "default_lighter_chase_retries")]
+    pub lighter_chase_retries: u32,
+    #[serde(default = "default_lighter_chase_timeout_ms")]
+    pub lighter_chase_timeout_ms: u64,
+    /// When true, after `lighter_chase_retries` cycles all fail, place
+    /// a Lighter taker order for the residual qty. Default true so a
+    /// degraded post_only state doesn't leave the cross-venue exposure
+    /// dangling.
+    #[serde(default = "default_true")]
+    pub lighter_taker_fallback: bool,
 
     // ---- Realised PnL fees (#268 S5-1) ----
     /// Per-side fee rate the realised-PnL helper subtracts on each
@@ -310,6 +332,37 @@ impl XvenueConfig {
                 );
             }
         }
+        // Validate the Lighter maker config schema first.
+        let lm = self.lighter_maker_config();
+        if let Err(e) = lm.validate() {
+            anyhow::bail!("lighter_maker_config: {}", e);
+        }
+        // bot-strategy#288 cross-venue invariant: when post_only is
+        // armed, the worst-case Lighter chase budget plus the Extended
+        // taker deadline must fit inside `leg_mismatch_timeout_ms` so a
+        // slow Lighter chase can't leave one leg open past the
+        // cross-venue recovery window. Extended budget already accounts
+        // for the same invariant via `extended_chase_*` knobs, so we
+        // only need to check the Lighter side here.
+        if self.lighter_post_only {
+            let lt_budget = lm.worst_case_budget_ms();
+            // Conservative pad: assume Extended taker takes at most
+            // `extended_chase_timeout_ms` to terminate (matches the
+            // chase round budget). The two legs run serially per
+            // DESIGN §4.1, so the real wall-clock cost stacks.
+            let combined = lt_budget.saturating_add(self.extended_chase_timeout_ms);
+            if combined > self.leg_mismatch_timeout_ms {
+                anyhow::bail!(
+                    "lighter chase budget ({} ms) + extended_chase_timeout_ms ({} ms) = {} ms \
+                     exceeds leg_mismatch_timeout_ms ({} ms); shorten lighter_chase_retries / \
+                     lighter_chase_timeout_ms or raise leg_mismatch_timeout_ms (see #288)",
+                    lt_budget,
+                    self.extended_chase_timeout_ms,
+                    combined,
+                    self.leg_mismatch_timeout_ms
+                );
+            }
+        }
         Ok(())
     }
 
@@ -391,6 +444,24 @@ impl XvenueConfig {
     pub fn ext_min_qty(&self) -> rust_decimal::Decimal {
         rust_decimal::Decimal::from_f64_retain(self.extended_min_qty)
             .unwrap_or(rust_decimal::Decimal::ZERO)
+    }
+
+    /// Knobs for [`crate::trade::execution::lighter_maker::LighterMakerLoop`].
+    /// Built from the same `lighter_chase_*` family of YAML fields as
+    /// the Extended-side equivalent. The runner picks which loop to
+    /// drive based on `lighter_post_only`; this helper just translates
+    /// the YAML into the typed config.
+    pub fn lighter_maker_config(&self) -> LighterMakerConfig {
+        LighterMakerConfig {
+            common: crate::trade::execution::types::CommonExecutorConfig {
+                poll_interval_ms: 25,
+            },
+            chase_ticks: self.lighter_chase_ticks,
+            chase_retries: self.lighter_chase_retries,
+            chase_timeout_ms: self.lighter_chase_timeout_ms,
+            taker_fallback: self.lighter_taker_fallback,
+            post_only: self.lighter_post_only,
+        }
     }
 
     /// Knobs for [`crate::trade::execution::lighter_fill::LighterFillLoop`].
@@ -492,6 +563,15 @@ fn default_extended_taker_slippage_bps() -> u32 {
 }
 fn default_lighter_order_type() -> String {
     "market".to_string()
+}
+fn default_lighter_chase_ticks() -> u64 {
+    1
+}
+fn default_lighter_chase_retries() -> u32 {
+    3
+}
+fn default_lighter_chase_timeout_ms() -> u64 {
+    250
 }
 fn default_signal_mode() -> String {
     "mid_to_mid".to_string()
@@ -728,6 +808,95 @@ lt_book_max_eth: 2.0
 "#;
         let cfg = parse(yaml);
         assert_eq!(cfg.lt_book_max_eth, Some(2.0));
+    }
+
+    #[test]
+    fn lighter_maker_defaults_are_taker_compatible() {
+        // Default config must keep the legacy taker behavior — flipping
+        // the switch is opt-in via lighter_post_only=true.
+        let cfg = parse(minimal_yaml());
+        let lm = cfg.lighter_maker_config();
+        assert!(!lm.post_only);
+        assert!(lm.taker_fallback);
+        assert_eq!(lm.chase_retries, 3);
+        assert_eq!(lm.chase_timeout_ms, 250);
+        assert!(lm.validate().is_ok());
+    }
+
+    #[test]
+    fn lighter_maker_post_only_round_trips() {
+        let yaml = r#"
+agent_name: x
+symbol_ext: ETH-USD
+symbol_lt: ETH
+trade_size_pct: 0.05
+min_notional_usd: 20
+max_notional_usd: 1000
+binance_reference_symbol: ETHUSDT
+reference_max_dev_bps: 100
+lighter_post_only: true
+lighter_chase_retries: 4
+lighter_chase_timeout_ms: 200
+extended_chase_timeout_ms: 500
+leg_mismatch_timeout_ms: 5000
+"#;
+        let cfg = parse(yaml);
+        let lm = cfg.lighter_maker_config();
+        assert!(lm.post_only);
+        assert_eq!(lm.chase_retries, 4);
+        assert_eq!(lm.chase_timeout_ms, 200);
+        // 4 * 200 = 800 ms Lighter budget + 500 ms Extended = 1300 ms,
+        // comfortably under 5000 ms leg_mismatch_timeout_ms.
+        assert_eq!(lm.worst_case_budget_ms(), 800);
+    }
+
+    #[test]
+    fn rejects_lighter_chase_budget_breaching_leg_mismatch_timeout() {
+        let yaml = r#"
+agent_name: x
+symbol_ext: ETH-USD
+symbol_lt: ETH
+trade_size_pct: 0.05
+min_notional_usd: 20
+max_notional_usd: 1000
+binance_reference_symbol: ETHUSDT
+reference_max_dev_bps: 100
+lighter_post_only: true
+lighter_chase_retries: 10
+lighter_chase_timeout_ms: 500
+extended_chase_timeout_ms: 500
+leg_mismatch_timeout_ms: 3000
+"#;
+        let cfg: XvenueConfig = serde_yaml::from_str(yaml).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("leg_mismatch_timeout_ms"),
+            "expected #288 invariant error; got {}",
+            err
+        );
+    }
+
+    #[test]
+    fn lighter_post_only_disabled_skips_budget_check() {
+        // Even with an absurd chase budget, post_only=false should let
+        // the YAML validate (the loop won't run).
+        let yaml = r#"
+agent_name: x
+symbol_ext: ETH-USD
+symbol_lt: ETH
+trade_size_pct: 0.05
+min_notional_usd: 20
+max_notional_usd: 1000
+binance_reference_symbol: ETHUSDT
+reference_max_dev_bps: 100
+lighter_post_only: false
+lighter_chase_retries: 100
+lighter_chase_timeout_ms: 5000
+extended_chase_timeout_ms: 500
+leg_mismatch_timeout_ms: 3000
+"#;
+        let cfg: XvenueConfig = serde_yaml::from_str(yaml).unwrap();
+        cfg.validate().unwrap();
     }
 
     #[test]
