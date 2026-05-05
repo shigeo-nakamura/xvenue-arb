@@ -343,14 +343,10 @@ pub fn compute_realised_pnl(
         SpreadDirection::Short => (entry_spread - exit_spread) * realised_qty,
     };
     let bps_div = Decimal::new(10_000, 0);
-    let ext_rate =
-        Decimal::from_f64_retain(ext_fee_bps).unwrap_or(Decimal::ZERO) / bps_div;
-    let lt_rate =
-        Decimal::from_f64_retain(lt_fee_bps).unwrap_or(Decimal::ZERO) / bps_div;
-    let ext_fees =
-        (ext_entry_mid * ext_entry_qty + ext_exit_mid * ext_exit_qty) * ext_rate;
-    let lt_fees =
-        (lt_entry_mid * lt_entry_qty + lt_exit_mid * lt_exit_qty) * lt_rate;
+    let ext_rate = Decimal::from_f64_retain(ext_fee_bps).unwrap_or(Decimal::ZERO) / bps_div;
+    let lt_rate = Decimal::from_f64_retain(lt_fee_bps).unwrap_or(Decimal::ZERO) / bps_div;
+    let ext_fees = (ext_entry_mid * ext_entry_qty + ext_exit_mid * ext_exit_qty) * ext_rate;
+    let lt_fees = (lt_entry_mid * lt_entry_qty + lt_exit_mid * lt_exit_qty) * lt_rate;
     gross - ext_fees - lt_fees
 }
 
@@ -397,10 +393,7 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
     let mut machine = PositionMachine::new();
     let mut summary = LivePaperSummary::default();
     let mut reporter = StatusReporter::from_env(&cfg);
-    let mut risk_manager = RiskManager::new(
-        cfg.risk_config(),
-        cfg.agent_name.clone(),
-    );
+    let mut risk_manager = RiskManager::new(cfg.risk_config(), cfg.agent_name.clone());
     let mut reference_guard = if cfg.binance_reference_symbol.trim().is_empty() {
         ReferenceGuard::disabled(
             cfg.reference_max_dev_bps,
@@ -627,9 +620,7 @@ async fn refresh_equity<H: VenueHub + ?Sized>(
 fn publish_risk(risk_manager: &RiskManager, reporter: &mut StatusReporter) {
     reporter.set_daily_risk(risk_manager.daily_snapshot());
     reporter.set_session_risk(risk_manager.session_snapshot());
-    reporter.set_circuit_breaker(Some(
-        risk_manager.circuit_breaker_snapshot(now_unix_secs()),
-    ));
+    reporter.set_circuit_breaker(Some(risk_manager.circuit_breaker_snapshot(now_unix_secs())));
     reporter.set_risk_history(risk_manager.risk_history());
 }
 
@@ -887,9 +878,7 @@ fn would_be_maker_fill_outcome(
         SpreadDirection::Long => lt_snap.ask_size,
         SpreadDirection::Short => lt_snap.bid_size,
     };
-    let depth_eth = depth
-        .to_f64()
-        .filter(|d| d.is_finite() && *d > 0.0)?;
+    let depth_eth = depth.to_f64().filter(|d| d.is_finite() && *d > 0.0)?;
     // Linear-decay-by-depth model: p = max(0, 1 - our_size / depth).
     // Bounded to [0, 1] so noisy book reads don't propagate as a >1
     // probability into the draw.
@@ -964,10 +953,7 @@ fn force_flatten_on_session_dd_halt(
         Err(e) => {
             // Already in EmergencyFlattening (idempotent re-fire) or
             // other transient — debug-log and continue.
-            log::debug!(
-                "[XVENUE] forced-flatten Emergency rejected: {:?}",
-                e
-            );
+            log::debug!("[XVENUE] forced-flatten Emergency rejected: {:?}", e);
         }
     }
 }
@@ -1046,7 +1032,11 @@ fn handle_skew_breach_emergency(
 ) -> bool {
     let skew_dec = machine.inventory_skew_usd(ext_mid, lt_mid);
     let skew_f = rust_decimal::prelude::ToPrimitive::to_f64(&skew_dec).unwrap_or(0.0);
-    let SkewOutcome::Breach { skew_usd, threshold_usd } = skew_monitor.evaluate(skew_f) else {
+    let SkewOutcome::Breach {
+        skew_usd,
+        threshold_usd,
+    } = skew_monitor.evaluate(skew_f)
+    else {
         return false;
     };
 
@@ -1317,14 +1307,7 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
 
     // WS staleness check (#244 Group C). Runs *after* the reads so a
     // successful read clears any prior staleness latch.
-    if handle_ws_stale_emergency(
-        cfg,
-        ws_health,
-        machine,
-        open_qty,
-        summary,
-        now_wall_ms,
-    ) {
+    if handle_ws_stale_emergency(cfg, ws_health, machine, open_qty, summary, now_wall_ms) {
         return Ok(());
     }
 
@@ -1333,8 +1316,16 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
 
     if let Some(r) = reporter.as_deref_mut() {
         r.record_book_ok(
-            if ext_snap.book_ok { Some(ext_snap.ts_ms) } else { None },
-            if lt_snap.book_ok { Some(lt_snap.ts_ms) } else { None },
+            if ext_snap.book_ok {
+                Some(ext_snap.ts_ms)
+            } else {
+                None
+            },
+            if lt_snap.book_ok {
+                Some(lt_snap.ts_ms)
+            } else {
+                None
+            },
         );
     }
 
@@ -1595,8 +1586,7 @@ async fn handle_decision_enter<H: VenueHub + ?Sized>(
         // stays exercised end-to-end. Used in dry-run and by tests /
         // BT replay paths.
         let qty = paper_qty(cfg.min_notional_usd, ext_snap.mid)?;
-        let notional = Decimal::from_f64_retain(cfg.min_notional_usd)
-            .unwrap_or(Decimal::ZERO);
+        let notional = Decimal::from_f64_retain(cfg.min_notional_usd).unwrap_or(Decimal::ZERO);
         machine.apply(
             now_ts_ms,
             Event::EntrySignal {
@@ -1634,9 +1624,7 @@ async fn handle_decision_enter<H: VenueHub + ?Sized>(
         // The depth + our_size fields go into the log line so post-hoc
         // analysis can recompute the fill rate under a different model.
         summary.would_be_maker_attempts += 1;
-        if let Some(out) =
-            would_be_maker_fill_outcome(dir, qty, lt_snap, now_ts_ms)
-        {
+        if let Some(out) = would_be_maker_fill_outcome(dir, qty, lt_snap, now_ts_ms) {
             summary.would_be_maker_p_sum += out.fill_p;
             if out.sampled_fill {
                 summary.would_be_maker_fills += 1;
@@ -1774,10 +1762,10 @@ async fn handle_decision_enter<H: VenueHub + ?Sized>(
             // through the post-only chase loop when the YAML flips
             // `lighter_post_only: true`. Default keeps the legacy
             // taker behavior. dex-connector verification gate is the
-            // `lighter-spike` binary at $50 notional (#317). Exit
-            // path stays on `LighterFillLoop` for now — the
-            // `ParallelExitLoop` refactor to choose between executors
-            // is a separate change.
+            // `lighter-spike` binary at $50 notional (#317). The exit
+            // path mirrors this gate inside `ParallelExitLoop::run`
+            // (#330), so flipping `lighter_post_only` toggles both
+            // legs in lockstep.
             let lt_term = if live.lighter_maker_cfg.post_only {
                 LighterMakerLoop::new(&*live.lt_ops, &live.lighter_maker_cfg)
                     .run(LighterMakerRequest {
@@ -1818,10 +1806,7 @@ async fn handle_decision_enter<H: VenueHub + ?Sized>(
                     if let Some(r) = reporter.as_deref_mut() {
                         r.record_fill(false, true, now_ts_ms);
                     }
-                    log::info!(
-                        "[XVENUE] LIVE ENTER lt filled qty={} → Held",
-                        lt_filled
-                    );
+                    log::info!("[XVENUE] LIVE ENTER lt filled qty={} → Held", lt_filled);
                 }
                 LighterTerminal::Failed { reason } => {
                     log::error!(
@@ -1992,13 +1977,21 @@ async fn handle_decision_exit(
         lt_snap.bid_size,
         lt_snap.ask_size,
     );
+    // bot-strategy#330: route both exit legs through the same maker
+    // selector the entry path uses. `lt_maker_cfg.post_only=true` flips
+    // the Lighter leg from `LighterFillLoop` (taker) to
+    // `LighterMakerLoop` (post-only chase + taker fallback) inside
+    // `ParallelExitLoop::run`; the legacy fill cfg is still passed so
+    // the gate flips cleanly without re-plumbing the runner.
     let outcome = ParallelExitLoop::new(
         &*live.ext_ops,
         &*live.lt_ops,
         &live.extended_maker_cfg,
         &live.lighter_fill_cfg,
+        &live.lighter_maker_cfg,
         &live.parallel_exit_cfg,
     )
+    .with_lt_min_qty(live.lt_min_qty)
     .run(
         ExtendedEntryRequest {
             symbol: live.ext_symbol.clone(),
@@ -2066,8 +2059,7 @@ async fn handle_decision_exit(
                             Decimal::ZERO
                         }
                     };
-                    let pnl_f64 =
-                        rust_decimal::prelude::ToPrimitive::to_f64(&pnl).unwrap_or(0.0);
+                    let pnl_f64 = rust_decimal::prelude::ToPrimitive::to_f64(&pnl).unwrap_or(0.0);
                     summary.last_realised_pnl_usd = Some(pnl_f64);
                     if let Some(r) = reporter.as_deref_mut() {
                         r.record_fill(true, true, now_ts_ms);
@@ -2374,7 +2366,11 @@ mod tests {
     fn book_depth_filter_disabled_when_max_is_none() {
         let snap = lt_snap_with_sizes(Decimal::from(100), Decimal::from(100));
         assert!(!book_depth_blocks_entry(SpreadDirection::Long, &snap, None));
-        assert!(!book_depth_blocks_entry(SpreadDirection::Short, &snap, None));
+        assert!(!book_depth_blocks_entry(
+            SpreadDirection::Short,
+            &snap,
+            None
+        ));
     }
 
     #[test]
@@ -2430,13 +2426,8 @@ mod tests {
     fn would_be_outcome_zero_p_when_we_swamp_the_book() {
         // Our 5 ETH order vs 1 ETH ask depth → fill_p clamped to 0.
         let snap = lt_snap_with_sizes(Decimal::ZERO, Decimal::from(1));
-        let out = would_be_maker_fill_outcome(
-            SpreadDirection::Long,
-            Decimal::from(5),
-            &snap,
-            42,
-        )
-        .expect("snapshot has positive ask depth");
+        let out = would_be_maker_fill_outcome(SpreadDirection::Long, Decimal::from(5), &snap, 42)
+            .expect("snapshot has positive ask depth");
         assert_eq!(out.fill_p, 0.0);
         assert!(!out.sampled_fill, "p=0 must never sample to true");
     }
@@ -2462,24 +2453,15 @@ mod tests {
     fn would_be_outcome_picks_correct_side_per_direction() {
         // Long looks at ask_size, Short looks at bid_size.
         let snap = lt_snap_with_sizes(Decimal::from(10), d(1, 2));
-        let long_out = would_be_maker_fill_outcome(
-            SpreadDirection::Long,
-            Decimal::from(1),
-            &snap,
-            1,
-        )
-        .unwrap();
+        let long_out =
+            would_be_maker_fill_outcome(SpreadDirection::Long, Decimal::from(1), &snap, 1).unwrap();
         // ask_size = 0.01, our_size = 1 → p = 0
         assert_eq!(long_out.fill_p, 0.0);
         assert_eq!(long_out.depth_eth, 0.01);
 
-        let short_out = would_be_maker_fill_outcome(
-            SpreadDirection::Short,
-            Decimal::from(1),
-            &snap,
-            1,
-        )
-        .unwrap();
+        let short_out =
+            would_be_maker_fill_outcome(SpreadDirection::Short, Decimal::from(1), &snap, 1)
+                .unwrap();
         // bid_size = 10, our_size = 1 → p = 0.9
         assert!((short_out.fill_p - 0.9).abs() < 1e-9);
         assert_eq!(short_out.depth_eth, 10.0);
@@ -2488,20 +2470,14 @@ mod tests {
     #[test]
     fn would_be_outcome_none_when_book_empty() {
         let snap = lt_snap_with_sizes(Decimal::ZERO, Decimal::ZERO);
-        assert!(would_be_maker_fill_outcome(
-            SpreadDirection::Long,
-            Decimal::from(1),
-            &snap,
-            0
-        )
-        .is_none());
-        assert!(would_be_maker_fill_outcome(
-            SpreadDirection::Short,
-            Decimal::from(1),
-            &snap,
-            0
-        )
-        .is_none());
+        assert!(
+            would_be_maker_fill_outcome(SpreadDirection::Long, Decimal::from(1), &snap, 0)
+                .is_none()
+        );
+        assert!(
+            would_be_maker_fill_outcome(SpreadDirection::Short, Decimal::from(1), &snap, 0)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2510,20 +2486,10 @@ mod tests {
         // the same draw — so post-hoc analysis on a logged tuple
         // returns the bot's recorded outcome exactly.
         let snap = lt_snap_with_sizes(Decimal::ZERO, Decimal::from(2));
-        let a = would_be_maker_fill_outcome(
-            SpreadDirection::Long,
-            Decimal::from(1),
-            &snap,
-            12345,
-        )
-        .unwrap();
-        let b = would_be_maker_fill_outcome(
-            SpreadDirection::Long,
-            Decimal::from(1),
-            &snap,
-            12345,
-        )
-        .unwrap();
+        let a = would_be_maker_fill_outcome(SpreadDirection::Long, Decimal::from(1), &snap, 12345)
+            .unwrap();
+        let b = would_be_maker_fill_outcome(SpreadDirection::Long, Decimal::from(1), &snap, 12345)
+            .unwrap();
         assert_eq!(a, b);
     }
 
@@ -2613,7 +2579,10 @@ max_hold_sec: 60
 
     #[tokio::test]
     async fn loop_exits_on_shutdown() {
-        let hub = Arc::new(ScriptedHub::new(vec![mid(1000, 2000.0)], vec![mid(1000, 2000.0)]));
+        let hub = Arc::new(ScriptedHub::new(
+            vec![mid(1000, 2000.0)],
+            vec![mid(1000, 2000.0)],
+        ));
         let cfg = min_cfg();
         let loop_cfg = LiveLoopConfig {
             tick_interval_ms: 5,
@@ -2622,10 +2591,13 @@ max_hold_sec: 60
         let (tx, rx) = oneshot::channel();
         // Send shutdown immediately
         let _ = tx.send(());
-        let summary = timeout(Duration::from_secs(1), run_paper_loop(cfg, loop_cfg, hub, None, rx))
-            .await
-            .expect("loop did not terminate")
-            .unwrap();
+        let summary = timeout(
+            Duration::from_secs(1),
+            run_paper_loop(cfg, loop_cfg, hub, None, rx),
+        )
+        .await
+        .expect("loop did not terminate")
+        .unwrap();
         // Even with immediate shutdown, the biased select! picks the
         // shutdown branch first → no ticks executed.
         assert_eq!(summary.ticks, 0);
@@ -3198,10 +3170,7 @@ max_hold_sec: 60
                     "order book snapshot unavailable (no recent update)"
                 ))
             }
-            async fn read_equity_usd(
-                &self,
-                _venue: Venue,
-            ) -> Result<Option<Decimal>> {
+            async fn read_equity_usd(&self, _venue: Venue) -> Result<Option<Decimal>> {
                 Ok(None)
             }
         }
@@ -3278,10 +3247,7 @@ max_hold_sec: 60
                     )),
                 }
             }
-            async fn read_equity_usd(
-                &self,
-                _venue: Venue,
-            ) -> Result<Option<Decimal>> {
+            async fn read_equity_usd(&self, _venue: Venue) -> Result<Option<Decimal>> {
                 Ok(None)
             }
         }
@@ -3487,8 +3453,7 @@ emergency_complete_grace_ms: 0  # tests assert immediate-complete on zero (#287 
             };
         });
         let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
-        let (machine, summary, open_qty) =
-            drive_live_ticks(&cfg, &*hub, &live, 38).await;
+        let (machine, summary, open_qty) = drive_live_ticks(&cfg, &*hub, &live, 38).await;
         assert!(
             summary.decisions_enter_short >= 1,
             "expected enter_short ≥ 1, got summary={:?}",
@@ -3532,8 +3497,7 @@ emergency_complete_grace_ms: 0  # tests assert immediate-complete on zero (#287 
             };
         });
         let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
-        let (machine, summary, open_qty) =
-            drive_live_ticks(&cfg, &*hub, &live, 38).await;
+        let (machine, summary, open_qty) = drive_live_ticks(&cfg, &*hub, &live, 38).await;
         assert!(summary.decisions_enter_short >= 1, "Enter must have fired");
         assert_eq!(
             machine.phase(),
@@ -3573,8 +3537,7 @@ emergency_complete_grace_ms: 0  # tests assert immediate-complete on zero (#287 
         // Lighter default = zero non-terminal → times out → Failed{Timeout}.
         let lt_vops = Arc::new(ScriptedVenueOps::new());
         let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
-        let (machine, summary, open_qty) =
-            drive_live_ticks(&cfg, &*hub, &live, 38).await;
+        let (machine, summary, open_qty) = drive_live_ticks(&cfg, &*hub, &live, 38).await;
         assert!(summary.decisions_enter_short >= 1);
         assert_eq!(
             machine.phase(),
@@ -3599,14 +3562,11 @@ emergency_complete_grace_ms: 0  # tests assert immediate-complete on zero (#287 
         // Equity * pct ($100 * 0.05 = $5) < min_notional ($50) →
         // SizeOutcome::BelowMin.
         let (ext_seq, lt_seq) = breach_sequence();
-        let hub = Arc::new(
-            ScriptedHub::new(ext_seq, lt_seq).with_equity(dec!(50), dec!(50)),
-        );
+        let hub = Arc::new(ScriptedHub::new(ext_seq, lt_seq).with_equity(dec!(50), dec!(50)));
         let ext_vops = Arc::new(ScriptedVenueOps::new());
         let lt_vops = Arc::new(ScriptedVenueOps::new());
         let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
-        let (machine, summary, open_qty) =
-            drive_live_ticks(&cfg, &*hub, &live, 38).await;
+        let (machine, summary, open_qty) = drive_live_ticks(&cfg, &*hub, &live, 38).await;
         // `decisions_enter_short` is gated on EntrySignal landing
         // (mirrors the existing kill_switch / risk-gate pattern: a
         // skipped Enter does NOT bump the success counter). Proof
@@ -3618,7 +3578,11 @@ emergency_complete_grace_ms: 0  # tests assert immediate-complete on zero (#287 
              that fails sizing; got summary={:?}",
             summary
         );
-        assert_eq!(machine.phase(), Phase::Flat, "state machine untouched on skip");
+        assert_eq!(
+            machine.phase(),
+            Phase::Flat,
+            "state machine untouched on skip"
+        );
         assert!(open_qty.is_none());
         assert_eq!(summary.decisions_enter_short, 0);
         assert!(
@@ -3640,10 +3604,7 @@ emergency_complete_grace_ms: 0  # tests assert immediate-complete on zero (#287 
             async fn read_mid(&self, venue: Venue) -> Result<MidSnapshot> {
                 self.inner.read_mid(venue).await
             }
-            async fn read_equity_usd(
-                &self,
-                _venue: Venue,
-            ) -> Result<Option<Decimal>> {
+            async fn read_equity_usd(&self, _venue: Venue) -> Result<Option<Decimal>> {
                 Ok(None)
             }
         }
@@ -3656,8 +3617,7 @@ emergency_complete_grace_ms: 0  # tests assert immediate-complete on zero (#287 
         let ext_vops = Arc::new(ScriptedVenueOps::new());
         let lt_vops = Arc::new(ScriptedVenueOps::new());
         let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
-        let (machine, summary, open_qty) =
-            drive_live_ticks(&cfg, &*hub, &live, 38).await;
+        let (machine, summary, open_qty) = drive_live_ticks(&cfg, &*hub, &live, 38).await;
         // Same gating semantics as the size-below-min test: the
         // counter we assert on is the explicit skip counter, not
         // decisions_enter_short.
@@ -3685,8 +3645,7 @@ emergency_complete_grace_ms: 0  # tests assert immediate-complete on zero (#287 
         let ext_vops = Arc::new(ScriptedVenueOps::new());
         let lt_vops = Arc::new(ScriptedVenueOps::new());
         let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
-        let (machine, summary, open_qty) =
-            drive_live_ticks(&cfg, &*hub, &live, 38).await;
+        let (machine, summary, open_qty) = drive_live_ticks(&cfg, &*hub, &live, 38).await;
         assert!(summary.decisions_enter_short >= 1);
         assert_eq!(
             machine.phase(),
@@ -3794,8 +3753,7 @@ leg_mismatch_timeout_ms: 100
             };
         });
         let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
-        let (machine, summary, open_qty) =
-            drive_live_ticks(&cfg, &*hub, &live, total).await;
+        let (machine, summary, open_qty) = drive_live_ticks(&cfg, &*hub, &live, total).await;
         assert!(
             summary.decisions_enter_short >= 1,
             "Enter must have fired; summary={:?}",
@@ -3845,21 +3803,18 @@ leg_mismatch_timeout_ms: 100
         let lt_vops = Arc::new(ScriptedVenueOps::new());
         lt_vops.with_state(|s| {
             s.poll_fill.push_back(
-                crate::trade::execution::venue_ops::ScriptedResponse::FillStatus(
-                    OrderFillStatus {
-                        filled_qty: dec!(1),
-                        terminal: true,
-                        cancelled: false,
-                    },
-                ),
+                crate::trade::execution::venue_ops::ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(1),
+                    terminal: true,
+                    cancelled: false,
+                }),
             );
             // default_fill stays at OrderFillStatus::default() = zero
             // non-terminal so subsequent polls (the exit cycle) keep
             // returning "still in flight".
         });
         let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
-        let (machine, summary, open_qty) =
-            drive_live_ticks(&cfg, &*hub, &live, total).await;
+        let (machine, summary, open_qty) = drive_live_ticks(&cfg, &*hub, &live, total).await;
         assert!(summary.decisions_enter_short >= 1);
         assert!(summary.decisions_exit >= 1);
         assert_eq!(
@@ -3902,13 +3857,11 @@ leg_mismatch_timeout_ms: 100
         lt_vops.with_state(|s| {
             // Entry: terminal-filled (queued — first pop).
             s.poll_fill.push_back(
-                crate::trade::execution::venue_ops::ScriptedResponse::FillStatus(
-                    OrderFillStatus {
-                        filled_qty: dec!(1),
-                        terminal: true,
-                        cancelled: false,
-                    },
-                ),
+                crate::trade::execution::venue_ops::ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(1),
+                    terminal: true,
+                    cancelled: false,
+                }),
             );
             // Exit: terminal-cancelled with zero fill (default) →
             // LighterTerminal::Failed{Cancelled}. ParallelExitLoop
@@ -3920,8 +3873,7 @@ leg_mismatch_timeout_ms: 100
             };
         });
         let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
-        let (machine, summary, open_qty) =
-            drive_live_ticks(&cfg, &*hub, &live, total).await;
+        let (machine, summary, open_qty) = drive_live_ticks(&cfg, &*hub, &live, total).await;
         assert!(summary.decisions_enter_short >= 1);
         assert!(summary.decisions_exit >= 1);
         assert_eq!(
@@ -3948,13 +3900,13 @@ leg_mismatch_timeout_ms: 100
     /// shows non-zero, after one close_all show zero, return
     /// Complete" the same way the emergency_loop unit tests do.
     struct ScriptedLegReader {
-        seq: std::sync::Mutex<std::collections::VecDeque<crate::trade::execution::emergency_loop::LegQtys>>,
+        seq: std::sync::Mutex<
+            std::collections::VecDeque<crate::trade::execution::emergency_loop::LegQtys>,
+        >,
     }
 
     impl ScriptedLegReader {
-        fn new(
-            seq: Vec<crate::trade::execution::emergency_loop::LegQtys>,
-        ) -> Self {
+        fn new(seq: Vec<crate::trade::execution::emergency_loop::LegQtys>) -> Self {
             assert!(!seq.is_empty(), "ScriptedLegReader needs ≥1 entry");
             Self {
                 seq: std::sync::Mutex::new(seq.into()),
@@ -4247,11 +4199,10 @@ leg_mismatch_timeout_ms: 100
         // Five close_all rejections — equal to the kill threshold.
         ext.with_state(|s| {
             for _ in 0..5 {
-                s.close_all.push_back(
-                    crate::trade::execution::venue_ops::ScriptedResponse::Err(
+                s.close_all
+                    .push_back(crate::trade::execution::venue_ops::ScriptedResponse::Err(
                         "reduce-only rejected".into(),
-                    ),
-                );
+                    ));
             }
         });
         let lt = Arc::new(ScriptedVenueOps::new());
@@ -4291,7 +4242,10 @@ leg_mismatch_timeout_ms: 100
             }
         }
 
-        assert!(stuck.is_stuck(), "STUCK file must be armed after 5 failures");
+        assert!(
+            stuck.is_stuck(),
+            "STUCK file must be armed after 5 failures"
+        );
         assert_eq!(summary.emergency_close_all_failures, 5);
         assert_eq!(summary.emergency_stuck_armed, 1);
 
@@ -4370,8 +4324,7 @@ leg_mismatch_timeout_ms: 100
         let ext_vops = Arc::new(ScriptedVenueOps::new());
         let lt_vops = Arc::new(ScriptedVenueOps::new());
         let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
-        let (machine, summary, open_qty) =
-            drive_live_ticks(&cfg, &*hub, &live, total).await;
+        let (machine, summary, open_qty) = drive_live_ticks(&cfg, &*hub, &live, total).await;
         assert!(summary.decisions_enter_short >= 1);
         assert!(summary.decisions_exit >= 1);
         assert_eq!(
@@ -4578,8 +4531,7 @@ leg_mismatch_timeout_ms: 100
             };
         });
         let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
-        let (machine, summary, _) =
-            drive_live_ticks(&cfg, &*hub, &live, total).await;
+        let (machine, summary, _) = drive_live_ticks(&cfg, &*hub, &live, total).await;
         assert_eq!(machine.phase(), Phase::Flat);
         assert!(
             summary.last_realised_pnl_usd.is_some(),
@@ -4634,8 +4586,7 @@ leg_mismatch_timeout_ms: 100
             };
         });
         let live = live_with_scripted(&cfg, ext_vops.clone(), lt_vops.clone());
-        let (machine, summary, _open_qty) =
-            drive_live_ticks(&cfg, &*hub, &live, total).await;
+        let (machine, summary, _open_qty) = drive_live_ticks(&cfg, &*hub, &live, total).await;
         assert!(summary.decisions_enter_short >= 1);
         assert!(summary.decisions_exit >= 1);
         assert_eq!(
@@ -4781,8 +4732,16 @@ leg_mismatch_timeout_ms: 100
         cfg.dry_run = false;
         let mut machine = machine_in_held(dec!(0.025));
         let hub = Arc::new(ScriptedHub::new(
-            vec![mid(1_000, 2_000.0), mid(2_000, 2_000.0), mid(3_000, 2_000.0)],
-            vec![mid(1_000, 2_000.0), mid(2_000, 2_000.0), mid(3_000, 2_000.0)],
+            vec![
+                mid(1_000, 2_000.0),
+                mid(2_000, 2_000.0),
+                mid(3_000, 2_000.0),
+            ],
+            vec![
+                mid(1_000, 2_000.0),
+                mid(2_000, 2_000.0),
+                mid(3_000, 2_000.0),
+            ],
         ));
         let ext_vops = Arc::new(ScriptedVenueOps::new());
         let lt_vops = Arc::new(ScriptedVenueOps::new());

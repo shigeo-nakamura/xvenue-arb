@@ -170,9 +170,11 @@ pub struct LighterMakerConfig {
     /// order for the residual qty. `lighter_taker_fallback` in YAML.
     pub taker_fallback: bool,
     /// `lighter_post_only` — when false the maker stage is skipped
-    /// entirely and execution stays on the legacy `LighterFillLoop` path.
-    /// The runner uses this flag to pick which loop to drive; the maker
-    /// loop itself only runs when this is true.
+    /// entirely and execution stays on the legacy `LighterFillLoop`
+    /// path on **both entry and exit** (#330). When true the runner
+    /// drives `LighterMakerLoop` for entry (`xvenue::live`) and
+    /// `ParallelExitLoop::run` selects the same maker loop for exit;
+    /// the maker loop itself only runs when this flag is true.
     pub post_only: bool,
     /// bot-strategy#322: after a chase round terminates with
     /// `filled=0 cancelled=false` (i.e. the deadline elapsed before
@@ -304,7 +306,9 @@ mod tests {
     #[test]
     fn extended_config_rejects_zero_timeout() {
         let cfg = ExtendedMakerConfig {
-            common: CommonExecutorConfig { poll_interval_ms: 50 },
+            common: CommonExecutorConfig {
+                poll_interval_ms: 50,
+            },
             chase_ticks: 1,
             chase_retries: 3,
             chase_timeout_ms: 0,
@@ -318,7 +322,9 @@ mod tests {
     #[test]
     fn extended_config_rejects_zero_retries_no_fallback() {
         let cfg = ExtendedMakerConfig {
-            common: CommonExecutorConfig { poll_interval_ms: 50 },
+            common: CommonExecutorConfig {
+                poll_interval_ms: 50,
+            },
             chase_ticks: 1,
             chase_retries: 0,
             chase_timeout_ms: 500,
@@ -333,7 +339,9 @@ mod tests {
     fn extended_config_zero_retries_with_fallback_is_ok() {
         // Operator-emergency mode: skip maker, go straight to taker.
         let cfg = ExtendedMakerConfig {
-            common: CommonExecutorConfig { poll_interval_ms: 50 },
+            common: CommonExecutorConfig {
+                poll_interval_ms: 50,
+            },
             chase_ticks: 1,
             chase_retries: 0,
             chase_timeout_ms: 500,
@@ -347,7 +355,9 @@ mod tests {
     #[test]
     fn lighter_maker_config_rejects_zero_timeout() {
         let cfg = LighterMakerConfig {
-            common: CommonExecutorConfig { poll_interval_ms: 25 },
+            common: CommonExecutorConfig {
+                poll_interval_ms: 25,
+            },
             chase_ticks: 1,
             chase_retries: 3,
             chase_timeout_ms: 0,
@@ -362,7 +372,9 @@ mod tests {
     #[test]
     fn lighter_maker_config_rejects_zero_retries_no_fallback() {
         let cfg = LighterMakerConfig {
-            common: CommonExecutorConfig { poll_interval_ms: 25 },
+            common: CommonExecutorConfig {
+                poll_interval_ms: 25,
+            },
             chase_ticks: 1,
             chase_retries: 0,
             chase_timeout_ms: 250,
@@ -379,7 +391,9 @@ mod tests {
         // post_only=false short-circuits — the loop is unused and
         // validate() should not complain about chase budget.
         let cfg = LighterMakerConfig {
-            common: CommonExecutorConfig { poll_interval_ms: 25 },
+            common: CommonExecutorConfig {
+                poll_interval_ms: 25,
+            },
             chase_ticks: 1,
             chase_retries: 0,
             chase_timeout_ms: 250,
@@ -394,7 +408,9 @@ mod tests {
     #[test]
     fn lighter_maker_worst_case_budget_multiplies_retries_and_timeout() {
         let cfg = LighterMakerConfig {
-            common: CommonExecutorConfig { poll_interval_ms: 25 },
+            common: CommonExecutorConfig {
+                poll_interval_ms: 25,
+            },
             chase_ticks: 1,
             chase_retries: 4,
             chase_timeout_ms: 250,
@@ -415,7 +431,9 @@ mod tests {
     #[test]
     fn lighter_config_rejects_zero_timeout() {
         let cfg = LighterFillConfig {
-            common: CommonExecutorConfig { poll_interval_ms: 25 },
+            common: CommonExecutorConfig {
+                poll_interval_ms: 25,
+            },
             order_type: LighterOrderType::Market,
             fill_timeout_ms: 0,
         };
