@@ -172,6 +172,12 @@ pub struct LivePaperSummary {
     /// Number of new entries suppressed because the STUCK file is
     /// armed (REST consec-fail / reduce-only consec-fail / SIGUSR1).
     pub entries_blocked_by_stuck_file: u64,
+    /// bot-strategy#309 step 4: count of `Decision::Enter` outcomes
+    /// dropped because the Lighter side we'd post on already has more
+    /// than `lt_book_max_eth` size at touch (we'd be too deep in queue
+    /// for the maker fill premise to hold). 0 when the filter is
+    /// disabled (`lt_book_max_eth: None`).
+    pub entries_blocked_by_book_depth: u64,
     /// Number of ticks where the WS staleness watchdog flipped to
     /// `Stale` (#244 Group C / `risk::ws_health`). Counts the trip,
     /// not every tick the latch stays armed — the runner emits one
@@ -790,6 +796,43 @@ fn apply_entry_gates(
     }
 }
 
+/// bot-strategy#309 step 4: queue-depth filter for the maker-on-Lighter
+/// redesign. Returns `true` when the entry should be blocked because
+/// the Lighter side we would post on has more than `max_eth` size at
+/// touch. Returns `false` when the filter is disabled (`max_eth =
+/// None`), when the relevant size is zero/missing (no book → can't
+/// evaluate, fall through), or when the size is within budget.
+///
+/// Long entry posts on Lighter ASK (we're the seller) so checks
+/// `lt_ask_size`. Short entry posts on Lighter BID so checks
+/// `lt_bid_size`. Mirrors the BT redesign cell that demonstrated
+/// net +$47.64 over 5.28d at $50 notional with `lt_book_max=2 ETH`.
+fn book_depth_blocks_entry(
+    dir: SpreadDirection,
+    lt_snap: &MidSnapshot,
+    max_eth: Option<f64>,
+) -> bool {
+    let max = match max_eth {
+        Some(m) => m,
+        None => return false,
+    };
+    let size = match dir {
+        SpreadDirection::Long => lt_snap.ask_size,
+        SpreadDirection::Short => lt_snap.bid_size,
+    };
+    let size_f = match size.to_f64() {
+        Some(s) if s.is_finite() => s,
+        _ => return false,
+    };
+    // size==0 indicates an empty side; fall through rather than block,
+    // mirroring the existing book_ok semantics where a zero-size side
+    // is handled upstream by the spread engine, not here.
+    if size_f <= 0.0 {
+        return false;
+    }
+    size_f > max
+}
+
 /// S5-3 forced flatten on session DD (#268). Runs *before* signal.decide
 /// so a HALTed position routes to `EmergencyFlattening` rather than
 /// letting the strategy decide a natural exit (which could chase for
@@ -1097,7 +1140,8 @@ async fn report_status_tick<H: VenueHub + ?Sized>(
     log::info!(
         "[STATUS] ticks={} samples={} hold={} enter_l={} enter_s={} exit={} \
          ks_blocked={} stuck_blocked={} dd_blocked={} sd_blocked={} cb_blocked={} \
-         ws_blocked={} ws_emerg={} skew_emerg={} ws_age_ext={:?} ws_age_lt={:?} \
+         ws_blocked={} depth_blocked={} ws_emerg={} skew_emerg={} \
+         ws_age_ext={:?} ws_age_lt={:?} \
          ref_supp_ext={} ref_supp_lt={} read_mid_err_ext={} read_mid_err_lt={} \
          dev_bps={:?} cap_long={:?} cap_short={:?} \
          ext_inside={:?} lt_inside={:?} lt_bid_sz={:?} lt_ask_sz={:?}",
@@ -1113,6 +1157,7 @@ async fn report_status_tick<H: VenueHub + ?Sized>(
         summary.entries_blocked_by_session_dd,
         summary.entries_blocked_by_circuit_breaker,
         summary.entries_blocked_by_ws_stale,
+        summary.entries_blocked_by_book_depth,
         summary.ws_stale_emergencies_emitted,
         summary.skew_emergencies_emitted,
         ws_age.ext_age_ms,
@@ -1317,6 +1362,26 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
         summary,
         dev,
     );
+
+    // bot-strategy#309 step 4: queue-depth filter. Runs after the
+    // standard entry gates so a kill_switch / risk-halt block doesn't
+    // get re-counted as a depth block. Disabled by default; flips on
+    // for the maker-on-Lighter redesign once `lt_book_max_eth` is set
+    // in the YAML.
+    if let Decision::Enter(dir) = decision {
+        if book_depth_blocks_entry(dir, &lt_snap, cfg.lt_book_max_eth) {
+            log::debug!(
+                "[XVENUE] book-depth filter blocked entry: dir={:?} \
+                 lt_bid_sz={:?} lt_ask_sz={:?} max={:?}",
+                dir,
+                summary.last_lt_bid_size,
+                summary.last_lt_ask_size,
+                cfg.lt_book_max_eth,
+            );
+            summary.entries_blocked_by_book_depth += 1;
+            decision = Decision::Hold;
+        }
+    }
 
     match decision {
         Decision::Hold => {
@@ -2114,6 +2179,95 @@ mod tests {
     use crate::risk::manager::{RiskConfig, RiskManager};
     use crate::xvenue::test_helpers::{mid, stale_mid, ScriptedHub, WarmupHub};
     use tokio::time::timeout;
+
+    fn lt_snap_with_sizes(bid_size: Decimal, ask_size: Decimal) -> MidSnapshot {
+        MidSnapshot {
+            ts_ms: 0,
+            mid: Decimal::from(2000),
+            book_ok: true,
+            bid: Decimal::from(1999),
+            ask: Decimal::from(2001),
+            bid_size,
+            ask_size,
+        }
+    }
+
+    fn d(n: i64, scale: u32) -> Decimal {
+        Decimal::new(n, scale)
+    }
+
+    #[test]
+    fn book_depth_filter_disabled_when_max_is_none() {
+        let snap = lt_snap_with_sizes(Decimal::from(100), Decimal::from(100));
+        assert!(!book_depth_blocks_entry(SpreadDirection::Long, &snap, None));
+        assert!(!book_depth_blocks_entry(SpreadDirection::Short, &snap, None));
+    }
+
+    #[test]
+    fn book_depth_filter_blocks_long_when_ask_too_deep() {
+        // Long posts on Lighter ASK (we're the seller). ask_size=5,
+        // max=2 ETH → blocked.
+        let snap = lt_snap_with_sizes(d(5, 1), Decimal::from(5));
+        assert!(book_depth_blocks_entry(
+            SpreadDirection::Long,
+            &snap,
+            Some(2.0)
+        ));
+        // Short would post on the (thin) BID side, so not blocked.
+        assert!(!book_depth_blocks_entry(
+            SpreadDirection::Short,
+            &snap,
+            Some(2.0)
+        ));
+    }
+
+    #[test]
+    fn book_depth_filter_blocks_short_when_bid_too_deep() {
+        let snap = lt_snap_with_sizes(Decimal::from(5), d(5, 1));
+        assert!(book_depth_blocks_entry(
+            SpreadDirection::Short,
+            &snap,
+            Some(2.0)
+        ));
+        assert!(!book_depth_blocks_entry(
+            SpreadDirection::Long,
+            &snap,
+            Some(2.0)
+        ));
+    }
+
+    #[test]
+    fn book_depth_filter_admits_at_or_below_threshold() {
+        let snap = lt_snap_with_sizes(Decimal::from(2), Decimal::from(2));
+        // Equal to threshold → admit (strict > comparator)
+        assert!(!book_depth_blocks_entry(
+            SpreadDirection::Long,
+            &snap,
+            Some(2.0)
+        ));
+        assert!(!book_depth_blocks_entry(
+            SpreadDirection::Short,
+            &snap,
+            Some(2.0)
+        ));
+    }
+
+    #[test]
+    fn book_depth_filter_falls_through_on_zero_size() {
+        // Empty side: spread engine handles via book_ok upstream;
+        // here we don't double-gate.
+        let snap = lt_snap_with_sizes(Decimal::ZERO, Decimal::ZERO);
+        assert!(!book_depth_blocks_entry(
+            SpreadDirection::Long,
+            &snap,
+            Some(2.0)
+        ));
+        assert!(!book_depth_blocks_entry(
+            SpreadDirection::Short,
+            &snap,
+            Some(2.0)
+        ));
+    }
 
     /// Test fixture: build a paused (manual) ReferenceGuard so unit
     /// tests don't spawn a real polling task / hit the network. The

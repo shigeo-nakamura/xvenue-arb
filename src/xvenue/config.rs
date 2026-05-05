@@ -134,6 +134,17 @@ pub struct XvenueConfig {
     pub lighter_order_type: String,
     #[serde(default = "default_lighter_fill_timeout_ms")]
     pub lighter_fill_timeout_ms: u64,
+    /// bot-strategy#309 step 4: queue-depth filter for the maker-on-
+    /// Lighter redesign. Skip new entries when the Lighter side we'd
+    /// post on already has more than this size at touch (so we won't
+    /// be near front-of-queue and the maker fill premise breaks).
+    /// `None` (default) disables the filter — preserves legacy taker
+    /// behavior. Long entry checks `lt_ask_size`; Short checks
+    /// `lt_bid_size`. Recommended starting point per the BT redesign:
+    /// 2.0 ETH for the ETH config (book_max=2 cell tested net +$47.64
+    /// over 5.28d at $50 notional, conservative thr=1.0 thin=1.0).
+    #[serde(default)]
+    pub lt_book_max_eth: Option<f64>,
 
     // ---- Realised PnL fees (#268 S5-1) ----
     /// Per-side fee rate the realised-PnL helper subtracts on each
@@ -290,6 +301,14 @@ impl XvenueConfig {
                 "signal_mode must be \"mid_to_mid\" or \"touch_to_touch\"; got {}",
                 self.signal_mode
             );
+        }
+        if let Some(m) = self.lt_book_max_eth {
+            if m <= 0.0 || !m.is_finite() {
+                anyhow::bail!(
+                    "lt_book_max_eth must be a positive finite number; got {}",
+                    m
+                );
+            }
         }
         Ok(())
     }
@@ -686,6 +705,47 @@ abs_threshold_bps: 1.0
         assert_eq!(cfg.signal_mode_enum(), SignalMode::TouchToTouch);
         assert_eq!(cfg.signal_config().signal_mode, SignalMode::TouchToTouch);
         assert_eq!(cfg.signal_config().abs_threshold_bps, 1.0);
+    }
+
+    #[test]
+    fn lt_book_max_eth_default_is_none() {
+        let cfg = parse(minimal_yaml());
+        assert_eq!(cfg.lt_book_max_eth, None);
+    }
+
+    #[test]
+    fn lt_book_max_eth_round_trips_when_set() {
+        let yaml = r#"
+agent_name: x
+symbol_ext: ETH-USD
+symbol_lt: ETH
+trade_size_pct: 0.05
+min_notional_usd: 20
+max_notional_usd: 1000
+binance_reference_symbol: ETHUSDT
+reference_max_dev_bps: 100
+lt_book_max_eth: 2.0
+"#;
+        let cfg = parse(yaml);
+        assert_eq!(cfg.lt_book_max_eth, Some(2.0));
+    }
+
+    #[test]
+    fn rejects_non_positive_lt_book_max() {
+        let yaml = r#"
+agent_name: x
+symbol_ext: ETH-USD
+symbol_lt: ETH
+trade_size_pct: 0.05
+min_notional_usd: 20
+max_notional_usd: 1000
+binance_reference_symbol: ETHUSDT
+reference_max_dev_bps: 100
+lt_book_max_eth: 0
+"#;
+        let cfg: XvenueConfig = serde_yaml::from_str(yaml).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("lt_book_max_eth"));
     }
 
     #[test]
