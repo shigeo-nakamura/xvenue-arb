@@ -173,6 +173,14 @@ pub struct LivePaperSummary {
     /// Number of new entries suppressed because the STUCK file is
     /// armed (REST consec-fail / reduce-only consec-fail / SIGUSR1).
     pub entries_blocked_by_stuck_file: u64,
+    /// bot-strategy#317: count of `Decision::Enter` outcomes blocked
+    /// because Extended is in maintenance (or a declared maintenance
+    /// window starts within 1 hour). Mirrors pairtrade's
+    /// `is_upcoming_maintenance(1)` gate. Without this, every entry
+    /// in maintenance burns one `Maintenance mode` REST round-trip on
+    /// Extended; the gate replaces that with one cheap connector-side
+    /// flag check per tick.
+    pub entries_blocked_by_maintenance: u64,
     /// bot-strategy#309 step 4: count of `Decision::Enter` outcomes
     /// dropped because the Lighter side we'd post on already has more
     /// than `lt_book_max_eth` size at touch (we'd be too deep in queue
@@ -1219,7 +1227,7 @@ async fn report_status_tick<H: VenueHub + ?Sized>(
     log::info!(
         "[STATUS] ticks={} samples={} hold={} enter_l={} enter_s={} exit={} \
          ks_blocked={} stuck_blocked={} dd_blocked={} sd_blocked={} cb_blocked={} \
-         ws_blocked={} depth_blocked={} ws_emerg={} skew_emerg={} \
+         ws_blocked={} depth_blocked={} maint_blocked={} ws_emerg={} skew_emerg={} \
          ws_age_ext={:?} ws_age_lt={:?} \
          ref_supp_ext={} ref_supp_lt={} read_mid_err_ext={} read_mid_err_lt={} \
          dev_bps={:?} cap_long={:?} cap_short={:?} \
@@ -1238,6 +1246,7 @@ async fn report_status_tick<H: VenueHub + ?Sized>(
         summary.entries_blocked_by_circuit_breaker,
         summary.entries_blocked_by_ws_stale,
         summary.entries_blocked_by_book_depth,
+        summary.entries_blocked_by_maintenance,
         summary.ws_stale_emergencies_emitted,
         summary.skew_emergencies_emitted,
         ws_age.ext_age_ms,
@@ -1446,6 +1455,28 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
         summary,
         dev,
     );
+
+    // bot-strategy#317: Extended maintenance gate. Mirrors pairtrade's
+    // `is_upcoming_maintenance(1)` check at pairtrade/src/pairtrade/mod.rs.
+    // Without this, every entry attempt during a declared / reactive
+    // maintenance window burns a `Maintenance mode` REST round-trip on
+    // Extended (taker IOC rejected, state → Flat, retry next tick). The
+    // gate replaces that with one cheap connector-side flag check per
+    // tick. Lighter has no maintenance protocol so the default-`false`
+    // trait impl on its VenueOps means we only consult Extended.
+    if matches!(decision, Decision::Enter(_)) {
+        if let Some(live) = live_exec {
+            if live.ext_ops.is_upcoming_maintenance(1).await {
+                log::warn!(
+                    "[XVENUE] Extended maintenance upcoming/active; blocking new entry. \
+                     dev_bps={:?}",
+                    dev
+                );
+                summary.entries_blocked_by_maintenance += 1;
+                decision = Decision::Hold;
+            }
+        }
+    }
 
     // bot-strategy#309 step 4: queue-depth filter. Runs after the
     // standard entry gates so a kill_switch / risk-halt block doesn't

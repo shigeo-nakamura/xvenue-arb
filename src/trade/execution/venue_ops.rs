@@ -115,6 +115,18 @@ pub trait VenueOps: Send + Sync {
     /// the account currently holds — Extended and Lighter both
     /// support this shape via `close_all_positions(None)`.
     async fn close_all(&self, symbol: Option<&str>) -> Result<()>;
+
+    /// True when the venue is in maintenance OR a declared maintenance
+    /// window is within `hours_ahead` hours. Mirrors the
+    /// `DexConnector::is_upcoming_maintenance` contract — the runner's
+    /// pre-decision gate consults this to block new entries before the
+    /// venue starts rejecting orders. Defaults to `false` so connectors
+    /// without maintenance protocol semantics (e.g. Lighter) don't
+    /// have to opt into the check; only Extended currently surfaces
+    /// real maintenance state (bot-strategy#196 + #317).
+    async fn is_upcoming_maintenance(&self, _hours_ahead: i64) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------

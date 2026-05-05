@@ -248,6 +248,10 @@ impl VenueOps for LiveVenueOps {
             .await
             .map_err(|e| anyhow!("close_all_positions: {}", e))
     }
+
+    async fn is_upcoming_maintenance(&self, hours_ahead: i64) -> bool {
+        self.conn.is_upcoming_maintenance(hours_ahead).await
+    }
 }
 
 #[cfg(test)]
