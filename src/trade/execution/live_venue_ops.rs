@@ -12,17 +12,24 @@
 //! | VenueOps method     | DexConnector call(s)                                       |
 //! |---------------------|------------------------------------------------------------|
 //! | `read_top_of_book`  | `get_order_book(symbol, 1)`                                |
-//! | `place_post_only`   | `create_order(price=Some, spread=Some(-2), reduce_only=false)` |
+//! | `place_post_only`   | `create_order(price=Some, spread=Some(-2), reduce_only=…)` |
 //! | `place_taker`       | `create_order_taker_ioc(slippage_bps=…)` if configured, else `create_order(price=None, spread=None, …)` |
 //! | `cancel`            | `cancel_order(symbol, order_id)`                           |
 //! | `poll_fill_status`  | `get_filled_orders` + `get_canceled_orders` + `get_open_orders`, filter by `order_id`, aggregate |
 //! | `close_all`         | `close_all_positions(symbol.map(String::from))`            |
 //!
-//! The `Some(-2)` marker on `create_order`'s `spread` parameter is
-//! Extended's post-only flag (extended_connector.rs:3098). Other
-//! venues ignore the marker and place a regular limit; the chase
-//! loop's terminal-cancelled and partial-fill handling still copes
-//! with whatever fill behaviour results.
+//! `Some(-2)` is the cross-DexConnector post-only sentinel on
+//! `create_order`'s `spread` parameter:
+//! - Extended: `extended_connector::mod.rs::create_order` →
+//!   `let post_only = matches!(spread, Some(-2));`
+//! - Lighter: `lighter_connector::mod.rs::resolve_spread_to_tif_and_price`
+//!   maps `-2` to `TIF_POST_ONLY` (verified by the `lighter-spike`
+//!   binary at \$50 notional — bot-strategy#317).
+//!
+//! Both backends honor the marker; `place_post_only` is therefore
+//! venue-agnostic and the chase loop on either side gets real
+//! post-only semantics (the venue rejects on cross instead of
+//! executing as taker).
 //!
 //! `taker_slippage_bps` selects the `place_taker` backend per venue
 //! (bot-strategy#302):

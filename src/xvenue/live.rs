@@ -46,6 +46,7 @@ use crate::risk::skew_monitor::{SkewMonitor, SkewOutcome};
 use crate::risk::ws_health::{WsHealthMonitor, WsHealthOutcome};
 use crate::trade::execution::extended_maker::{ExtendedEntryRequest, ExtendedMakerLoop};
 use crate::trade::execution::lighter_fill::{LighterFillLoop, LighterFillRequest};
+use crate::trade::execution::lighter_maker::{LighterMakerLoop, LighterMakerRequest};
 use crate::trade::execution::parallel_exit::{ParallelExitLoop, ParallelExitOutcome};
 use crate::trade::execution::types::{ExecutionFailure, ExtendedTerminal, LighterTerminal};
 
@@ -1727,15 +1728,35 @@ async fn handle_decision_enter<H: VenueHub + ?Sized>(
                 r.record_fill(true, false, now_ts_ms);
             }
             log::info!("[XVENUE] LIVE ENTER ext filled qty={}", qty);
-            let lt_term = LighterFillLoop::new(&*live.lt_ops, &live.lighter_fill_cfg)
-                .run(LighterFillRequest {
-                    symbol: live.lt_symbol.clone(),
-                    side: lt_side,
-                    target_qty: lt_qty,
-                    dust_qty: live.dust_qty,
-                    reduce_only: false,
-                })
-                .await;
+            // bot-strategy#309 step 6: route the Lighter entry leg
+            // through the post-only chase loop when the YAML flips
+            // `lighter_post_only: true`. Default keeps the legacy
+            // taker behavior. dex-connector verification gate is the
+            // `lighter-spike` binary at $50 notional (#317). Exit
+            // path stays on `LighterFillLoop` for now — the
+            // `ParallelExitLoop` refactor to choose between executors
+            // is a separate change.
+            let lt_term = if live.lighter_maker_cfg.post_only {
+                LighterMakerLoop::new(&*live.lt_ops, &live.lighter_maker_cfg)
+                    .run(LighterMakerRequest {
+                        symbol: live.lt_symbol.clone(),
+                        side: lt_side,
+                        target_qty: lt_qty,
+                        dust_qty: live.dust_qty,
+                        reduce_only: false,
+                    })
+                    .await
+            } else {
+                LighterFillLoop::new(&*live.lt_ops, &live.lighter_fill_cfg)
+                    .run(LighterFillRequest {
+                        symbol: live.lt_symbol.clone(),
+                        side: lt_side,
+                        target_qty: lt_qty,
+                        dust_qty: live.dust_qty,
+                        reduce_only: false,
+                    })
+                    .await
+            };
             match lt_term {
                 LighterTerminal::Filled { qty: lt_filled } => {
                     machine.apply(now_ts_ms, Event::LighterFilled { qty: lt_filled })?;

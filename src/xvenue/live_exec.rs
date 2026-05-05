@@ -29,7 +29,7 @@ use rust_decimal_macros::dec;
 use super::config::XvenueConfig;
 use crate::trade::execution::emergency_loop::{EmergencyLoopConfig, LegQtys, LegStateReader};
 use crate::trade::execution::parallel_exit::ParallelExitConfig;
-use crate::trade::execution::types::{ExtendedMakerConfig, LighterFillConfig};
+use crate::trade::execution::types::{ExtendedMakerConfig, LighterFillConfig, LighterMakerConfig};
 use crate::trade::execution::venue_ops::VenueOps;
 
 /// Default dust threshold below which a chase-loop residual is
@@ -46,6 +46,11 @@ pub struct LiveExecution {
     pub lt_ops: Arc<dyn VenueOps>,
     pub extended_maker_cfg: ExtendedMakerConfig,
     pub lighter_fill_cfg: LighterFillConfig,
+    /// bot-strategy#309 step 6: knobs for the post-only chase loop on
+    /// the Lighter leg. Active only when `post_only = true` (i.e.
+    /// `lighter_post_only` flipped on in the YAML); otherwise the
+    /// runner stays on the legacy `LighterFillLoop` path.
+    pub lighter_maker_cfg: LighterMakerConfig,
     pub parallel_exit_cfg: ParallelExitConfig,
     pub emergency_loop_cfg: EmergencyLoopConfig,
     /// Symbol for the Extended leg (e.g. "ETH-USD").
@@ -80,6 +85,7 @@ impl LiveExecution {
             lt_ops,
             extended_maker_cfg: cfg.extended_maker_config(),
             lighter_fill_cfg: cfg.lighter_fill_config()?,
+            lighter_maker_cfg: cfg.lighter_maker_config(),
             parallel_exit_cfg: cfg.parallel_exit_config(),
             emergency_loop_cfg: cfg.emergency_loop_config(),
             ext_symbol: cfg.symbol_ext.clone(),
@@ -125,6 +131,9 @@ impl LiveExecution {
             .validate()
             .map_err(|e| anyhow::anyhow!(e))?;
         self.lighter_fill_cfg
+            .validate()
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.lighter_maker_cfg
             .validate()
             .map_err(|e| anyhow::anyhow!(e))?;
         self.parallel_exit_cfg
@@ -184,6 +193,41 @@ reference_max_dev_bps: 100
         assert_eq!(exec.parallel_exit_cfg.leg_mismatch_timeout_ms, 3_000);
         assert_eq!(exec.emergency_loop_cfg.retry_interval_ms, 30_000);
         assert_eq!(exec.emergency_loop_cfg.max_attempts, 100);
+        // bot-strategy#309 step 6: lighter_maker_cfg is built from
+        // the same YAML; defaults keep post_only OFF so the legacy
+        // taker path stays in force until the operator flips the YAML.
+        assert!(!exec.lighter_maker_cfg.post_only);
+        assert_eq!(exec.lighter_maker_cfg.chase_retries, 3);
+    }
+
+    #[test]
+    fn lighter_post_only_yaml_propagates_into_live_execution() {
+        let yaml = r#"
+agent_name: x
+symbol_ext: ETH-USD
+symbol_lt: ETH
+trade_size_pct: 0.05
+min_notional_usd: 20
+max_notional_usd: 1000
+binance_reference_symbol: ETHUSDT
+reference_max_dev_bps: 100
+lighter_post_only: true
+lighter_chase_retries: 4
+lighter_chase_timeout_ms: 200
+extended_chase_timeout_ms: 500
+leg_mismatch_timeout_ms: 5000
+"#;
+        let c: XvenueConfig = serde_yaml::from_str(yaml).unwrap();
+        c.validate().unwrap();
+        let ext: Arc<dyn VenueOps> = Arc::new(ScriptedVenueOps::new());
+        let lt: Arc<dyn VenueOps> = Arc::new(ScriptedVenueOps::new());
+        let exec = LiveExecution::from_config(&c, ext, lt).unwrap();
+        assert!(exec.lighter_maker_cfg.post_only);
+        assert_eq!(exec.lighter_maker_cfg.chase_retries, 4);
+        assert_eq!(exec.lighter_maker_cfg.chase_timeout_ms, 200);
+        // Legacy LighterFillLoop config is still populated — exit
+        // path keeps using it even when entry flips to maker.
+        assert_eq!(exec.lighter_fill_cfg.fill_timeout_ms, 1_000);
     }
 
     #[test]
