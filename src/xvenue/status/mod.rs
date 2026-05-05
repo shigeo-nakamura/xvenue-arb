@@ -120,6 +120,10 @@ pub struct StatusReporter {
     session_risk: Option<SessionRiskSnapshot>,
     circuit_breaker: Option<CircuitBreakerSnapshot>,
     risk_history: Vec<RiskHistoryEvent>,
+
+    // Set by the live loop based on `is_upcoming_maintenance(1)`. Mirrors
+    // pairtrade `status.rs::StatusReporter.maintenance`. bot-strategy#321.
+    maintenance: Option<String>,
 }
 
 impl StatusReporter {
@@ -187,6 +191,7 @@ impl StatusReporter {
             session_risk: None,
             circuit_breaker: None,
             risk_history: Vec::new(),
+            maintenance: None,
         };
         reporter.load_equity_baseline();
         if let Err(err) = reporter.ensure_status_file() {
@@ -280,6 +285,13 @@ impl StatusReporter {
 
     pub fn set_risk_history(&mut self, v: Vec<RiskHistoryEvent>) {
         self.risk_history = v;
+    }
+
+    /// Set the maintenance tag surfaced on `status.json`. Pass `None` to
+    /// clear when the venue is no longer in maintenance. Mirrors
+    /// pairtrade `status.rs::set_maintenance`. bot-strategy#321.
+    pub fn set_maintenance(&mut self, v: Option<String>) {
+        self.maintenance = v;
     }
 
     /// Updates equity → PnL bookkeeping. Same contract as pairtrade:
@@ -388,6 +400,7 @@ impl StatusReporter {
                 pnl: self.total_pnl,
             }),
             error_summary: error_counter::global().map(|h| h.snapshot()),
+            maintenance: self.maintenance.clone(),
             venues,
             recent_taker_fills: self.recent_taker_fills.iter().cloned().collect(),
             spread_series: self.spread_series.iter().cloned().collect(),
@@ -813,6 +826,39 @@ dry_run: true
         // mark_dirty forces the next call.
         r.mark_dirty();
         assert!(r.write_snapshot_if_due(&machine, 0).unwrap());
+    }
+
+    #[test]
+    fn maintenance_field_surfaces_when_set() {
+        let _g = env_guard();
+        let tmp = TempDir::new().unwrap();
+        let cfg = min_cfg();
+        let mut r = reporter_in(&tmp, &cfg);
+        let machine = PositionMachine::new();
+
+        // Default: omitted from JSON (skip_serializing_if).
+        r.write_snapshot(&machine, 0).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(r.path()).unwrap()).unwrap();
+        assert!(v.get("maintenance").is_none());
+
+        // Set: surfaces the tag verbatim so the dashboard / error-watch
+        // workflow can branch on `maintenance != null`.
+        r.set_maintenance(Some("upcoming_or_active".to_string()));
+        r.write_snapshot(&machine, 0).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(r.path()).unwrap()).unwrap();
+        assert_eq!(
+            v.get("maintenance").and_then(|x| x.as_str()),
+            Some("upcoming_or_active")
+        );
+
+        // Clear: returns to omitted form.
+        r.set_maintenance(None);
+        r.write_snapshot(&machine, 0).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(r.path()).unwrap()).unwrap();
+        assert!(v.get("maintenance").is_none());
     }
 
     #[test]

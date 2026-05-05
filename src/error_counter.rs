@@ -8,7 +8,7 @@
 use log::{Level, Log, Metadata, Record};
 use serde::Serialize;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Process-global counter handle, populated by the binary's logger
@@ -16,12 +16,31 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// include an `error_summary` section in `status.json`.
 static GLOBAL_HANDLE: OnceLock<ErrorCounterHandle> = OnceLock::new();
 
+/// When true, `ErrorCountingLogger` stops incrementing warn/error counters
+/// and stops updating `last_error` / `last_warn`. Set from the live loop
+/// whenever Extended is detected as in/upcoming maintenance: the
+/// `Maintenance mode` REST rejections, WS reconnect bursts, and stale-book
+/// WARNs that fire while the venue is rejecting requests are expected
+/// fallout, not actionable signal, and should not inflate `error_summary`
+/// in `status.json`. Log emission to the inner logger (journalctl) is
+/// unaffected. Mirrors pairtrade `error_counter::SUPPRESS_COUNTING`.
+/// bot-strategy#321.
+static SUPPRESS_COUNTING: AtomicBool = AtomicBool::new(false);
+
 pub fn install_global(handle: ErrorCounterHandle) {
     let _ = GLOBAL_HANDLE.set(handle);
 }
 
 pub fn global() -> Option<&'static ErrorCounterHandle> {
     GLOBAL_HANDLE.get()
+}
+
+pub fn set_counting_suppressed(suppressed: bool) {
+    SUPPRESS_COUNTING.store(suppressed, Ordering::Relaxed);
+}
+
+pub fn is_counting_suppressed() -> bool {
+    SUPPRESS_COUNTING.load(Ordering::Relaxed)
 }
 
 /// Window (seconds) for the short-term rolling counts published in the
@@ -238,7 +257,7 @@ impl Log for ErrorCountingLogger {
             // poll lag).
             flush_expired_pending_ws(&self.counters, ts);
             let level = record.level();
-            if level == Level::Error || level == Level::Warn {
+            if (level == Level::Error || level == Level::Warn) && !is_counting_suppressed() {
                 let truncated = if msg.chars().count() > LAST_ERROR_MAX_CHARS {
                     msg.chars().take(LAST_ERROR_MAX_CHARS).collect::<String>() + "…"
                 } else {
@@ -299,6 +318,9 @@ mod tests {
         }
         flush_expired_pending_ws(counters, ts);
         if level != Level::Error && level != Level::Warn {
+            return;
+        }
+        if is_counting_suppressed() {
             return;
         }
         let truncated = msg.to_string();
@@ -409,5 +431,33 @@ mod tests {
         fake_log(&c, t0, Level::Error, "Some other ERROR unrelated to WS");
         let (e, _) = snap_counts(&c, t0 + 1);
         assert_eq!(e, 1, "non-WS errors must not be deferred");
+    }
+
+    /// While `set_counting_suppressed(true)` is in effect (e.g. Extended is
+    /// in maintenance), warn/error log lines must not bump the rolling
+    /// counters even though they still flow to the inner logger. Mirrors
+    /// pairtrade's coverage at `error_counter.rs::tests`. bot-strategy#321.
+    #[test]
+    fn suppress_counting_blocks_increments() {
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 5_000_000;
+        // Baseline: errors count without the flag.
+        fake_log(&c, t0, Level::Error, "Some venue ERROR before maintenance");
+        let (e0, _) = snap_counts(&c, t0 + 1);
+        assert_eq!(e0, 1);
+
+        set_counting_suppressed(true);
+        fake_log(&c, t0 + 5, Level::Error, "[UNHEDGED] BTC/ETH close failed err=ServerResponse(\"Maintenance mode\")");
+        fake_log(&c, t0 + 6, Level::Warn, "[XVENUE/extmaker] place_taker err=create_order_taker_ioc ETH-USD: Server response error: Maintenance mode");
+        let (e1, w1) = snap_counts(&c, t0 + 10);
+        assert_eq!(e1, 1, "ERROR must not increment while suppressed");
+        assert_eq!(w1, 0, "WARN must not increment while suppressed");
+
+        // Lifting the flag re-arms counting.
+        set_counting_suppressed(false);
+        fake_log(&c, t0 + 11, Level::Error, "Post-maintenance error");
+        let (e2, _) = snap_counts(&c, t0 + 12);
+        assert_eq!(e2, 2, "post-flag-clear errors count again");
     }
 }

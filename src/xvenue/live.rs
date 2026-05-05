@@ -1456,26 +1456,37 @@ async fn run_one_tick<H: VenueHub + ?Sized>(
         dev,
     );
 
-    // bot-strategy#317: Extended maintenance gate. Mirrors pairtrade's
+    // bot-strategy#317 / #321: Extended maintenance gate. Mirrors pairtrade's
     // `is_upcoming_maintenance(1)` check at pairtrade/src/pairtrade/mod.rs.
-    // Without this, every entry attempt during a declared / reactive
-    // maintenance window burns a `Maintenance mode` REST round-trip on
-    // Extended (taker IOC rejected, state → Flat, retry next tick). The
-    // gate replaces that with one cheap connector-side flag check per
-    // tick. Lighter has no maintenance protocol so the default-`false`
-    // trait impl on its VenueOps means we only consult Extended.
-    if matches!(decision, Decision::Enter(_)) {
-        if let Some(live) = live_exec {
-            if live.ext_ops.is_upcoming_maintenance(1).await {
-                log::warn!(
-                    "[XVENUE] Extended maintenance upcoming/active; blocking new entry. \
-                     dev_bps={:?}",
-                    dev
-                );
-                summary.entries_blocked_by_maintenance += 1;
-                decision = Decision::Hold;
-            }
-        }
+    // Evaluated once per tick (not just on Enter) so the flag also drives
+    // `status.maintenance` (gated by error-watch workflow, see
+    // bot-strategy#168/#199) and `error_counter::set_counting_suppressed`
+    // — without the latter, the `Maintenance mode` REST rejections, WS
+    // reconnect bursts, and stale-book WARNs that fire while the venue is
+    // rejecting requests inflate `error_summary` and trip the auto-error
+    // workflow even when the bot is correctly blocked. Lighter has no
+    // maintenance protocol so the default-`false` trait impl on its
+    // VenueOps means we only consult Extended.
+    let maintenance_block_entries = match live_exec {
+        Some(live) => live.ext_ops.is_upcoming_maintenance(1).await,
+        None => false,
+    };
+    if let Some(r) = reporter.as_deref_mut() {
+        r.set_maintenance(if maintenance_block_entries {
+            Some("upcoming_or_active".to_string())
+        } else {
+            None
+        });
+    }
+    crate::error_counter::set_counting_suppressed(maintenance_block_entries);
+    if matches!(decision, Decision::Enter(_)) && maintenance_block_entries {
+        log::warn!(
+            "[XVENUE] Extended maintenance upcoming/active; blocking new entry. \
+             dev_bps={:?}",
+            dev
+        );
+        summary.entries_blocked_by_maintenance += 1;
+        decision = Decision::Hold;
     }
 
     // bot-strategy#309 step 4: queue-depth filter. Runs after the

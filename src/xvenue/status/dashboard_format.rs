@@ -98,6 +98,14 @@ pub struct StatusSnapshot {
     pub trade_stats: Option<TradeStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_summary: Option<ErrorSummary>,
+    /// Free-form tag identifying that the venue has been detected as
+    /// in/upcoming maintenance (e.g. `"upcoming_or_active"`). The
+    /// error-watch workflow gates on `maintenance != null` to suppress
+    /// false-positive issue creation while the bot is correctly blocked.
+    /// Mirrors pairtrade `status.rs::StatusSnapshot.maintenance`. See
+    /// bot-strategy#321.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<String>,
 
     // ---- xvenue-arb extensions (DESIGN.md §7) ----
     pub venues: Vec<VenueState>,
