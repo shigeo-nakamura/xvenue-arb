@@ -56,6 +56,18 @@ const ROLLING_WINDOW_SECS: i64 = 1800;
 /// reconnects without ageing out a real persistent disconnect.
 const WS_DEFER_WINDOW_SECS: i64 = 60;
 
+/// 24h window for the ws-reset counter. Replaces the dashboard's
+/// `journalctl ... | awk '/Connection reset.../ {c++}'` SSM probe with
+/// a self-reported field in `status.json` (bot-strategy#343). Threshold
+/// for alerting is 10/day per #47.
+const WS_RESET_24H_WINDOW_SECS: i64 = 24 * 60 * 60;
+
+/// Substring used to identify a WS reset event in the log stream. The
+/// dashboard's old journalctl probe matched the same exact phrase, so
+/// the bot-self-reported counter and the journalctl-derived counter
+/// are interchangeable.
+const WS_RESET_PHRASE: &str = "Connection reset without closing handshake";
+
 /// Keep the last error message truncated to this many chars so the
 /// dashboard can display it without blowing up the JSON payload.
 const LAST_ERROR_MAX_CHARS: usize = 200;
@@ -87,6 +99,12 @@ struct Counters {
     /// `WS_DEFER_WINDOW_SECS` elapses, or (b) `snapshot()` flushes it into
     /// `recent` once its deadline passes. See bot-strategy#261.
     pending_ws: Mutex<VecDeque<PendingWsEntry>>,
+    /// Timestamps (epoch seconds) of WS reset events in the last 24h —
+    /// any log line containing `Connection reset without closing
+    /// handshake`. Surfaced as `ws_reset_24h_count` in `status.json` so
+    /// the dashboard does not need a journalctl SSM probe. See
+    /// bot-strategy#343.
+    ws_resets_24h: Mutex<VecDeque<i64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +141,23 @@ pub struct ErrorCounterHandle {
 }
 
 impl ErrorCounterHandle {
+    /// Read the 24h ws-reset count without mutating any other counter.
+    /// Used by `StatusReporter` to populate `ws_reset_24h_count`
+    /// (bot-strategy#343). Prunes expired timestamps as a side effect.
+    pub fn ws_reset_24h_count(&self) -> u64 {
+        let now = chrono::Utc::now().timestamp();
+        let cutoff = now - WS_RESET_24H_WINDOW_SECS;
+        let mut q = self.counters.ws_resets_24h.lock().unwrap();
+        while let Some(&front) = q.front() {
+            if front < cutoff {
+                q.pop_front();
+            } else {
+                break;
+            }
+        }
+        q.len() as u64
+    }
+
     pub fn snapshot(&self) -> ErrorSummary {
         let now = chrono::Utc::now().timestamp();
         // Flush any pending WS-defer entries whose recovery window has
@@ -185,6 +220,7 @@ impl ErrorCountingLogger {
             error_total: AtomicU64::new(0),
             warn_total: AtomicU64::new(0),
             pending_ws: Mutex::new(VecDeque::new()),
+            ws_resets_24h: Mutex::new(VecDeque::new()),
         });
         let handle = ErrorCounterHandle {
             counters: Arc::clone(&counters),
@@ -241,6 +277,24 @@ impl Log for ErrorCountingLogger {
         if self.enabled(record.metadata()) {
             let ts = chrono::Utc::now().timestamp();
             let msg = record.args().to_string();
+            // 24h ws-reset counter (#343). See pairtrade's
+            // `error_counter.rs::log` for the reasoning — we count
+            // independently of the pending-WS defer machinery so the
+            // dashboard sees the same volume the journalctl probe
+            // produced. Suppression (maintenance mode) does NOT mask
+            // ws_reset volume.
+            if msg.contains(WS_RESET_PHRASE) {
+                let cutoff = ts - WS_RESET_24H_WINDOW_SECS;
+                let mut q = self.counters.ws_resets_24h.lock().unwrap();
+                while let Some(&front) = q.front() {
+                    if front < cutoff {
+                        q.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                q.push_back(ts);
+            }
             // Recovery markers fire at INFO; check before the level gate so
             // they can drain pending entries from any preceding WS reset.
             if is_ws_recovery_event(&msg) {
@@ -308,10 +362,23 @@ mod tests {
             error_total: AtomicU64::new(0),
             warn_total: AtomicU64::new(0),
             pending_ws: Mutex::new(VecDeque::new()),
+            ws_resets_24h: Mutex::new(VecDeque::new()),
         })
     }
 
     fn fake_log(counters: &Counters, ts: i64, level: Level, msg: &str) {
+        if msg.contains(WS_RESET_PHRASE) {
+            let cutoff = ts - WS_RESET_24H_WINDOW_SECS;
+            let mut q = counters.ws_resets_24h.lock().unwrap();
+            while let Some(&front) = q.front() {
+                if front < cutoff {
+                    q.pop_front();
+                } else {
+                    break;
+                }
+            }
+            q.push_back(ts);
+        }
         if is_ws_recovery_event(msg) {
             let cutoff = ts - WS_DEFER_WINDOW_SECS;
             counters
@@ -517,5 +584,79 @@ mod tests {
         fake_log(&c, t0 + 11, Level::Error, "Post-maintenance error");
         let (e2, _) = snap_counts(&c, t0 + 12);
         assert_eq!(e2, 2, "post-flag-clear errors count again");
+    }
+
+    // bot-strategy#343: ws_reset_24h_count replaces the dashboard's old
+    // journalctl `Connection reset without closing handshake` SSM probe.
+
+    fn ws_reset_count(counters: &Counters, now: i64) -> u64 {
+        let cutoff = now - WS_RESET_24H_WINDOW_SECS;
+        let mut q = counters.ws_resets_24h.lock().unwrap();
+        while let Some(&front) = q.front() {
+            if front < cutoff {
+                q.pop_front();
+            } else {
+                break;
+            }
+        }
+        q.len() as u64
+    }
+
+    #[test]
+    fn ws_reset_24h_counts_matching_substring() {
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 12_000_000;
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "orderbook stream error: ws error: WebSocket protocol error: Connection reset without closing handshake (stream=orderbook BTC)",
+        );
+        fake_log(
+            &c,
+            t0 + 1,
+            Level::Warn,
+            "public trades stream error: Connection reset without closing handshake",
+        );
+        fake_log(&c, t0 + 2, Level::Warn, "[XVENUE] tick error: read_mid Lighter");
+        assert_eq!(ws_reset_count(&c, t0 + 5), 2);
+    }
+
+    #[test]
+    fn ws_reset_24h_expires_old_entries() {
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 13_000_000;
+        fake_log(&c, t0, Level::Warn, "Connection reset without closing handshake (1)");
+        fake_log(&c, t0 + 100, Level::Warn, "Connection reset without closing handshake (2)");
+        let now = t0 + WS_RESET_24H_WINDOW_SECS - 10;
+        assert_eq!(ws_reset_count(&c, now), 2);
+        let now = t0 + 100 + WS_RESET_24H_WINDOW_SECS + 10;
+        assert_eq!(ws_reset_count(&c, now), 0);
+    }
+
+    #[test]
+    fn ws_reset_24h_counts_independently_of_suppression() {
+        let _g = _serialize();
+        let c = make_counters();
+        set_counting_suppressed(true);
+        let t0 = 14_000_000;
+        fake_log(&c, t0, Level::Warn, "Connection reset without closing handshake");
+        let (e, w) = snap_counts(&c, t0 + 5);
+        assert_eq!((e, w), (0, 0));
+        assert_eq!(ws_reset_count(&c, t0 + 5), 1);
+        set_counting_suppressed(false);
+    }
+
+    #[test]
+    fn ws_reset_24h_ignores_non_matching_phrase() {
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 15_000_000;
+        fake_log(&c, t0, Level::Warn, "Connection reset by peer (os error 104)");
+        fake_log(&c, t0 + 1, Level::Warn, "WebSocket reset");
+        fake_log(&c, t0 + 2, Level::Warn, "Connection reset without graceful close");
+        assert_eq!(ws_reset_count(&c, t0 + 5), 0);
     }
 }

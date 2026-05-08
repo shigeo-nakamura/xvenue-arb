@@ -9,6 +9,7 @@ pub mod bt_grid;
 pub mod config;
 pub mod live;
 pub mod live_exec;
+pub(crate) mod s3_mirror;
 pub mod signal;
 pub mod sizing;
 pub mod spread;

@@ -25,6 +25,11 @@ rand_distr = "0.4"
 bincode = "1.3"
 libc = "0.2"
 rayon = "1.10"
+# Optional S3 mirror for the status writer (bot-strategy#343). Engaged only
+# when STATUS_S3_BUCKET / STATUS_S3_KEY_PREFIX env vars are set; without
+# them the writer stays local-only and the SDK is dead code at runtime.
+aws-config = "1"
+aws-sdk-s3 = "1"
 
 debot-utils = "1.0.*"
 # Binance 1m kline polling for the live reference_guard (#244 D / #166

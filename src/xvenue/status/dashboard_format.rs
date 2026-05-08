@@ -79,6 +79,11 @@ pub struct TradeStats {
 pub struct StatusSnapshot {
     pub ts: i64,
     pub updated_at: String,
+    /// Epoch seconds at which the bot process booted. Replaces the
+    /// dashboard's `systemctl ActiveEnterTimestamp` SSM probe — see
+    /// bot-strategy#343. Captured once per process at first
+    /// `StatusReporter` construction.
+    pub process_started_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -98,6 +103,14 @@ pub struct StatusSnapshot {
     pub trade_stats: Option<TradeStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_summary: Option<ErrorSummary>,
+    /// Mirror of the dashboard's old journalctl `Connection reset...`
+    /// counter, sampled from `error_counter::ws_reset_24h_count` at
+    /// snapshot time (#343).
+    pub ws_reset_24h_count: u64,
+    /// Mirror of the dashboard's old `cat /opt/debot/KILL_SWITCH` probe
+    /// (#343). Set by the live loop before each snapshot via
+    /// `set_kill_switch`.
+    pub kill_switch_active: bool,
     /// Free-form tag identifying that the venue has been detected as
     /// in/upcoming maintenance (e.g. `"upcoming_or_active"`). The
     /// error-watch workflow gates on `maintenance != null` to suppress

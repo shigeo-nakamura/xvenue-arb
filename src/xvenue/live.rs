@@ -486,6 +486,7 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
         refresh_equity(&*hub, r, &mut risk_manager).await;
         r.mark_dirty();
         publish_risk(&risk_manager, r);
+        publish_kill_switch(&cfg, r);
         if let Err(e) = r.write_snapshot_if_due(&machine, wall_clock_ms()) {
             log::warn!("[STATUS] initial snapshot write failed: {:?}", e);
         }
@@ -564,6 +565,7 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
 
             _ = status_ivl.tick() => {
                 report_status_tick(
+                    &cfg,
                     &*hub,
                     &summary,
                     &ws_health,
@@ -634,6 +636,15 @@ fn publish_risk(risk_manager: &RiskManager, reporter: &mut StatusReporter) {
     reporter.set_session_risk(risk_manager.session_snapshot());
     reporter.set_circuit_breaker(Some(risk_manager.circuit_breaker_snapshot(now_unix_secs())));
     reporter.set_risk_history(risk_manager.risk_history());
+}
+
+/// Refresh `kill_switch_active` on the reporter so the dashboard's
+/// `kill_switch_active` field stays current without an SSM probe (#343).
+/// Called once per tick from each `write_snapshot_if_due` call site so
+/// the reporter sees the same state the live `kill_switch_active()`
+/// gate sees inside `gate_decision`.
+fn publish_kill_switch(cfg: &XvenueConfig, reporter: &mut StatusReporter) {
+    reporter.set_kill_switch(kill_switch_active(&cfg.kill_switch_file));
 }
 
 /// Evaluate the WS staleness latch and, when a position is open and
@@ -1208,6 +1219,7 @@ async fn handle_emergency_flatten_tick(
 /// Behaviour-preserving: identical log line, identical equity refresh /
 /// risk publish / snapshot-write order.
 async fn report_status_tick<H: VenueHub + ?Sized>(
+    cfg: &XvenueConfig,
     hub: &H,
     summary: &LivePaperSummary,
     ws_health: &WsHealthMonitor,
@@ -1287,6 +1299,7 @@ async fn report_status_tick<H: VenueHub + ?Sized>(
     if let Some(r) = reporter {
         refresh_equity(hub, r, risk_manager).await;
         publish_risk(risk_manager, r);
+        publish_kill_switch(cfg, r);
         let now_ts_ms = wall_clock_ms();
         if let Err(e) = r.write_snapshot_if_due(machine, now_ts_ms) {
             log::warn!("[STATUS] snapshot write failed: {:?}", e);
