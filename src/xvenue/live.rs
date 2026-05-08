@@ -197,6 +197,18 @@ pub struct LivePaperSummary {
     pub would_be_maker_attempts: u64,
     pub would_be_maker_fills: u64,
     pub would_be_maker_p_sum: f64,
+    /// bot-strategy#330: would-be exit-side maker fill telemetry.
+    /// Mirror of the entry-side counters above — populated only in
+    /// paper-mode, on every `Decision::Exit` that consumes a paper
+    /// position. Each exit increments `attempts`; the depth-conditional
+    /// model run against the *opposite* side of the Lighter book (a
+    /// Long position closes by buying back at bid; a Short closes at
+    /// ask) contributes the sampled outcome to `fills` and the raw
+    /// probability to `p_sum`. The exit-gate from #330 acceptance
+    /// criteria reads off `wb_exit_fill_rate`.
+    pub would_be_maker_exit_attempts: u64,
+    pub would_be_maker_exit_fills: u64,
+    pub would_be_maker_exit_p_sum: f64,
     /// Number of ticks where the WS staleness watchdog flipped to
     /// `Stale` (#244 Group C / `risk::ws_health`). Counts the trip,
     /// not every tick the latch stays armed — the runner emits one
@@ -1214,6 +1226,16 @@ async fn report_status_tick<H: VenueHub + ?Sized>(
     } else {
         0.0
     };
+    let wb_exit_fill_rate = if summary.would_be_maker_exit_attempts > 0 {
+        summary.would_be_maker_exit_fills as f64 / summary.would_be_maker_exit_attempts as f64
+    } else {
+        0.0
+    };
+    let wb_exit_p_avg = if summary.would_be_maker_exit_attempts > 0 {
+        summary.would_be_maker_exit_p_sum / summary.would_be_maker_exit_attempts as f64
+    } else {
+        0.0
+    };
     log::info!(
         "[STATUS] ticks={} samples={} hold={} enter_l={} enter_s={} exit={} \
          ks_blocked={} stuck_blocked={} dd_blocked={} sd_blocked={} cb_blocked={} \
@@ -1222,7 +1244,8 @@ async fn report_status_tick<H: VenueHub + ?Sized>(
          ref_supp_ext={} ref_supp_lt={} read_mid_err_ext={} read_mid_err_lt={} \
          dev_bps={:?} cap_long={:?} cap_short={:?} \
          ext_inside={:?} lt_inside={:?} lt_bid_sz={:?} lt_ask_sz={:?} \
-         wb_attempts={} wb_fills={} wb_fill_rate={:.4} wb_p_avg={:.4}",
+         wb_attempts={} wb_fills={} wb_fill_rate={:.4} wb_p_avg={:.4} \
+         wb_exit_attempts={} wb_exit_fills={} wb_exit_fill_rate={:.4} wb_exit_p_avg={:.4}",
         summary.ticks,
         summary.samples_committed,
         summary.decisions_hold,
@@ -1256,6 +1279,10 @@ async fn report_status_tick<H: VenueHub + ?Sized>(
         summary.would_be_maker_fills,
         wb_fill_rate,
         wb_p_avg,
+        summary.would_be_maker_exit_attempts,
+        summary.would_be_maker_exit_fills,
+        wb_exit_fill_rate,
+        wb_exit_p_avg,
     );
     if let Some(r) = reporter {
         refresh_equity(hub, r, risk_manager).await;
@@ -1885,6 +1912,12 @@ async fn handle_decision_exit(
     let go_live = !cfg.dry_run && live_exec.is_some();
     if !go_live {
         // Paper-mode synthetic exit fills (existing behaviour).
+        // Capture the position direction *before* applying ExitSignal —
+        // the state machine keeps `position` populated through Exiting,
+        // but we want a deterministic source for the would-be-maker
+        // telemetry so the outcome is well-defined even if a future
+        // refactor clears it earlier.
+        let position_dir = machine.position().map(|p| p.direction);
         let qty = open_qty.take().unwrap_or(Decimal::ZERO);
         machine.apply(now_ts_ms, Event::ExitSignal { reason })?;
         if qty > Decimal::ZERO {
@@ -1907,6 +1940,43 @@ async fn handle_decision_exit(
             lt_snap.mid,
             cfg.dry_run,
         );
+
+        // bot-strategy#330: would-be exit-side maker telemetry. Each
+        // paper exit counts as a would-be attempt; the helper is run
+        // against the *opposite* book side because a Long position
+        // closes by buying back the Lighter leg (depth = bid_size,
+        // matching `would_be_maker_fill_outcome`'s Short branch) and
+        // a Short closes by selling back (depth = ask_size, Long
+        // branch). The seed mixes `now_ts_ms ^ 1` so a tick that
+        // re-uses the same wall clock for an entry+exit pair (rare,
+        // but possible in tight BT replay) draws independently.
+        if qty > Decimal::ZERO {
+            if let Some(dir) = position_dir {
+                summary.would_be_maker_exit_attempts += 1;
+                let exit_dir = match dir {
+                    SpreadDirection::Long => SpreadDirection::Short,
+                    SpreadDirection::Short => SpreadDirection::Long,
+                };
+                if let Some(out) =
+                    would_be_maker_fill_outcome(exit_dir, qty, lt_snap, now_ts_ms ^ 1)
+                {
+                    summary.would_be_maker_exit_p_sum += out.fill_p;
+                    if out.sampled_fill {
+                        summary.would_be_maker_exit_fills += 1;
+                    }
+                    log::info!(
+                        "[XVENUE] WOULD-BE MAKER EXIT pos_dir={:?} our_size_eth={:.6} \
+                         depth_eth={:.6} fill_p={:.4} sampled_fill={}",
+                        dir,
+                        out.our_size_eth,
+                        out.depth_eth,
+                        out.fill_p,
+                        out.sampled_fill,
+                    );
+                }
+            }
+        }
+
         let _ = ExitReason::MeanCross;
         return Ok(());
     }
@@ -2508,6 +2578,152 @@ mod tests {
             &snap,
             Some(2.0)
         ));
+    }
+
+    // bot-strategy#330 — paper-mode exit-side maker telemetry. Mirror
+    // of the entry-side `would_be_*` coverage above. Tests below drive
+    // `handle_decision_exit` directly with a hand-prepared Held machine
+    // to keep the surface tight (a full `run_one_tick` round-trip
+    // depends on spread engine warm-up + signal threshold and is
+    // covered separately in the loop-level tests further down).
+    fn build_held_machine_for_exit(dir: SpreadDirection, qty: Decimal) -> PositionMachine {
+        let mut m = PositionMachine::new();
+        m.apply(
+            0,
+            Event::EntrySignal {
+                direction: dir,
+                notional_usd: Decimal::from(100),
+            },
+        )
+        .unwrap();
+        m.apply(0, Event::ExtendedFilled { qty }).unwrap();
+        m.apply(0, Event::LighterFilled { qty }).unwrap();
+        m
+    }
+
+    #[tokio::test]
+    async fn paper_exit_records_attempt_and_uses_bid_depth_for_long_close() {
+        // Long position closes by buying back the Lighter leg, so the
+        // depth that matters is the *bid* size. We supply ask=ZERO,
+        // bid=large to force fill_p > 0; if the helper accidentally
+        // looked at ask_size instead, fill_p would be 0 and `attempts`
+        // would still tick but `p_sum` would stay at 0.0.
+        let qty = Decimal::new(5, 2); // 0.05 ETH
+        let mut machine = build_held_machine_for_exit(SpreadDirection::Long, qty);
+        let mut summary = LivePaperSummary::default();
+        let mut open_qty = Some(qty);
+        let mut live_entry_ctx: Option<LiveEntryCtx> = None;
+        let cfg = min_cfg();
+        let (_d, mut rm) = test_risk_manager();
+        let ext_snap = mid(0, 2000.0);
+        // bid=10 ETH (deep) vs our 0.05 → fill_p ≈ 0.995
+        let lt_snap = lt_snap_with_sizes(Decimal::from(10), Decimal::ZERO);
+
+        handle_decision_exit(
+            &cfg,
+            None,
+            &mut machine,
+            &mut summary,
+            &mut open_qty,
+            &mut live_entry_ctx,
+            None,
+            &mut rm,
+            &ext_snap,
+            &lt_snap,
+            ExitReason::MeanCross,
+            1_000,
+            Some(0.5),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.would_be_maker_exit_attempts, 1);
+        assert!(
+            summary.would_be_maker_exit_p_sum > 0.99,
+            "Long close should consume bid depth (p≈0.995), got p_sum={}",
+            summary.would_be_maker_exit_p_sum
+        );
+    }
+
+    #[tokio::test]
+    async fn paper_exit_records_attempt_and_uses_ask_depth_for_short_close() {
+        // Short position closes by selling back, so depth = ask. ask=ZERO
+        // would force fill_p=0; we set ask=large to confirm the helper
+        // looked at the ask side.
+        let qty = Decimal::new(5, 2);
+        let mut machine = build_held_machine_for_exit(SpreadDirection::Short, qty);
+        let mut summary = LivePaperSummary::default();
+        let mut open_qty = Some(qty);
+        let mut live_entry_ctx: Option<LiveEntryCtx> = None;
+        let cfg = min_cfg();
+        let (_d, mut rm) = test_risk_manager();
+        let ext_snap = mid(0, 2000.0);
+        let lt_snap = lt_snap_with_sizes(Decimal::ZERO, Decimal::from(10));
+
+        handle_decision_exit(
+            &cfg,
+            None,
+            &mut machine,
+            &mut summary,
+            &mut open_qty,
+            &mut live_entry_ctx,
+            None,
+            &mut rm,
+            &ext_snap,
+            &lt_snap,
+            ExitReason::MeanCross,
+            1_000,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.would_be_maker_exit_attempts, 1);
+        assert!(
+            summary.would_be_maker_exit_p_sum > 0.99,
+            "Short close should consume ask depth (p≈0.995), got p_sum={}",
+            summary.would_be_maker_exit_p_sum
+        );
+    }
+
+    #[tokio::test]
+    async fn paper_exit_zero_open_qty_records_no_attempt() {
+        // open_qty=None (or ZERO) is the degenerate case: ExitSignal
+        // still routes through the state machine for symmetry, but
+        // there's nothing to "fill" so we should not pollute the
+        // would-be telemetry with attempts that have no associated
+        // notional.
+        let qty = Decimal::new(5, 2);
+        let mut machine = build_held_machine_for_exit(SpreadDirection::Long, qty);
+        let mut summary = LivePaperSummary::default();
+        let mut open_qty: Option<Decimal> = None;
+        let mut live_entry_ctx: Option<LiveEntryCtx> = None;
+        let cfg = min_cfg();
+        let (_d, mut rm) = test_risk_manager();
+        let ext_snap = mid(0, 2000.0);
+        let lt_snap = lt_snap_with_sizes(Decimal::from(10), Decimal::from(10));
+
+        handle_decision_exit(
+            &cfg,
+            None,
+            &mut machine,
+            &mut summary,
+            &mut open_qty,
+            &mut live_entry_ctx,
+            None,
+            &mut rm,
+            &ext_snap,
+            &lt_snap,
+            ExitReason::MeanCross,
+            1_000,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.would_be_maker_exit_attempts, 0);
+        assert_eq!(summary.would_be_maker_exit_fills, 0);
+        assert_eq!(summary.would_be_maker_exit_p_sum, 0.0);
     }
 
     /// Test fixture: build a paused (manual) ReferenceGuard so unit
