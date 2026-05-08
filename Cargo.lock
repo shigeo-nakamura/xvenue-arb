@@ -1471,7 +1471,7 @@ dependencies = [
 
 [[package]]
 name = "dex-connector"
-version = "4.5.5"
+version = "4.5.6"
 dependencies = [
  "async-trait",
  "base64 0.21.7",
