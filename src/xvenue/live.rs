@@ -290,6 +290,12 @@ pub struct LivePaperSummary {
     /// `[STATUS]` so recurrence is visible without grepping logs.
     pub read_mid_err_ext: u64,
     pub read_mid_err_lt: u64,
+    /// Equity samples skipped because one venue returned a value but
+    /// the other did not (bot-strategy#360). Recording such a sample
+    /// halves the rolling-peak equity and trips a spurious session_dd
+    /// halt during single-venue maintenance. Boot-time "all venues
+    /// unavailable" stays silent and does not increment this counter.
+    pub equity_samples_skipped_partial: u64,
 }
 
 /// Snapshot of an open live position needed to compute realised PnL
@@ -483,7 +489,7 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
     // the first read may be Err while the WS is still warming, in
     // which case PnL stays at zero until the next tick.
     if let Some(r) = reporter.as_mut() {
-        refresh_equity(&*hub, r, &mut risk_manager).await;
+        refresh_equity(&*hub, r, &mut risk_manager, &mut summary).await;
         r.mark_dirty();
         publish_risk(&risk_manager, r);
         publish_kill_switch(&cfg, r);
@@ -567,7 +573,7 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                 report_status_tick(
                     &cfg,
                     &*hub,
-                    &summary,
+                    &mut summary,
                     &ws_health,
                     &machine,
                     &mut risk_manager,
@@ -599,32 +605,71 @@ fn kill_switch_active(path: &str) -> bool {
     !path.is_empty() && std::path::Path::new(path).exists()
 }
 
+/// Reads equity from both venues and decides whether the sum should
+/// be recorded as a sample.
+///
+/// **All-or-nothing semantics (bot-strategy#360)**: returns
+/// `Some(total)` only when *every* queried venue returned
+/// `Ok(Some(_))`. Returns `None` in two cases:
+/// - All venues failed/missing (typical at boot before WS warmup) —
+///   silent, no counter bump.
+/// - Some-but-not-all venues reported (e.g. one venue in maintenance)
+///   — bumps `equity_samples_skipped_partial` and emits a WARN.
+///   Recording a single-venue equity halves the rolling peak and
+///   trips a spurious session_dd halt, so we deliberately skip.
+async fn read_total_equity_for_sample<H: VenueHub + ?Sized>(
+    hub: &H,
+    summary: &mut LivePaperSummary,
+) -> Option<Decimal> {
+    let venues = [Venue::Extended, Venue::Lighter];
+    let mut total = Decimal::ZERO;
+    let mut ok_count: u8 = 0;
+    let total_count: u8 = venues.len() as u8;
+    let mut missing: Vec<Venue> = Vec::new();
+    for v in venues {
+        match hub.read_equity_usd(v).await {
+            Ok(Some(eq)) => {
+                total += eq;
+                ok_count += 1;
+            }
+            Ok(None) => missing.push(v),
+            Err(e) => {
+                log::warn!("[STATUS] read_equity_usd({:?}) failed: {:?}", v, e);
+                missing.push(v);
+            }
+        }
+    }
+    if ok_count == 0 {
+        return None;
+    }
+    if ok_count < total_count {
+        summary.equity_samples_skipped_partial += 1;
+        log::warn!(
+            "[STATUS] equity sample skipped: {}/{} venues reported, missing={:?} \
+             (would-record total={}; see bot-strategy#360)",
+            ok_count,
+            total_count,
+            missing,
+            total
+        );
+        return None;
+    }
+    Some(total)
+}
+
 /// Pulls equity from both venues and threads the sum into the reporter
 /// so the dashboard's `pnl_total` / `pnl_today` line tracks the live
 /// account. Also hands the equity sample to the risk manager so the
 /// session-DD rolling peak (#244 D-4) tracks the same number the
-/// dashboard renders. Best-effort: per-venue failures are logged and
-/// treated as zero so a hung venue doesn't stall the snapshot.
+/// dashboard renders. Skip policy lives in
+/// [`read_total_equity_for_sample`] (bot-strategy#360).
 async fn refresh_equity<H: VenueHub + ?Sized>(
     hub: &H,
     reporter: &mut StatusReporter,
     risk_manager: &mut RiskManager,
+    summary: &mut LivePaperSummary,
 ) {
-    let mut total = Decimal::ZERO;
-    let mut any_ok = false;
-    for v in [Venue::Extended, Venue::Lighter] {
-        match hub.read_equity_usd(v).await {
-            Ok(Some(eq)) => {
-                total += eq;
-                any_ok = true;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                log::warn!("[STATUS] read_equity_usd({:?}) failed: {:?}", v, e);
-            }
-        }
-    }
-    if any_ok {
+    if let Some(total) = read_total_equity_for_sample(hub, summary).await {
         let eq_f64 = equity_decimal_to_f64(total);
         reporter.update_equity(eq_f64);
         risk_manager.record_equity_sample(eq_f64, now_unix_secs());
@@ -1221,7 +1266,7 @@ async fn handle_emergency_flatten_tick(
 async fn report_status_tick<H: VenueHub + ?Sized>(
     cfg: &XvenueConfig,
     hub: &H,
-    summary: &LivePaperSummary,
+    summary: &mut LivePaperSummary,
     ws_health: &WsHealthMonitor,
     machine: &PositionMachine,
     risk_manager: &mut RiskManager,
@@ -1254,6 +1299,7 @@ async fn report_status_tick<H: VenueHub + ?Sized>(
          ws_blocked={} depth_blocked={} maint_blocked={} ws_emerg={} skew_emerg={} \
          ws_age_ext={:?} ws_age_lt={:?} \
          ref_supp_ext={} ref_supp_lt={} read_mid_err_ext={} read_mid_err_lt={} \
+         eq_skip_partial={} \
          dev_bps={:?} cap_long={:?} cap_short={:?} \
          ext_inside={:?} lt_inside={:?} lt_bid_sz={:?} lt_ask_sz={:?} \
          wb_attempts={} wb_fills={} wb_fill_rate={:.4} wb_p_avg={:.4} \
@@ -1280,6 +1326,7 @@ async fn report_status_tick<H: VenueHub + ?Sized>(
         summary.lt_book_suppressed_by_ref_guard,
         summary.read_mid_err_ext,
         summary.read_mid_err_lt,
+        summary.equity_samples_skipped_partial,
         summary.last_dev_bps,
         summary.last_cap_long_bps,
         summary.last_cap_short_bps,
@@ -1297,7 +1344,7 @@ async fn report_status_tick<H: VenueHub + ?Sized>(
         wb_exit_p_avg,
     );
     if let Some(r) = reporter {
-        refresh_equity(hub, r, risk_manager).await;
+        refresh_equity(hub, r, risk_manager, summary).await;
         publish_risk(risk_manager, r);
         publish_kill_switch(cfg, r);
         let now_ts_ms = wall_clock_ms();
@@ -3819,6 +3866,137 @@ emergency_complete_grace_ms: 0  # tests assert immediate-complete on zero (#287 
             "no orders flow when sizing is below min"
         );
         assert!(lt_vops.snapshot_takers().is_empty());
+    }
+
+    /// Helper hub that lets tests dictate per-venue equity outcomes
+    /// (Some / None / Err) so the bot-strategy#360 partial-skip path
+    /// can be exercised without standing up a StatusReporter.
+    struct EquityScriptHub {
+        ext: std::result::Result<Option<Decimal>, &'static str>,
+        lt: std::result::Result<Option<Decimal>, &'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl VenueHub for EquityScriptHub {
+        async fn read_mid(&self, _venue: Venue) -> Result<MidSnapshot> {
+            unreachable!("read_total_equity_for_sample never reads mid")
+        }
+        async fn read_equity_usd(&self, venue: Venue) -> Result<Option<Decimal>> {
+            let cell = match venue {
+                Venue::Extended => &self.ext,
+                Venue::Lighter => &self.lt,
+            };
+            match cell {
+                Ok(opt) => Ok(*opt),
+                Err(msg) => Err(anyhow::anyhow!(*msg)),
+            }
+        }
+    }
+
+    /// bot-strategy#360: when one venue is unreachable (here: Lighter
+    /// returns Err, mirroring a maintenance window where REST fails)
+    /// the partial sample must be skipped — recording only the
+    /// surviving venue would halve the rolling peak and trip a
+    /// spurious session_dd halt. Counter must bump for visibility.
+    #[tokio::test]
+    async fn refresh_equity_skips_partial_when_lighter_unavailable() {
+        let hub = EquityScriptHub {
+            ext: Ok(Some(dec!(497.20))),
+            lt: Err("lighter rest 503 (maintenance)"),
+        };
+        let mut summary = LivePaperSummary::default();
+        let result = read_total_equity_for_sample(&hub, &mut summary).await;
+        assert_eq!(
+            result, None,
+            "partial sample (Extended only) must not be recorded"
+        );
+        assert_eq!(
+            summary.equity_samples_skipped_partial, 1,
+            "partial-skip must increment its counter for visibility"
+        );
+    }
+
+    /// Symmetric: Extended unreachable, Lighter OK → still skipped.
+    #[tokio::test]
+    async fn refresh_equity_skips_partial_when_extended_unavailable() {
+        let hub = EquityScriptHub {
+            ext: Ok(None),
+            lt: Ok(Some(dec!(499.29))),
+        };
+        let mut summary = LivePaperSummary::default();
+        let result = read_total_equity_for_sample(&hub, &mut summary).await;
+        assert_eq!(result, None);
+        assert_eq!(summary.equity_samples_skipped_partial, 1);
+    }
+
+    /// Boot-time path: both venues unavailable while WS is warming up.
+    /// Stay silent — no counter bump, no log spam.
+    #[tokio::test]
+    async fn refresh_equity_silent_when_all_venues_unavailable() {
+        let hub = EquityScriptHub {
+            ext: Ok(None),
+            lt: Err("lighter ws not ready"),
+        };
+        let mut summary = LivePaperSummary::default();
+        let result = read_total_equity_for_sample(&hub, &mut summary).await;
+        assert_eq!(result, None);
+        assert_eq!(
+            summary.equity_samples_skipped_partial, 0,
+            "all-failed boot case must NOT increment partial counter"
+        );
+    }
+
+    /// Happy path: both venues report → record the sum.
+    #[tokio::test]
+    async fn refresh_equity_records_sum_when_all_venues_ok() {
+        let hub = EquityScriptHub {
+            ext: Ok(Some(dec!(497.20))),
+            lt: Ok(Some(dec!(499.29))),
+        };
+        let mut summary = LivePaperSummary::default();
+        let result = read_total_equity_for_sample(&hub, &mut summary).await;
+        assert_eq!(result, Some(dec!(996.49)));
+        assert_eq!(summary.equity_samples_skipped_partial, 0);
+    }
+
+    /// Reproduces the 2026-05-10 13:05 UTC incident at the risk-
+    /// manager level: the spurious session_dd halt was driven by a
+    /// $996 → $497 equity sample landing in the rolling peak. With
+    /// the #360 fix in place, the partial sample is suppressed so
+    /// `record_equity_sample` is never called and the halt does not
+    /// arm.
+    #[tokio::test]
+    async fn refresh_equity_prevents_spurious_session_dd_halt() {
+        let hub = EquityScriptHub {
+            ext: Ok(Some(dec!(497.20))),
+            lt: Err("lighter maintenance"),
+        };
+        let mut summary = LivePaperSummary::default();
+        let (_dir, mut rm) = test_risk_manager();
+        // Seed a healthy peak so any $497 sample would trip the
+        // 500 bps session DD threshold.
+        rm.record_equity_sample(996.49, 0);
+        let baseline_samples = rm
+            .session_snapshot()
+            .expect("snapshot Some after baseline seed")
+            .sample_count;
+
+        if let Some(total) = read_total_equity_for_sample(&hub, &mut summary).await {
+            rm.record_equity_sample(equity_decimal_to_f64(total), 60);
+        }
+
+        let snap = rm
+            .session_snapshot()
+            .expect("snapshot Some after seeding a baseline sample");
+        assert_eq!(
+            snap.sample_count, baseline_samples,
+            "partial sample must not be recorded into the rolling peak"
+        );
+        assert!(
+            !snap.session_halted,
+            "session_dd must NOT arm on a single-venue maintenance event"
+        );
+        assert_eq!(summary.equity_samples_skipped_partial, 1);
     }
 
     #[tokio::test(start_paused = true)]
