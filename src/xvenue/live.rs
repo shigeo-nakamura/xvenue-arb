@@ -209,6 +209,29 @@ pub struct LivePaperSummary {
     pub would_be_maker_exit_attempts: u64,
     pub would_be_maker_exit_fills: u64,
     pub would_be_maker_exit_p_sum: f64,
+    /// bot-strategy#330 follow-up: per-RT touch-to-touch projected PnL
+    /// for paper mode. The mid-to-mid `dev_bps` in `[XVENUE] PAPER ENTER`
+    /// / `PAPER EXIT` overstates capturable edge because it ignores
+    /// Extended's half-spread cross and Lighter's maker-rebate /
+    /// taker-cost asymmetry. These counters track the calibrated
+    /// projection (computed in `paper_pnl_projection` at exit time):
+    /// `paper_net_attempts` increments per completed RT with a captured
+    /// entry ctx, `paper_gross_bps_sum` is the cumulative touch-level
+    /// gross, `paper_net_bps_sum` is gross minus fees and minus/plus
+    /// Lighter half-spread depending on `sampled_fill` at entry/exit.
+    /// Surfaced in `[STATUS]` as `paper_n / paper_gross_bps_avg /
+    /// paper_net_bps_avg` so the LIVE re-probe gate can compare against
+    /// the Phase 0 BT M5 cell (≥+5 bps/RT net) using the same calibration
+    /// the live executor will see.
+    pub paper_net_attempts: u64,
+    pub paper_gross_bps_sum: f64,
+    pub paper_net_bps_sum: f64,
+    /// Captured at `Decision::Enter` (paper branch) and consumed at the
+    /// matching `Decision::Exit`. Internal bookkeeping for the projected
+    /// PnL line. Cleared when the position machine returns to Flat
+    /// outside of a normal exit (mirrors `live_entry_ctx` semantics in
+    /// the run loop).
+    pub paper_entry_ctx: Option<PaperEntryCtx>,
     /// Number of ticks where the WS staleness watchdog flipped to
     /// `Stale` (#244 Group C / `risk::ws_health`). Counts the trip,
     /// not every tick the latch stays armed — the runner emits one
@@ -319,6 +342,130 @@ pub struct LiveEntryCtx {
     pub lt_entry_mid: Decimal,
     pub ext_entry_qty: Decimal,
     pub lt_entry_qty: Decimal,
+}
+
+/// bot-strategy#330 follow-up: captured at the paper-mode entry to fund
+/// a calibrated projected-PnL line at the matching paper exit. The
+/// mid-to-mid `dev_bps` already in `[XVENUE] PAPER ENTER` is the signal
+/// value; this struct adds the touch-level prices + the sampled maker
+/// outcome so the exit-time projection mirrors what a live executor
+/// would actually capture (Ext crosses the half-spread as taker; Lt
+/// either earns or pays the half-spread depending on whether the
+/// post-only filled).
+#[derive(Debug, Clone)]
+pub struct PaperEntryCtx {
+    pub direction: SpreadDirection,
+    pub ext_entry_mid: Decimal,
+    pub ext_entry_bid: Decimal,
+    pub ext_entry_ask: Decimal,
+    pub lt_entry_mid: Decimal,
+    pub lt_entry_bid: Decimal,
+    pub lt_entry_ask: Decimal,
+    pub qty: Decimal,
+    /// `sampled_fill` from `would_be_maker_fill_outcome` at entry. None
+    /// when the helper returned None (book read unusable, scripted-hub
+    /// tests with default-zero sizes). We treat None as taker for the
+    /// projection (conservative).
+    pub maker_entry: Option<bool>,
+}
+
+/// bot-strategy#330 follow-up: per-RT projected PnL in basis points,
+/// computed at touch level instead of mid-to-mid. Mirrors what a live
+/// executor would capture given the current execution wiring (Ext
+/// taker IOC + Lt post-only with taker fallback).
+///
+/// Returns `(gross_bps, net_bps)`:
+/// * `gross_bps` — touch-to-touch capture before fees. Includes the
+///   Ext half-spread cross both ways and the Lt half-spread maker
+///   rebate / taker cost on each leg, determined by `maker_entry` /
+///   `maker_exit`. None outcomes default to taker.
+/// * `net_bps` — `gross_bps - 2*ext_fee_bps - 2*lt_fee_bps`. Per-fill
+///   convention matches `compute_realised_pnl` (#268 S5-1); RT total
+///   fee is twice the per-fill rate on each venue.
+///
+/// Sign convention: positive = profit. For `SpreadDirection::Long` we
+/// buy Ext at entry / sell at exit, and sell Lt at entry / buy at exit;
+/// Short is symmetric.
+pub fn paper_pnl_projection(
+    ctx: &PaperEntryCtx,
+    ext_exit: &MidSnapshot,
+    lt_exit: &MidSnapshot,
+    maker_exit: Option<bool>,
+    ext_fee_bps: f64,
+    lt_fee_bps: f64,
+) -> Option<(f64, f64)> {
+    let ext_entry_mid = ctx.ext_entry_mid.to_f64()?;
+    let ext_entry_bid = ctx.ext_entry_bid.to_f64()?;
+    let ext_entry_ask = ctx.ext_entry_ask.to_f64()?;
+    let lt_entry_bid = ctx.lt_entry_bid.to_f64()?;
+    let lt_entry_ask = ctx.lt_entry_ask.to_f64()?;
+    let ext_exit_bid = ext_exit.bid.to_f64()?;
+    let ext_exit_ask = ext_exit.ask.to_f64()?;
+    let lt_exit_bid = lt_exit.bid.to_f64()?;
+    let lt_exit_ask = lt_exit.ask.to_f64()?;
+    if !(ext_entry_mid > 0.0
+        && ext_entry_bid > 0.0
+        && ext_entry_ask > 0.0
+        && lt_entry_bid > 0.0
+        && lt_entry_ask > 0.0
+        && ext_exit_bid > 0.0
+        && ext_exit_ask > 0.0
+        && lt_exit_bid > 0.0
+        && lt_exit_ask > 0.0)
+    {
+        return None;
+    }
+    // Per-leg fill prices. Ext is always taker (config flips
+    // `extended_post_only: false`, see #302), so entry buys at ask /
+    // sells at bid. Lt fill price depends on maker outcome: a maker
+    // fill on the rest side captures the half-spread (sell at ask /
+    // buy at bid for a position close); a taker fallback crosses the
+    // touch (sell at bid / buy at ask).
+    let (ext_buy_px, ext_sell_px, lt_sell_px, lt_buy_px) = match ctx.direction {
+        SpreadDirection::Long => {
+            // Entry: buy Ext at ask, sell Lt at maker_entry ? ask : bid.
+            // Exit: sell Ext at bid (taker), buy Lt at maker_exit ? bid : ask.
+            let lt_sell = if maker_exit_or_entry(ctx.maker_entry) {
+                lt_entry_ask
+            } else {
+                lt_entry_bid
+            };
+            let lt_buy = if maker_exit_or_entry(maker_exit) {
+                lt_exit_bid
+            } else {
+                lt_exit_ask
+            };
+            (ext_entry_ask, ext_exit_bid, lt_sell, lt_buy)
+        }
+        SpreadDirection::Short => {
+            // Entry: sell Ext at bid, buy Lt at maker_entry ? bid : ask.
+            // Exit: buy Ext at ask, sell Lt at maker_exit ? ask : bid.
+            let lt_buy = if maker_exit_or_entry(ctx.maker_entry) {
+                lt_entry_bid
+            } else {
+                lt_entry_ask
+            };
+            let lt_sell = if maker_exit_or_entry(maker_exit) {
+                lt_exit_ask
+            } else {
+                lt_exit_bid
+            };
+            (ext_exit_ask, ext_entry_bid, lt_sell, lt_buy)
+        }
+    };
+    // Per-share PnL across both legs. For Long the Ext leg profits on
+    // (sell - buy) and the Lt leg on (sell - buy) of the short side;
+    // Short is symmetric. Normalising to the Ext entry mid keeps the
+    // bps figure stable across the small ext/lt mid difference.
+    let pnl_per_unit = (ext_sell_px - ext_buy_px) + (lt_sell_px - lt_buy_px);
+    let gross_bps = pnl_per_unit / ext_entry_mid * 10_000.0;
+    let net_bps = gross_bps - 2.0 * ext_fee_bps - 2.0 * lt_fee_bps;
+    Some((gross_bps, net_bps))
+}
+
+#[inline]
+fn maker_exit_or_entry(flag: Option<bool>) -> bool {
+    flag.unwrap_or(false)
 }
 
 /// Realised USD PnL for one live round-trip (#268 S5-1).
@@ -566,6 +713,11 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                 // Flat. Idempotent if ctx is already None.
                 if matches!(machine.phase(), super::state::Phase::Flat) {
                     live_entry_ctx = None;
+                    // bot-strategy#330 follow-up: mirror the live ctx
+                    // sweep on the paper-mode projection ctx so a
+                    // EmergencyComplete / Reset path doesn't carry
+                    // stale entry state into the next round-trip.
+                    summary.paper_entry_ctx = None;
                 }
             }
 
@@ -1293,6 +1445,16 @@ async fn report_status_tick<H: VenueHub + ?Sized>(
     } else {
         0.0
     };
+    let paper_gross_avg_bps = if summary.paper_net_attempts > 0 {
+        summary.paper_gross_bps_sum / summary.paper_net_attempts as f64
+    } else {
+        0.0
+    };
+    let paper_net_avg_bps = if summary.paper_net_attempts > 0 {
+        summary.paper_net_bps_sum / summary.paper_net_attempts as f64
+    } else {
+        0.0
+    };
     log::info!(
         "[STATUS] ticks={} samples={} hold={} enter_l={} enter_s={} exit={} \
          ks_blocked={} stuck_blocked={} dd_blocked={} sd_blocked={} cb_blocked={} \
@@ -1303,7 +1465,8 @@ async fn report_status_tick<H: VenueHub + ?Sized>(
          dev_bps={:?} cap_long={:?} cap_short={:?} \
          ext_inside={:?} lt_inside={:?} lt_bid_sz={:?} lt_ask_sz={:?} \
          wb_attempts={} wb_fills={} wb_fill_rate={:.4} wb_p_avg={:.4} \
-         wb_exit_attempts={} wb_exit_fills={} wb_exit_fill_rate={:.4} wb_exit_p_avg={:.4}",
+         wb_exit_attempts={} wb_exit_fills={} wb_exit_fill_rate={:.4} wb_exit_p_avg={:.4} \
+         paper_n={} paper_gross_bps_avg={:.2} paper_net_bps_avg={:.2}",
         summary.ticks,
         summary.samples_committed,
         summary.decisions_hold,
@@ -1342,6 +1505,9 @@ async fn report_status_tick<H: VenueHub + ?Sized>(
         summary.would_be_maker_exit_fills,
         wb_exit_fill_rate,
         wb_exit_p_avg,
+        summary.paper_net_attempts,
+        paper_gross_avg_bps,
+        paper_net_avg_bps,
     );
     if let Some(r) = reporter {
         refresh_equity(hub, r, risk_manager, summary).await;
@@ -1711,7 +1877,8 @@ async fn handle_decision_enter<H: VenueHub + ?Sized>(
         // The depth + our_size fields go into the log line so post-hoc
         // analysis can recompute the fill rate under a different model.
         summary.would_be_maker_attempts += 1;
-        if let Some(out) = would_be_maker_fill_outcome(dir, qty, lt_snap, now_ts_ms) {
+        let maker_entry_outcome = would_be_maker_fill_outcome(dir, qty, lt_snap, now_ts_ms);
+        if let Some(out) = maker_entry_outcome {
             summary.would_be_maker_p_sum += out.fill_p;
             if out.sampled_fill {
                 summary.would_be_maker_fills += 1;
@@ -1726,6 +1893,23 @@ async fn handle_decision_enter<H: VenueHub + ?Sized>(
                 out.sampled_fill,
             );
         }
+
+        // bot-strategy#330 follow-up: capture the touch-level entry
+        // state so the matching exit can emit a calibrated projected
+        // PnL line. The mid-to-mid `dev_bps` already in the PAPER ENTER
+        // log overstates capturable edge — see paper_pnl_projection
+        // doc-comment.
+        summary.paper_entry_ctx = Some(PaperEntryCtx {
+            direction: dir,
+            ext_entry_mid: ext_snap.mid,
+            ext_entry_bid: ext_snap.bid,
+            ext_entry_ask: ext_snap.ask,
+            lt_entry_mid: lt_snap.mid,
+            lt_entry_bid: lt_snap.bid,
+            lt_entry_ask: lt_snap.ask,
+            qty,
+            maker_entry: maker_entry_outcome.map(|o| o.sampled_fill),
+        });
 
         return Ok(());
     }
@@ -2010,6 +2194,7 @@ async fn handle_decision_exit(
         // branch). The seed mixes `now_ts_ms ^ 1` so a tick that
         // re-uses the same wall clock for an entry+exit pair (rare,
         // but possible in tight BT replay) draws independently.
+        let mut maker_exit_outcome: Option<WouldBeMakerOutcome> = None;
         if qty > Decimal::ZERO {
             if let Some(dir) = position_dir {
                 summary.would_be_maker_exit_attempts += 1;
@@ -2033,7 +2218,41 @@ async fn handle_decision_exit(
                         out.fill_p,
                         out.sampled_fill,
                     );
+                    maker_exit_outcome = Some(out);
                 }
+            }
+        }
+
+        // bot-strategy#330 follow-up: projected per-RT PnL at touch
+        // level, gated on having a matching entry ctx (taken so a stray
+        // exit without entry — e.g. operator Reset edge case — doesn't
+        // pollute the cumulative counters). Computed even when the
+        // would-be maker outcome above was None: paper_pnl_projection
+        // treats `maker_*: None` as taker (conservative) so the floor
+        // case still produces a sensible figure.
+        if let Some(ctx) = summary.paper_entry_ctx.take() {
+            if let Some((gross_bps, net_bps)) = paper_pnl_projection(
+                &ctx,
+                ext_snap,
+                lt_snap,
+                maker_exit_outcome.map(|o| o.sampled_fill),
+                cfg.extended_fee_bps,
+                cfg.lighter_fee_bps,
+            ) {
+                summary.paper_net_attempts += 1;
+                summary.paper_gross_bps_sum += gross_bps;
+                summary.paper_net_bps_sum += net_bps;
+                log::info!(
+                    "[XVENUE] PAPER NET dir={:?} maker_in={:?} maker_out={:?} \
+                     gross_bps={:.2} net_bps={:.2} ext_fee_bps={} lt_fee_bps={}",
+                    ctx.direction,
+                    ctx.maker_entry,
+                    maker_exit_outcome.map(|o| o.sampled_fill),
+                    gross_bps,
+                    net_bps,
+                    cfg.extended_fee_bps,
+                    cfg.lighter_fee_bps,
+                );
             }
         }
 
@@ -5261,6 +5480,220 @@ leg_mismatch_timeout_ms: 100
             machine.phase(),
             Phase::EmergencyFlattening,
             "S5-3 must not push paper mode into EmergencyFlattening"
+        );
+    }
+
+    // -- bot-strategy#330 follow-up: paper_pnl_projection tests --
+
+    fn paper_ctx(dir: SpreadDirection, maker_entry: Option<bool>) -> PaperEntryCtx {
+        // ETH-like prices. Ext is tight (0.5 tick inside = 5 bps),
+        // Lt is wider (1 tick inside = 10 bps) — mirrors the live
+        // venue asymmetry the redesign relies on.
+        PaperEntryCtx {
+            direction: dir,
+            ext_entry_mid: Decimal::from(2000),
+            ext_entry_bid: Decimal::new(19995, 1),
+            ext_entry_ask: Decimal::new(20005, 1),
+            lt_entry_mid: Decimal::from(2000),
+            lt_entry_bid: Decimal::from(1999),
+            lt_entry_ask: Decimal::from(2001),
+            qty: Decimal::new(1, 2),
+            maker_entry,
+        }
+    }
+
+    fn full_snap(mid_v: f64, bid_v: f64, ask_v: f64) -> MidSnapshot {
+        MidSnapshot {
+            ts_ms: 0,
+            mid: Decimal::from_f64_retain(mid_v).unwrap(),
+            book_ok: true,
+            bid: Decimal::from_f64_retain(bid_v).unwrap(),
+            ask: Decimal::from_f64_retain(ask_v).unwrap(),
+            bid_size: Decimal::from(10),
+            ask_size: Decimal::from(10),
+        }
+    }
+
+    #[test]
+    fn paper_pnl_long_both_maker_captures_lt_inside_minus_ext_cross() {
+        // Flat mids — no spread reversion alpha. Capture should equal
+        // (lt_inside - ext_inside) bps before fees.
+        // ext_inside = 1.0 / 2000 = 5 bps; lt_inside = 2.0 / 2000 = 10 bps
+        // → gross = 5 bps. Fees 2 × 5 = 10 → net = -5 bps.
+        let ctx = paper_ctx(SpreadDirection::Long, Some(true));
+        let ext_exit = full_snap(2000.0, 1999.5, 2000.5);
+        let lt_exit = full_snap(2000.0, 1999.0, 2001.0);
+        let (gross, net) = paper_pnl_projection(&ctx, &ext_exit, &lt_exit, Some(true), 5.0, 0.0)
+            .expect("projection succeeds with full prices");
+        assert!(
+            (gross - 5.0).abs() < 1e-6,
+            "gross should equal lt_inside - ext_inside = 5 bps, got {}",
+            gross
+        );
+        assert!(
+            (net - (-5.0)).abs() < 1e-6,
+            "net = gross - 2*ext_fee = 5 - 10 = -5, got {}",
+            net
+        );
+    }
+
+    #[test]
+    fn paper_pnl_long_all_taker_pays_both_insides() {
+        // Same flat mids; all-taker path loses both half-spreads.
+        // gross = -(ext_inside + lt_inside) = -15 bps.
+        let ctx = paper_ctx(SpreadDirection::Long, Some(false));
+        let ext_exit = full_snap(2000.0, 1999.5, 2000.5);
+        let lt_exit = full_snap(2000.0, 1999.0, 2001.0);
+        let (gross, net) =
+            paper_pnl_projection(&ctx, &ext_exit, &lt_exit, Some(false), 5.0, 0.0).unwrap();
+        assert!(
+            (gross - (-15.0)).abs() < 1e-6,
+            "gross all-taker = -(ext_inside + lt_inside) = -15, got {}",
+            gross
+        );
+        assert!((net - (-25.0)).abs() < 1e-6, "net = -15 - 10 = -25");
+    }
+
+    #[test]
+    fn paper_pnl_long_entry_only_maker_half_rebate() {
+        // Entry captures Lt inside half, exit pays Lt inside half.
+        // Net Lt effect = 0; only ext_inside cost remains.
+        // gross = -ext_inside = -5 bps.
+        let ctx = paper_ctx(SpreadDirection::Long, Some(true));
+        let ext_exit = full_snap(2000.0, 1999.5, 2000.5);
+        let lt_exit = full_snap(2000.0, 1999.0, 2001.0);
+        let (gross, _net) =
+            paper_pnl_projection(&ctx, &ext_exit, &lt_exit, Some(false), 5.0, 0.0).unwrap();
+        assert!(
+            (gross - (-5.0)).abs() < 1e-6,
+            "asymmetric maker_in=true / maker_out=false gross = -ext_inside = -5, got {}",
+            gross
+        );
+    }
+
+    #[test]
+    fn paper_pnl_short_mirrors_long() {
+        // Short direction with both makers and flat mids reproduces
+        // the Long both-maker number (5 bps) under symmetric prices.
+        let ctx = paper_ctx(SpreadDirection::Short, Some(true));
+        let ext_exit = full_snap(2000.0, 1999.5, 2000.5);
+        let lt_exit = full_snap(2000.0, 1999.0, 2001.0);
+        let (gross, _net) =
+            paper_pnl_projection(&ctx, &ext_exit, &lt_exit, Some(true), 5.0, 0.0).unwrap();
+        assert!(
+            (gross - 5.0).abs() < 1e-6,
+            "Short both-maker gross should mirror Long = 5 bps, got {}",
+            gross
+        );
+    }
+
+    #[test]
+    fn paper_pnl_long_with_spread_reversion_adds_alpha() {
+        // Entry dev_bps ≈ -10 (ext 2000 cheap vs lt 2002). Exit at
+        // converged mids. Long captures the 10-bps mid reversion on
+        // top of the structural maker rebate.
+        let ctx = PaperEntryCtx {
+            direction: SpreadDirection::Long,
+            ext_entry_mid: Decimal::from(2000),
+            ext_entry_bid: Decimal::new(19995, 1),
+            ext_entry_ask: Decimal::new(20005, 1),
+            lt_entry_mid: Decimal::from(2002),
+            lt_entry_bid: Decimal::from(2001),
+            lt_entry_ask: Decimal::from(2003),
+            qty: Decimal::new(1, 2),
+            maker_entry: Some(true),
+        };
+        // Exit at converged mid = 2001
+        let ext_exit = full_snap(2001.0, 2000.5, 2001.5);
+        let lt_exit = full_snap(2001.0, 2000.0, 2002.0);
+        let (gross, _net) =
+            paper_pnl_projection(&ctx, &ext_exit, &lt_exit, Some(true), 5.0, 0.0).unwrap();
+        // Ext leg: buy 2000.5, sell 2000.5 → 0
+        // Lt leg: sell at maker entry ask = 2003, buy at maker exit bid = 2000 → +3
+        // gross = 3 / 2000 * 10000 = 15 bps
+        assert!(
+            (gross - 15.0).abs() < 1e-6,
+            "Long with 10 bps mid reversion + both makers should net 15 bps gross, got {}",
+            gross
+        );
+    }
+
+    #[test]
+    fn paper_pnl_none_outcome_treated_as_taker() {
+        // maker_entry / maker_exit = None defaults to taker. Should
+        // match the all-taker number on flat mids.
+        let ctx = paper_ctx(SpreadDirection::Long, None);
+        let ext_exit = full_snap(2000.0, 1999.5, 2000.5);
+        let lt_exit = full_snap(2000.0, 1999.0, 2001.0);
+        let (gross, _net) =
+            paper_pnl_projection(&ctx, &ext_exit, &lt_exit, None, 5.0, 0.0).unwrap();
+        assert!(
+            (gross - (-15.0)).abs() < 1e-6,
+            "None outcome should match all-taker = -15 bps, got {}",
+            gross
+        );
+    }
+
+    #[test]
+    fn paper_pnl_returns_none_on_missing_touch() {
+        // Default MidSnapshot has bid=0/ask=0 (scripted-hub tests).
+        // Projection bails out so we don't silently log garbage bps.
+        let ctx = paper_ctx(SpreadDirection::Long, Some(true));
+        let blank = mid(0, 2000.0); // bid=0, ask=0 via Default
+        let out = paper_pnl_projection(&ctx, &blank, &blank, Some(true), 5.0, 0.0);
+        assert!(out.is_none(), "missing bid/ask must return None");
+    }
+
+    #[tokio::test]
+    async fn paper_exit_with_pre_populated_ctx_consumes_and_records() {
+        // Drive the exit branch directly: pre-populate the entry ctx
+        // (as handle_decision_enter would) and verify that
+        // handle_decision_exit consumes it + bumps the projection
+        // counters. Sidesteps the hub plumbing of handle_decision_enter.
+        let qty = Decimal::new(5, 2); // 0.05 ETH
+        let mut machine = build_held_machine_for_exit(SpreadDirection::Long, qty);
+        let mut summary = LivePaperSummary::default();
+        summary.paper_entry_ctx = Some(paper_ctx(SpreadDirection::Long, Some(true)));
+        let mut open_qty = Some(qty);
+        let mut live_entry_ctx: Option<LiveEntryCtx> = None;
+        let cfg = min_cfg();
+        let (_d, mut rm) = test_risk_manager();
+        let ext_exit = full_snap(2000.0, 1999.5, 2000.5);
+        let lt_exit = MidSnapshot {
+            ts_ms: 0,
+            mid: Decimal::from(2000),
+            book_ok: true,
+            bid: Decimal::from(1999),
+            ask: Decimal::from(2001),
+            bid_size: Decimal::from(10),
+            ask_size: Decimal::from(10),
+        };
+
+        handle_decision_exit(
+            &cfg,
+            None,
+            &mut machine,
+            &mut summary,
+            &mut open_qty,
+            &mut live_entry_ctx,
+            None,
+            &mut rm,
+            &ext_exit,
+            &lt_exit,
+            ExitReason::MeanCross,
+            1_500,
+            Some(0.5),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            summary.paper_entry_ctx.is_none(),
+            "paper exit should consume entry ctx"
+        );
+        assert_eq!(
+            summary.paper_net_attempts, 1,
+            "one completed RT should bump the projection counter"
         );
     }
 }
