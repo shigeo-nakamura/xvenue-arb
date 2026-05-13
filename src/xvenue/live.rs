@@ -312,6 +312,16 @@ pub struct LivePaperSummary {
     /// halt during single-venue maintenance. Boot-time "all venues
     /// unavailable" stays silent and does not increment this counter.
     pub equity_samples_skipped_partial: u64,
+    /// Flipped true the first time `read_total_equity_for_sample`
+    /// observes a positive equity from both venues. Pre-init this
+    /// gates `update_equity(0)` so `equity_day_start` does not lock
+    /// to 0 during the dex-connector's WS-cache warm-up window,
+    /// inflating `pnl_today` by the full equity once the real
+    /// balance lands. See bot-strategy#382 (the pairtrade companion
+    /// fix at pairtrade@1063983). Post-init zero readings ARE
+    /// accepted — a genuinely rekt bot must still surface on
+    /// dashboards.
+    pub equity_initialized: bool,
 }
 
 /// Snapshot of an open live position needed to compute realised PnL
@@ -799,6 +809,27 @@ async fn read_total_equity_for_sample<H: VenueHub + ?Sized>(
         );
         return None;
     }
+    // bot-strategy#382: drop zero-valued readings during the pre-init
+    // warm-up. dex-connector's WS-derived balance cache can return
+    // Ok(equity=0) before the first account dump lands, and when both
+    // venues fall into that state simultaneously the sum is Some(0).
+    // Propagating that to `reporter.update_equity(0)` (refresh_equity
+    // below) locks `equity_day_start = 0` for the rest of the UTC day,
+    // inflating `pnl_today` by the full equity once the real balance
+    // arrives. Same root cause as the pairtrade fix at
+    // pairtrade@1063983; same shape of gate.
+    //
+    // Post-init zero IS accepted — a genuinely rekt bot must still
+    // surface on dashboards rather than silently pin to its last
+    // positive equity.
+    if total <= Decimal::ZERO && !summary.equity_initialized {
+        log::info!(
+            "[STATUS] equity sample skipped: both venues reported 0 during \
+             warm-up (pre-init gate, see bot-strategy#382)"
+        );
+        return None;
+    }
+    summary.equity_initialized = true;
     Some(total)
 }
 
@@ -3491,6 +3522,70 @@ emergency_complete_grace_ms: 0  # tests assert immediate-complete on zero (#287 
         let result = read_total_equity_for_sample(&hub, &mut summary).await;
         assert_eq!(result, Some(dec!(996.49)));
         assert_eq!(summary.equity_samples_skipped_partial, 0);
+        assert!(
+            summary.equity_initialized,
+            "first positive equity sum must arm the init flag"
+        );
+    }
+
+    /// bot-strategy#382 (pairtrade companion): dex-connector's WS-derived
+    /// balance cache can return Ok(equity=0) before the first account
+    /// dump lands. When both venues fall into that state simultaneously
+    /// `read_total_equity_for_sample` would sum them to `Some(0)` and
+    /// propagate to `reporter.update_equity(0)`, locking
+    /// `equity_day_start` to 0 for the rest of the UTC day and
+    /// inflating `pnl_today` by the full real equity once it arrives.
+    /// The pre-init gate skips this case; post-init zero (legitimate
+    /// rekt signal) is accepted unchanged.
+    #[tokio::test]
+    async fn refresh_equity_drops_zero_sum_before_init() {
+        let mut summary = LivePaperSummary::default();
+        assert!(
+            !summary.equity_initialized,
+            "default must be uninitialized"
+        );
+
+        // Phase 1: both venues' WS caches empty — Ok(Some(0)) from each.
+        let hub_zero = EquityScriptHub {
+            ext: Ok(Some(Decimal::ZERO)),
+            lt: Ok(Some(Decimal::ZERO)),
+        };
+        let result = read_total_equity_for_sample(&hub_zero, &mut summary).await;
+        assert_eq!(
+            result, None,
+            "pre-init: zero sum must not propagate to update_equity"
+        );
+        assert!(
+            !summary.equity_initialized,
+            "zero sum must not arm the init flag"
+        );
+        assert_eq!(
+            summary.equity_samples_skipped_partial, 0,
+            "zero-sum skip is a different category — must not bump partial counter"
+        );
+
+        // Phase 2: WS dumps land — both venues report positive.
+        let hub_real = EquityScriptHub {
+            ext: Ok(Some(dec!(497.20))),
+            lt: Ok(Some(dec!(499.29))),
+        };
+        let result = read_total_equity_for_sample(&hub_real, &mut summary).await;
+        assert_eq!(result, Some(dec!(996.49)));
+        assert!(summary.equity_initialized, "first positive must arm");
+
+        // Phase 3: post-init, a 0 reading IS accepted — a rekt bot's
+        // dashboard must reflect the loss rather than silently pin to
+        // the last positive value.
+        let hub_rekt = EquityScriptHub {
+            ext: Ok(Some(Decimal::ZERO)),
+            lt: Ok(Some(Decimal::ZERO)),
+        };
+        let result = read_total_equity_for_sample(&hub_rekt, &mut summary).await;
+        assert_eq!(
+            result,
+            Some(Decimal::ZERO),
+            "post-init zero must surface to dashboards"
+        );
     }
 
     /// Reproduces the 2026-05-10 13:05 UTC incident at the risk-
