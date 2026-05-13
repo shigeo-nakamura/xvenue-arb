@@ -619,7 +619,12 @@ mod tests {
             Level::Warn,
             "public trades stream error: Connection reset without closing handshake",
         );
-        fake_log(&c, t0 + 2, Level::Warn, "[XVENUE] tick error: read_mid Lighter");
+        fake_log(
+            &c,
+            t0 + 2,
+            Level::Warn,
+            "[XVENUE] tick error: read_mid Lighter",
+        );
         assert_eq!(ws_reset_count(&c, t0 + 5), 2);
     }
 
@@ -628,8 +633,18 @@ mod tests {
         let _g = _serialize();
         let c = make_counters();
         let t0 = 13_000_000;
-        fake_log(&c, t0, Level::Warn, "Connection reset without closing handshake (1)");
-        fake_log(&c, t0 + 100, Level::Warn, "Connection reset without closing handshake (2)");
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "Connection reset without closing handshake (1)",
+        );
+        fake_log(
+            &c,
+            t0 + 100,
+            Level::Warn,
+            "Connection reset without closing handshake (2)",
+        );
         let now = t0 + WS_RESET_24H_WINDOW_SECS - 10;
         assert_eq!(ws_reset_count(&c, now), 2);
         let now = t0 + 100 + WS_RESET_24H_WINDOW_SECS + 10;
@@ -642,7 +657,12 @@ mod tests {
         let c = make_counters();
         set_counting_suppressed(true);
         let t0 = 14_000_000;
-        fake_log(&c, t0, Level::Warn, "Connection reset without closing handshake");
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "Connection reset without closing handshake",
+        );
         let (e, w) = snap_counts(&c, t0 + 5);
         assert_eq!((e, w), (0, 0));
         assert_eq!(ws_reset_count(&c, t0 + 5), 1);
@@ -654,9 +674,19 @@ mod tests {
         let _g = _serialize();
         let c = make_counters();
         let t0 = 15_000_000;
-        fake_log(&c, t0, Level::Warn, "Connection reset by peer (os error 104)");
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "Connection reset by peer (os error 104)",
+        );
         fake_log(&c, t0 + 1, Level::Warn, "WebSocket reset");
-        fake_log(&c, t0 + 2, Level::Warn, "Connection reset without graceful close");
+        fake_log(
+            &c,
+            t0 + 2,
+            Level::Warn,
+            "Connection reset without graceful close",
+        );
         assert_eq!(ws_reset_count(&c, t0 + 5), 0);
     }
 }
