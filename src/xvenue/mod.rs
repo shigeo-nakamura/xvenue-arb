@@ -14,6 +14,7 @@ pub mod live;
 pub mod live_exec;
 mod live_pnl;
 mod live_status;
+mod live_tick;
 pub(crate) mod s3_mirror;
 pub mod signal;
 pub mod sizing;
