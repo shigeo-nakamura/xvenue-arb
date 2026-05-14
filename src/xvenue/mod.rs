@@ -12,6 +12,7 @@ mod exit_dispatch;
 pub mod live;
 pub mod live_exec;
 mod live_pnl;
+mod live_status;
 pub(crate) mod s3_mirror;
 pub mod signal;
 pub mod sizing;
