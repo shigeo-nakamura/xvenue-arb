@@ -36,16 +36,14 @@
 //!   fill latency is ~50 ms with no observed history of late-fill
 //!   races, so the simpler chase loop applies.
 
-use std::time::Duration;
-
-use anyhow::Result;
 use async_trait::async_trait;
 use dex_connector::OrderSide;
 use rust_decimal::Decimal;
 
-use super::poll_loop::{poll_until_terminal_or_deadline, Executor, PollOutcome};
+use super::maker_loop::{run_maker_loop, MakerLoopParams, MakerRequest};
+use super::poll_loop::Executor;
 use super::types::{ExecutionFailure, LighterMakerConfig, LighterTerminal};
-use super::venue_ops::{PlacedOrder, VenueOps};
+use super::venue_ops::VenueOps;
 
 /// Inputs to one Lighter post-only entry / exit cycle.
 #[derive(Debug, Clone)]
@@ -98,318 +96,51 @@ impl<'a, V: VenueOps + ?Sized> LighterMakerLoop<'a, V> {
     /// Run one entry / exit cycle. The returned terminal is what the
     /// runner translates into `Event::LighterFilled` /
     /// `Event::LighterFailed`.
+    ///
+    /// Behaviour is unchanged from the pre-#388 inline form: the
+    /// shared `super::maker_loop::run_maker_loop` drives the chase
+    /// and taker fallback with Lighter-specific knobs.
+    /// `chase_uses_venue_min_floor = true` (per #331),
+    /// `taker_grace_before_cancel = false` (Lighter cancels before
+    /// re-polling), and `chase_grace_poll_ms` is wired from cfg for
+    /// the #322 fix.
     pub async fn run(&self, req: LighterMakerRequest) -> LighterTerminal {
         if req.target_qty <= Decimal::ZERO {
             return LighterTerminal::Failed {
                 reason: ExecutionFailure::VenueRejected,
             };
         }
-
-        let mut total_filled = Decimal::ZERO;
-        let mut last_failure: Option<ExecutionFailure> = None;
-
-        // bot-strategy#331 (Lighter mirror of #299): floor the
-        // "remaining ≤ X" gate at the Lighter venue minimum so a
-        // sub-min residual (typically left over after a partial fill
-        // on the previous chase round) is treated as fully filled
-        // instead of producing a `place_post_only` call Lighter
-        // rejects with `code:21706 invalid order base or quote
-        // amount`. The same floor gates the taker fallback below so
-        // the residual doesn't just trade the post_only WARN for an
-        // equivalent taker WARN. `venue_min_qty=0` (default / tests)
-        // preserves the previous dust-only behavior.
-        let min_floor = req.dust_qty.max(req.venue_min_qty);
-
-        // Maker chase loop. `cfg.post_only = false` short-circuits
-        // straight to taker — operator escape valve mirroring Extended.
-        if self.cfg.post_only {
-            for round in 0..self.cfg.chase_retries.max(1) {
-                let remaining = req.target_qty - total_filled;
-                if remaining <= min_floor {
-                    break;
-                }
-
-                match self.run_one_chase_round(&req, remaining, round).await {
-                    Ok(round_filled) => {
-                        total_filled += round_filled.filled_this_round;
-                        if round_filled.terminal_cancelled
-                            && round_filled.filled_this_round.is_zero()
-                        {
-                            // Venue cancelled with zero fill — likely
-                            // the post-only price moved through. Re-
-                            // quote at the new book on the next round.
-                            last_failure = Some(ExecutionFailure::Cancelled);
-                            continue;
-                        }
-                        if total_filled >= req.target_qty - min_floor {
-                            return LighterTerminal::Filled { qty: total_filled };
-                        }
-                    }
-                    Err(failure) => {
-                        last_failure = Some(failure);
-                        // Hard place / read failure — break out of the
-                        // chase and decide whether taker fallback
-                        // applies. Don't keep retrying place_* against
-                        // a venue that just signalled an error.
-                        break;
-                    }
-                }
+        let params = MakerLoopParams {
+            log_prefix: "XVENUE/lightmaker",
+            chase_retries: self.cfg.chase_retries,
+            chase_timeout_ms: self.cfg.chase_timeout_ms,
+            chase_grace_poll_ms: self.cfg.chase_grace_poll_ms,
+            taker_grace_poll_ms: self.cfg.taker_grace_poll_ms,
+            taker_fallback: self.cfg.taker_fallback,
+            post_only: self.cfg.post_only,
+            poll_interval_ms: self.poll_interval_ms,
+            chase_uses_venue_min_floor: true,
+            taker_grace_before_cancel: false,
+        };
+        let shared_req = MakerRequest {
+            symbol: req.symbol,
+            side: req.side,
+            target_qty: req.target_qty,
+            dust_qty: req.dust_qty,
+            venue_min_qty: req.venue_min_qty,
+            reduce_only: req.reduce_only,
+        };
+        let outcome = run_maker_loop(self.ops, &params, &shared_req).await;
+        if outcome.total_filled > Decimal::ZERO {
+            LighterTerminal::Filled {
+                qty: outcome.total_filled,
             }
-        }
-
-        let residual = req.target_qty - total_filled;
-        if residual > min_floor && self.cfg.taker_fallback {
-            match self.run_taker_round(&req, residual).await {
-                Ok(taker_filled) => {
-                    total_filled += taker_filled;
-                }
-                Err(failure) => {
-                    if total_filled.is_zero() {
-                        return LighterTerminal::Failed { reason: failure };
-                    }
-                    // Got a partial maker fill — surface so the state
-                    // machine can route via skew monitor instead of
-                    // dead-ending in Failed.
-                    return LighterTerminal::Filled { qty: total_filled };
-                }
-            }
-        }
-
-        if total_filled > Decimal::ZERO {
-            LighterTerminal::Filled { qty: total_filled }
         } else {
             LighterTerminal::Failed {
-                reason: last_failure.unwrap_or(ExecutionFailure::PostOnlyExhausted),
+                reason: outcome
+                    .last_failure
+                    .unwrap_or(ExecutionFailure::PostOnlyExhausted),
             }
-        }
-    }
-
-    async fn run_one_chase_round(
-        &self,
-        req: &LighterMakerRequest,
-        remaining: Decimal,
-        round: u32,
-    ) -> Result<PollOutcome, ExecutionFailure> {
-        let book = match self.ops.read_top_of_book(&req.symbol).await {
-            Ok(b) => b,
-            Err(e) => {
-                log::warn!(
-                    "[XVENUE/lightmaker] read_top_of_book round={} err={:?}",
-                    round,
-                    e
-                );
-                return Err(ExecutionFailure::VenueRejected);
-            }
-        };
-        let price = price_for_post_only(req.side, &book);
-        if price <= Decimal::ZERO {
-            return Err(ExecutionFailure::VenueRejected);
-        }
-
-        let placed: PlacedOrder = match self
-            .ops
-            .place_post_only(&req.symbol, req.side, remaining, price, req.reduce_only)
-            .await
-        {
-            Ok(o) => o,
-            Err(e) => {
-                log::warn!(
-                    "[XVENUE/lightmaker] place_post_only round={} err={:?}",
-                    round,
-                    e
-                );
-                return Err(ExecutionFailure::VenueRejected);
-            }
-        };
-        log::info!(
-            "[XVENUE/lightmaker] post_only placed round={} side={:?} qty={} price={} order_id={}",
-            round,
-            req.side,
-            remaining,
-            price,
-            placed.order_id
-        );
-
-        let mut outcome = poll_until_terminal_or_deadline(
-            self.ops,
-            &req.symbol,
-            &placed.order_id,
-            self.cfg.chase_timeout_ms,
-            self.poll_interval_ms,
-            "XVENUE/lightmaker",
-        )
-        .await;
-        log::info!(
-            "[XVENUE/lightmaker] post_only round={} done filled={} cancelled={} order_id={}",
-            round,
-            outcome.filled_this_round,
-            outcome.terminal_cancelled,
-            placed.order_id
-        );
-
-        // Cancel residual regardless of outcome — idempotent on the
-        // mock, harmless on a venue that has already terminated.
-        let _ = self.ops.cancel(&req.symbol, &placed.order_id).await;
-
-        // bot-strategy#322: WS-lag grace re-poll. Lighter's WS fill
-        // propagation is 0-500 ms; with the original 200 ms
-        // `chase_timeout_ms`, fills landed at the venue but the chase
-        // round timed out reporting `filled=0 cancelled=false`, then
-        // the next round placed a fresh order on top — stacking
-        // exposure that emergency-flatten then had to unwind. The
-        // grace re-poll (after cancel, so a still-resting order has
-        // its fate decided) catches the late fill and threads it
-        // through to `total_filled` so the loop sees one cycle, one
-        // fill. Mirrors the Extended-side #298 pattern but applies
-        // here to chase rounds (not just taker) because Lighter chase
-        // rounds were observed to fill late.
-        if outcome.filled_this_round.is_zero()
-            && !outcome.terminal_cancelled
-            && self.cfg.chase_grace_poll_ms > 0
-        {
-            tokio::time::sleep(Duration::from_millis(self.cfg.chase_grace_poll_ms)).await;
-            match self
-                .ops
-                .poll_fill_status(&req.symbol, &placed.order_id)
-                .await
-            {
-                Ok(s) => {
-                    if s.filled_qty > Decimal::ZERO {
-                        log::info!(
-                            "[XVENUE/lightmaker] post_only round={} grace-recovered \
-                             filled={} terminal={} cancelled={} order_id={}",
-                            round,
-                            s.filled_qty,
-                            s.terminal,
-                            s.cancelled,
-                            placed.order_id
-                        );
-                        outcome = PollOutcome {
-                            filled_this_round: s.filled_qty,
-                            terminal_cancelled: s.cancelled,
-                        };
-                    } else {
-                        log::debug!(
-                            "[XVENUE/lightmaker] post_only round={} grace-poll no-late-fill \
-                             terminal={} cancelled={} order_id={}",
-                            round,
-                            s.terminal,
-                            s.cancelled,
-                            placed.order_id
-                        );
-                    }
-                }
-                Err(e) => {
-                    log::warn!(
-                        "[XVENUE/lightmaker] post_only round={} grace-poll err={:?} order_id={}",
-                        round,
-                        e,
-                        placed.order_id
-                    );
-                }
-            }
-        }
-
-        Ok(outcome)
-    }
-
-    async fn run_taker_round(
-        &self,
-        req: &LighterMakerRequest,
-        residual: Decimal,
-    ) -> Result<Decimal, ExecutionFailure> {
-        let placed = match self
-            .ops
-            .place_taker(&req.symbol, req.side, residual, req.reduce_only)
-            .await
-        {
-            Ok(o) => o,
-            Err(e) => {
-                log::warn!("[XVENUE/lightmaker] place_taker err={:?}", e);
-                return Err(ExecutionFailure::TakerRejected);
-            }
-        };
-        log::info!(
-            "[XVENUE/lightmaker] taker placed side={:?} qty={} reduce_only={} order_id={}",
-            req.side,
-            residual,
-            req.reduce_only,
-            placed.order_id
-        );
-        let mut outcome = poll_until_terminal_or_deadline(
-            self.ops,
-            &req.symbol,
-            &placed.order_id,
-            self.cfg.chase_timeout_ms,
-            self.poll_interval_ms,
-            "XVENUE/lightmaker",
-        )
-        .await;
-        log::info!(
-            "[XVENUE/lightmaker] taker done filled={} cancelled={} order_id={}",
-            outcome.filled_this_round,
-            outcome.terminal_cancelled,
-            placed.order_id
-        );
-
-        let _ = self.ops.cancel(&req.symbol, &placed.order_id).await;
-
-        // bot-strategy#322: same WS-lag grace re-poll as the chase
-        // round (and identical in shape to Extended's #298 fix). A
-        // Lighter taker IOC that filled at the venue can take >200 ms
-        // to surface in the connector cache; without this, every
-        // entry whose chase exhausts ends in spurious Timeout +
-        // emergency flatten.
-        if outcome.filled_this_round.is_zero()
-            && !outcome.terminal_cancelled
-            && self.cfg.taker_grace_poll_ms > 0
-        {
-            tokio::time::sleep(Duration::from_millis(self.cfg.taker_grace_poll_ms)).await;
-            match self
-                .ops
-                .poll_fill_status(&req.symbol, &placed.order_id)
-                .await
-            {
-                Ok(s) => {
-                    if s.filled_qty > Decimal::ZERO {
-                        log::info!(
-                            "[XVENUE/lightmaker] taker grace-recovered \
-                             filled={} terminal={} cancelled={} order_id={}",
-                            s.filled_qty,
-                            s.terminal,
-                            s.cancelled,
-                            placed.order_id
-                        );
-                        outcome = PollOutcome {
-                            filled_this_round: s.filled_qty,
-                            terminal_cancelled: s.cancelled,
-                        };
-                    } else {
-                        log::warn!(
-                            "[XVENUE/lightmaker] taker grace-poll no-late-fill \
-                             terminal={} cancelled={} order_id={}",
-                            s.terminal,
-                            s.cancelled,
-                            placed.order_id
-                        );
-                    }
-                }
-                Err(e) => {
-                    log::warn!(
-                        "[XVENUE/lightmaker] taker grace-poll err={:?} order_id={}",
-                        e,
-                        placed.order_id
-                    );
-                }
-            }
-        }
-
-        if outcome.filled_this_round > Decimal::ZERO {
-            Ok(outcome.filled_this_round)
-        } else if outcome.terminal_cancelled {
-            Err(ExecutionFailure::TakerRejected)
-        } else {
-            Err(ExecutionFailure::Timeout)
         }
     }
 }
@@ -421,15 +152,6 @@ impl<'a, V: VenueOps + ?Sized + Sync> Executor for LighterMakerLoop<'a, V> {
 
     async fn run(&self, req: Self::Request) -> Self::Terminal {
         LighterMakerLoop::run(self, req).await
-    }
-}
-
-fn price_for_post_only(side: OrderSide, book: &super::venue_ops::TopOfBook) -> Decimal {
-    match side {
-        // Buy post-only at the best bid (rest passively).
-        OrderSide::Long => book.best_bid,
-        // Sell post-only at the best ask.
-        OrderSide::Short => book.best_ask,
     }
 }
 

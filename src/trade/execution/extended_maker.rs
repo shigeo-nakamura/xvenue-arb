@@ -25,16 +25,14 @@
 //!   `docs/execution_layer.md` §5).
 //! - Lighter execution. That's `lighter_fill.rs`.
 
-use std::time::Duration;
-
-use anyhow::Result;
 use async_trait::async_trait;
 use dex_connector::OrderSide;
 use rust_decimal::Decimal;
 
-use super::poll_loop::{poll_until_terminal_or_deadline, Executor, PollOutcome};
+use super::maker_loop::{run_maker_loop, MakerLoopParams, MakerRequest};
+use super::poll_loop::Executor;
 use super::types::{ExecutionFailure, ExtendedMakerConfig, ExtendedTerminal};
-use super::venue_ops::{PlacedOrder, VenueOps};
+use super::venue_ops::VenueOps;
 
 /// Inputs to one execution cycle.
 #[derive(Debug, Clone)]
@@ -92,264 +90,51 @@ impl<'a, V: VenueOps + ?Sized> ExtendedMakerLoop<'a, V> {
     /// Run one entry cycle. The returned terminal is what the
     /// runner translates into `Event::ExtendedFilled` /
     /// `Event::ExtendedFailed`.
+    ///
+    /// Behaviour is unchanged from the pre-#388 inline form: the
+    /// shared `super::maker_loop::run_maker_loop` drives the chase
+    /// and taker fallback with Extended-specific knobs.
+    /// `chase_uses_venue_min_floor = false`,
+    /// `taker_grace_before_cancel = true` (per the #298 venue-race
+    /// rationale), and `chase_grace_poll_ms = 0` (Extended has no
+    /// chase-side grace).
     pub async fn run_entry(&self, req: ExtendedEntryRequest) -> ExtendedTerminal {
         if req.target_qty <= Decimal::ZERO {
             return ExtendedTerminal::Failed {
                 reason: ExecutionFailure::VenueRejected,
             };
         }
-
-        let mut total_filled = Decimal::ZERO;
-        let mut last_failure: Option<ExecutionFailure> = None;
-
-        // Maker chase loop. `cfg.post_only = false` short-circuits
-        // straight to taker (operator escape valve for venue-degraded
-        // scenarios where every post-only is rejected).
-        if self.cfg.post_only {
-            for round in 0..self.cfg.chase_retries.max(1) {
-                let remaining = req.target_qty - total_filled;
-                if remaining <= req.dust_qty {
-                    break;
-                }
-
-                match self.run_one_chase_round(&req, remaining, round).await {
-                    Ok(round_filled) => {
-                        total_filled += round_filled.filled_this_round;
-                        if round_filled.terminal_cancelled
-                            && round_filled.filled_this_round.is_zero()
-                        {
-                            // Venue cancelled with zero fill — most
-                            // likely the post-only price moved
-                            // through. Continue to the next chase
-                            // round (if any retries left) so we
-                            // re-quote at the new book.
-                            last_failure = Some(ExecutionFailure::Cancelled);
-                            continue;
-                        }
-                        if total_filled >= req.target_qty - req.dust_qty {
-                            return ExtendedTerminal::Filled { qty: total_filled };
-                        }
-                    }
-                    Err(failure) => {
-                        last_failure = Some(failure);
-                        // Hard place / read failure — break out of
-                        // the chase and fall through to taker
-                        // fallback. We don't keep retrying place_*
-                        // since the venue is signalling a problem.
-                        break;
-                    }
-                }
+        let params = MakerLoopParams {
+            log_prefix: "XVENUE/extmaker",
+            chase_retries: self.cfg.chase_retries,
+            chase_timeout_ms: self.cfg.chase_timeout_ms,
+            chase_grace_poll_ms: 0,
+            taker_grace_poll_ms: self.cfg.taker_grace_poll_ms,
+            taker_fallback: self.cfg.taker_fallback,
+            post_only: self.cfg.post_only,
+            poll_interval_ms: self.poll_interval_ms,
+            chase_uses_venue_min_floor: false,
+            taker_grace_before_cancel: true,
+        };
+        let shared_req = MakerRequest {
+            symbol: req.symbol,
+            side: req.side,
+            target_qty: req.target_qty,
+            dust_qty: req.dust_qty,
+            venue_min_qty: req.venue_min_qty,
+            reduce_only: req.reduce_only,
+        };
+        let outcome = run_maker_loop(self.ops, &params, &shared_req).await;
+        if outcome.total_filled > Decimal::ZERO {
+            ExtendedTerminal::Filled {
+                qty: outcome.total_filled,
             }
-        }
-
-        // If chase didn't fill it all, decide whether to fall
-        // through to taker for the residual. bot-strategy#299: also
-        // gate against the venue minimum order size — a residual
-        // smaller than `venue_min_qty` cannot be placed and would
-        // emit a noisy `place_taker err=Order size 0 below min` WARN
-        // for what is effectively a clean post_only fill.
-        let residual = req.target_qty - total_filled;
-        let taker_min_threshold = req.venue_min_qty.max(req.dust_qty);
-        if residual > taker_min_threshold && self.cfg.taker_fallback {
-            match self.run_taker_round(&req, residual).await {
-                Ok(taker_filled) => {
-                    total_filled += taker_filled;
-                }
-                Err(failure) => {
-                    if total_filled.is_zero() {
-                        return ExtendedTerminal::Failed { reason: failure };
-                    }
-                    // Got a partial maker fill — surface the partial
-                    // so the state machine can route via skew
-                    // monitor instead of dead-ending in Failed.
-                    return ExtendedTerminal::Filled { qty: total_filled };
-                }
-            }
-        }
-
-        if total_filled > Decimal::ZERO {
-            ExtendedTerminal::Filled { qty: total_filled }
         } else {
             ExtendedTerminal::Failed {
-                reason: last_failure.unwrap_or(ExecutionFailure::PostOnlyExhausted),
+                reason: outcome
+                    .last_failure
+                    .unwrap_or(ExecutionFailure::PostOnlyExhausted),
             }
-        }
-    }
-
-    /// Inner: one place + poll-until-filled-or-timeout + cancel
-    /// cycle. Returns the qty filled this round and a `cancelled`
-    /// flag the outer chase uses to decide whether to re-quote.
-    async fn run_one_chase_round(
-        &self,
-        req: &ExtendedEntryRequest,
-        remaining: Decimal,
-        round: u32,
-    ) -> Result<PollOutcome, ExecutionFailure> {
-        let book = match self.ops.read_top_of_book(&req.symbol).await {
-            Ok(b) => b,
-            Err(e) => {
-                log::warn!(
-                    "[XVENUE/extmaker] read_top_of_book round={} err={:?}",
-                    round,
-                    e
-                );
-                return Err(ExecutionFailure::VenueRejected);
-            }
-        };
-        let price = price_for_post_only(req.side, &book);
-        if price <= Decimal::ZERO {
-            return Err(ExecutionFailure::VenueRejected);
-        }
-
-        let placed: PlacedOrder = match self
-            .ops
-            .place_post_only(&req.symbol, req.side, remaining, price, req.reduce_only)
-            .await
-        {
-            Ok(o) => o,
-            Err(e) => {
-                log::warn!(
-                    "[XVENUE/extmaker] place_post_only round={} err={:?}",
-                    round,
-                    e
-                );
-                return Err(ExecutionFailure::VenueRejected);
-            }
-        };
-        log::info!(
-            "[XVENUE/extmaker] post_only placed round={} side={:?} qty={} price={} order_id={}",
-            round,
-            req.side,
-            remaining,
-            price,
-            placed.order_id
-        );
-
-        let outcome = poll_until_terminal_or_deadline(
-            self.ops,
-            &req.symbol,
-            &placed.order_id,
-            self.cfg.chase_timeout_ms,
-            self.poll_interval_ms,
-            "XVENUE/extmaker",
-        )
-        .await;
-        log::info!(
-            "[XVENUE/extmaker] post_only round={} done filled={} cancelled={} order_id={}",
-            round,
-            outcome.filled_this_round,
-            outcome.terminal_cancelled,
-            placed.order_id
-        );
-
-        // Cancel residual regardless of outcome — Idempotent on the
-        // mock, harmless on a venue that has already terminated the
-        // order.
-        let _ = self.ops.cancel(&req.symbol, &placed.order_id).await;
-
-        Ok(outcome)
-    }
-
-    async fn run_taker_round(
-        &self,
-        req: &ExtendedEntryRequest,
-        residual: Decimal,
-    ) -> Result<Decimal, ExecutionFailure> {
-        let placed = match self
-            .ops
-            .place_taker(&req.symbol, req.side, residual, req.reduce_only)
-            .await
-        {
-            Ok(o) => o,
-            Err(e) => {
-                log::warn!("[XVENUE/extmaker] place_taker err={:?}", e);
-                return Err(ExecutionFailure::TakerRejected);
-            }
-        };
-        log::info!(
-            "[XVENUE/extmaker] taker placed side={:?} qty={} reduce_only={} order_id={}",
-            req.side,
-            residual,
-            req.reduce_only,
-            placed.order_id
-        );
-        let mut outcome = poll_until_terminal_or_deadline(
-            self.ops,
-            &req.symbol,
-            &placed.order_id,
-            self.cfg.chase_timeout_ms,
-            self.poll_interval_ms,
-            "XVENUE/extmaker",
-        )
-        .await;
-        log::info!(
-            "[XVENUE/extmaker] taker done filled={} cancelled={} order_id={}",
-            outcome.filled_this_round,
-            outcome.terminal_cancelled,
-            placed.order_id
-        );
-
-        // bot-strategy#298: WS-lag grace re-poll. The 2026-05-03
-        // EXIT-side timeouts (cases C/D in #298) all showed the
-        // taker landing on `filled=0 cancelled=false` — an IOC that
-        // neither filled nor terminal-cancelled within the chase
-        // deadline. That's the WS feed lagging the venue's actual
-        // result; one extra poll after a short grace lets a late
-        // fill surface as Filled rather than fall through to
-        // EmergencyFlattening on what was a clean fill. Runs before
-        // cancel so a fill that landed at the venue still gets
-        // recorded if the cancel races against it.
-        if outcome.filled_this_round.is_zero()
-            && !outcome.terminal_cancelled
-            && self.cfg.taker_grace_poll_ms > 0
-        {
-            tokio::time::sleep(Duration::from_millis(self.cfg.taker_grace_poll_ms)).await;
-            match self
-                .ops
-                .poll_fill_status(&req.symbol, &placed.order_id)
-                .await
-            {
-                Ok(s) => {
-                    if s.filled_qty > Decimal::ZERO {
-                        log::info!(
-                            "[XVENUE/extmaker] taker grace-recovered \
-                             filled={} terminal={} cancelled={} order_id={}",
-                            s.filled_qty,
-                            s.terminal,
-                            s.cancelled,
-                            placed.order_id
-                        );
-                        outcome = PollOutcome {
-                            filled_this_round: s.filled_qty,
-                            terminal_cancelled: s.cancelled,
-                        };
-                    } else {
-                        log::warn!(
-                            "[XVENUE/extmaker] taker grace-poll no-late-fill \
-                             terminal={} cancelled={} order_id={}",
-                            s.terminal,
-                            s.cancelled,
-                            placed.order_id
-                        );
-                    }
-                }
-                Err(e) => {
-                    log::warn!(
-                        "[XVENUE/extmaker] taker grace-poll err={:?} order_id={}",
-                        e,
-                        placed.order_id
-                    );
-                }
-            }
-        }
-
-        let _ = self.ops.cancel(&req.symbol, &placed.order_id).await;
-        if outcome.filled_this_round > Decimal::ZERO {
-            Ok(outcome.filled_this_round)
-        } else if outcome.terminal_cancelled {
-            Err(ExecutionFailure::TakerRejected)
-        } else {
-            Err(ExecutionFailure::Timeout)
         }
     }
 }
@@ -361,15 +146,6 @@ impl<'a, V: VenueOps + ?Sized + Sync> Executor for ExtendedMakerLoop<'a, V> {
 
     async fn run(&self, req: Self::Request) -> Self::Terminal {
         self.run_entry(req).await
-    }
-}
-
-fn price_for_post_only(side: OrderSide, book: &super::venue_ops::TopOfBook) -> Decimal {
-    match side {
-        // Buy post-only at the best bid (rest passively).
-        OrderSide::Long => book.best_bid,
-        // Sell post-only at the best ask.
-        OrderSide::Short => book.best_ask,
     }
 }
 

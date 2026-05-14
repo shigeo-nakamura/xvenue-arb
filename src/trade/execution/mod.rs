@@ -19,6 +19,7 @@ pub mod extended_maker;
 pub mod lighter_fill;
 pub mod lighter_maker;
 pub mod live_venue_ops;
+mod maker_loop;
 pub mod parallel_exit;
 pub mod poll_loop;
 pub mod types;
