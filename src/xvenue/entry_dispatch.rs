@@ -12,11 +12,9 @@ use dex_connector::OrderSide as DcOrderSide;
 use rust_decimal::Decimal;
 
 use super::config::XvenueConfig;
-use super::live::{
-    paper_qty, would_be_maker_fill_outcome, LiveEntryCtx, LivePaperSummary, MidSnapshot,
-    PaperEntryCtx, Venue, VenueHub,
-};
+use super::live::{LiveEntryCtx, LivePaperSummary, MidSnapshot, PaperEntryCtx, Venue, VenueHub};
 use super::live_exec::LiveExecution;
+use super::live_pnl::{paper_qty, would_be_maker_fill_outcome};
 use super::signal::SpreadDirection;
 use super::sizing::{compute_notional_usd, notional_to_qty, SizeOutcome};
 use super::state::{Event, PositionMachine};
