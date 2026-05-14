@@ -3540,10 +3540,7 @@ emergency_complete_grace_ms: 0  # tests assert immediate-complete on zero (#287 
     #[tokio::test]
     async fn refresh_equity_drops_zero_sum_before_init() {
         let mut summary = LivePaperSummary::default();
-        assert!(
-            !summary.equity_initialized,
-            "default must be uninitialized"
-        );
+        assert!(!summary.equity_initialized, "default must be uninitialized");
 
         // Phase 1: both venues' WS caches empty — Ok(Some(0)) from each.
         let hub_zero = EquityScriptHub {

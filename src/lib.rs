@@ -9,4 +9,5 @@ pub mod error_counter;
 pub mod rate_limit_notifier;
 pub mod risk;
 pub mod trade;
+pub mod ws_event_defer;
 pub mod xvenue;

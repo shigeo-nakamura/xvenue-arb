@@ -175,8 +175,8 @@ impl ReplayConnector {
         let mut data = Vec::new();
 
         for line in reader.lines() {
-            let line =
-                line.map_err(|e| DexError::Permanent(format!("failed to read replay line: {}", e)))?;
+            let line = line
+                .map_err(|e| DexError::Permanent(format!("failed to read replay line: {}", e)))?;
             if line.trim().is_empty() {
                 continue;
             }
