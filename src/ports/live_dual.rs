@@ -163,7 +163,7 @@ mod tests {
             _depth: usize,
         ) -> Result<OrderBookSnapshot, DexError> {
             if let Some(msg) = self.get_order_book_err.lock().unwrap().clone() {
-                return Err(DexError::Other(msg));
+                return Err(DexError::Transient(msg));
             }
             Ok(self.book.lock().unwrap().clone())
         }
@@ -174,7 +174,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
             if let Some(msg) = self.get_balance_err.lock().unwrap().clone() {
-                return Err(DexError::Other(msg));
+                return Err(DexError::Transient(msg));
             }
             Ok(self.balance.lock().unwrap().clone())
         }

@@ -145,7 +145,7 @@ impl ReplayConnector {
         };
 
         if data.is_empty() {
-            return Err(DexError::Other(
+            return Err(DexError::Permanent(
                 anyhow!("Data dump file is empty or invalid").to_string(),
             ));
         }
@@ -170,18 +170,18 @@ impl ReplayConnector {
 
     fn load_jsonl(path: &str) -> Result<Vec<DumpedDataEntry>, DexError> {
         let file = File::open(path)
-            .map_err(|e| DexError::Other(format!("failed to open replay file: {}", e)))?;
+            .map_err(|e| DexError::Permanent(format!("failed to open replay file: {}", e)))?;
         let reader = BufReader::new(file);
         let mut data = Vec::new();
 
         for line in reader.lines() {
             let line =
-                line.map_err(|e| DexError::Other(format!("failed to read replay line: {}", e)))?;
+                line.map_err(|e| DexError::Permanent(format!("failed to read replay line: {}", e)))?;
             if line.trim().is_empty() {
                 continue;
             }
             let entry: DumpedDataEntry = serde_json::from_str(&line).map_err(|e| {
-                DexError::Other(format!("failed to parse replay entry '{}': {}", line, e))
+                DexError::Permanent(format!("failed to parse replay entry '{}': {}", line, e))
             })?;
             data.push(entry);
         }
@@ -190,9 +190,9 @@ impl ReplayConnector {
 
     fn load_bincode(path: &str) -> Result<Vec<DumpedDataEntry>, DexError> {
         let bytes = std::fs::read(path)
-            .map_err(|e| DexError::Other(format!("failed to read bincode file: {}", e)))?;
+            .map_err(|e| DexError::Permanent(format!("failed to read bincode file: {}", e)))?;
         let bincode_data: Vec<BincodeDataEntry> = bincode::deserialize(&bytes)
-            .map_err(|e| DexError::Other(format!("failed to deserialize bincode: {}", e)))?;
+            .map_err(|e| DexError::Permanent(format!("failed to deserialize bincode: {}", e)))?;
         Ok(bincode_data
             .into_iter()
             .map(DumpedDataEntry::from)
@@ -240,9 +240,9 @@ impl ReplayConnector {
             .map(|e| BincodeDataEntry::from(*e))
             .collect();
         let bytes = bincode::serialize(&bincode_data)
-            .map_err(|e| DexError::Other(format!("failed to serialize bincode: {}", e)))?;
+            .map_err(|e| DexError::Permanent(format!("failed to serialize bincode: {}", e)))?;
         std::fs::write(output, bytes)
-            .map_err(|e| DexError::Other(format!("failed to write bincode file: {}", e)))?;
+            .map_err(|e| DexError::Permanent(format!("failed to write bincode file: {}", e)))?;
         Ok(())
     }
 
@@ -460,10 +460,10 @@ impl DexConnector for ReplayConnector {
         let current_snapshot = self
             .data
             .get(current_cursor)
-            .ok_or_else(|| DexError::Other("Cursor out of bounds".to_string()))?;
+            .ok_or_else(|| DexError::Permanent("Cursor out of bounds".to_string()))?;
 
         let symbol_data = current_snapshot.prices.get(symbol).ok_or_else(|| {
-            DexError::Other(format!(
+            DexError::Permanent(format!(
                 "Symbol '{}' not found in this data entry at cursor {}",
                 symbol, current_cursor
             ))
@@ -541,10 +541,10 @@ impl DexConnector for ReplayConnector {
         let current_snapshot = self
             .data
             .get(current_cursor)
-            .ok_or_else(|| DexError::Other("Cursor out of bounds".to_string()))?;
+            .ok_or_else(|| DexError::Permanent("Cursor out of bounds".to_string()))?;
 
         let symbol_data = current_snapshot.prices.get(symbol).ok_or_else(|| {
-            DexError::Other(format!(
+            DexError::Permanent(format!(
                 "Symbol '{}' not found in this data entry at cursor {}",
                 symbol, current_cursor
             ))
@@ -592,11 +592,11 @@ impl DexConnector for ReplayConnector {
         let snapshot = self
             .data
             .get(current_cursor)
-            .ok_or_else(|| DexError::Other("Cursor out of bounds".to_string()))?;
+            .ok_or_else(|| DexError::Permanent("Cursor out of bounds".to_string()))?;
         let symbol_data = snapshot
             .prices
             .get(symbol)
-            .ok_or_else(|| DexError::Other(format!("Symbol '{}' not found", symbol)))?;
+            .ok_or_else(|| DexError::Permanent(format!("Symbol '{}' not found", symbol)))?;
 
         // Fill at the appropriate side of the book (taker model):
         // buys fill at ask price, sells fill at bid price.

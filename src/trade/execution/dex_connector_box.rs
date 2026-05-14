@@ -79,7 +79,7 @@ impl DexConnectorBox {
                 let lighter_config = match get_lighter_config_from_env(instance_id).await {
                     Ok(v) => v,
                     Err(e) => {
-                        return Err(DexError::Other(e.to_string()));
+                        return Err(DexError::Permanent(e.to_string()));
                     }
                 };
 
@@ -89,7 +89,7 @@ impl DexConnectorBox {
                 if account_index == 0 {
                     let wallet_address =
                         lighter_config.wallet_address.as_deref().ok_or_else(|| {
-                            DexError::Other(
+                            DexError::Permanent(
                                 "LIGHTER_ACCOUNT_INDEX not set and LIGHTER_WALLET_ADDRESS not set. \
                                  Set one of them to enable account discovery."
                                     .to_string(),
@@ -140,7 +140,7 @@ impl DexConnectorBox {
             "extended" => {
                 let extended_config = get_extended_config_from_env()
                     .await
-                    .map_err(|e| DexError::Other(e.to_string()))?;
+                    .map_err(|e| DexError::Permanent(e.to_string()))?;
 
                 let connector = create_extended_connector(
                     extended_config.api_key,
@@ -155,7 +155,7 @@ impl DexConnectorBox {
 
                 Ok(DexConnectorBox { inner: connector })
             }
-            _ => Err(DexError::Other("Unsupported dex".to_owned())),
+            _ => Err(DexError::Permanent("Unsupported dex".to_owned())),
         }
     }
 }

@@ -1512,6 +1512,7 @@ dependencies = [
  "sha2 0.10.9",
  "sha3",
  "starknet 0.17.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "thiserror 1.0.69",
  "tiny-keccak",
  "tokio",
  "tokio-tungstenite",

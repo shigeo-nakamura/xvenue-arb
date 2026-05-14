@@ -360,7 +360,7 @@ mod tests {
         async fn get_positions(&self) -> Result<Vec<PositionSnapshot>, DexError> {
             let mut g = self.state.lock().unwrap();
             if let Some(msg) = g.positions_err.take() {
-                return Err(DexError::Other(msg));
+                return Err(DexError::Transient(msg));
             }
             Ok(g.positions.clone())
         }
@@ -375,7 +375,7 @@ mod tests {
             let mut g = self.state.lock().unwrap();
             g.get_order_book_calls.push((symbol.to_string(), depth));
             if let Some(msg) = g.order_book_err.take() {
-                return Err(DexError::Other(msg));
+                return Err(DexError::Transient(msg));
             }
             Ok(g.order_book.clone().unwrap_or_default())
         }
@@ -412,7 +412,7 @@ mod tests {
                 expiry_secs,
             });
             if let Some(msg) = g.create_order_err.take() {
-                return Err(DexError::Other(msg));
+                return Err(DexError::Transient(msg));
             }
             g.next_create_order_id += 1;
             Ok(CreateOrderResponse {
@@ -440,7 +440,7 @@ mod tests {
             g.cancel_order_calls
                 .push((symbol.to_string(), order_id.to_string()));
             if let Some(msg) = g.cancel_order_err.take() {
-                return Err(DexError::Other(msg));
+                return Err(DexError::Transient(msg));
             }
             Ok(())
         }
@@ -454,7 +454,7 @@ mod tests {
             let mut g = self.state.lock().unwrap();
             g.close_all_calls.push(symbol);
             if let Some(msg) = g.close_all_err.take() {
-                return Err(DexError::Other(msg));
+                return Err(DexError::Transient(msg));
             }
             Ok(())
         }
