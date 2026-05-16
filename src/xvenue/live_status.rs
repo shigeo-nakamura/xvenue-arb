@@ -14,8 +14,10 @@ use super::config::XvenueConfig;
 use super::live::{
     kill_switch_active, now_unix_secs, wall_clock_ms, LivePaperSummary, Venue, VenueHub,
 };
-use super::state::PositionMachine;
+use super::state::{Phase, PositionMachine};
 use super::status::{equity_decimal_to_f64, StatusReporter};
+use crate::prom;
+use crate::risk::kill_switch::StuckTripwire;
 use crate::risk::manager::RiskManager;
 use crate::risk::ws_health::WsHealthMonitor;
 
@@ -132,6 +134,7 @@ pub(super) fn publish_kill_switch(cfg: &XvenueConfig, reporter: &mut StatusRepor
 /// reads as a state machine rather than a paragraph of formatting.
 /// Behaviour-preserving: identical log line, identical equity refresh /
 /// risk publish / snapshot-write order.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn report_status_tick<H: VenueHub + ?Sized>(
     cfg: &XvenueConfig,
     hub: &H,
@@ -139,6 +142,7 @@ pub(super) async fn report_status_tick<H: VenueHub + ?Sized>(
     ws_health: &WsHealthMonitor,
     machine: &PositionMachine,
     risk_manager: &mut RiskManager,
+    stuck: &StuckTripwire,
     reporter: Option<&mut StatusReporter>,
 ) {
     let ws_age = ws_health.ws_age(wall_clock_ms());
@@ -233,6 +237,191 @@ pub(super) async fn report_status_tick<H: VenueHub + ?Sized>(
         let now_ts_ms = wall_clock_ms();
         if let Err(e) = r.write_snapshot_if_due(machine, now_ts_ms) {
             log::warn!("[STATUS] snapshot write failed: {:?}", e);
+        }
+        // bot-strategy#314 Group 5: mirror everything the [STATUS] log
+        // line already carries into Prometheus gauges. Done after the
+        // snapshot write so the dashboard's status.json and the
+        // exporter agree on the same tick.
+        publish_prom(cfg, summary, ws_health, machine, risk_manager, stuck, r);
+    }
+}
+
+/// Mirror the current status-tick state into the in-process Prometheus
+/// registry. Called once per status interval from `report_status_tick`,
+/// after risk + kill-switch + equity have already been refreshed.
+/// Per-tick metrics (e.g. `dev_bps`) are also updated here at the
+/// status cadence — a 60s sample is plenty for Grafana panels and
+/// avoids touching the hot tick loop.
+fn publish_prom(
+    cfg: &XvenueConfig,
+    summary: &LivePaperSummary,
+    ws_health: &WsHealthMonitor,
+    machine: &PositionMachine,
+    risk_manager: &mut RiskManager,
+    stuck: &StuckTripwire,
+    reporter: &StatusReporter,
+) {
+    let agent = cfg.agent_name.as_str();
+
+    // Spread / signal.
+    if let Some(v) = summary.last_dev_bps {
+        prom::DEV_BPS.with_label_values(&[agent]).set(v);
+    }
+    if let Some(v) = summary.last_cap_long_bps {
+        prom::CAP_LONG_BPS.with_label_values(&[agent]).set(v);
+    }
+    if let Some(v) = summary.last_cap_short_bps {
+        prom::CAP_SHORT_BPS.with_label_values(&[agent]).set(v);
+    }
+    if let Some(v) = summary.last_ext_inside_bps {
+        prom::INSIDE_BPS
+            .with_label_values(&[agent, "extended"])
+            .set(v);
+    }
+    if let Some(v) = summary.last_lt_inside_bps {
+        prom::INSIDE_BPS
+            .with_label_values(&[agent, "lighter"])
+            .set(v);
+    }
+    if let Some(v) = summary.last_lt_bid_size {
+        prom::LT_TOUCH_SIZE
+            .with_label_values(&[agent, "bid"])
+            .set(v);
+    }
+    if let Some(v) = summary.last_lt_ask_size {
+        prom::LT_TOUCH_SIZE
+            .with_label_values(&[agent, "ask"])
+            .set(v);
+    }
+
+    // Position state.
+    let phase = machine.phase();
+    let (phase_int, has_pos) = match phase {
+        Phase::Flat => (0_i64, 0_i64),
+        Phase::EnteringExtended => (1, 1),
+        Phase::EnteringLighter => (2, 1),
+        Phase::Held => (3, 1),
+        Phase::Exiting => (4, 1),
+        Phase::EmergencyFlattening => (5, 1),
+    };
+    prom::PHASE_STATE.with_label_values(&[agent]).set(phase_int);
+    prom::HAS_POSITION.with_label_values(&[agent]).set(has_pos);
+    let age_secs = if matches!(phase, Phase::Flat) {
+        0.0
+    } else {
+        machine.time_in_phase_ms(wall_clock_ms()) as f64 / 1000.0
+    };
+    prom::POSITION_AGE_SECONDS
+        .with_label_values(&[agent])
+        .set(age_secs);
+
+    // Decisions + blocks (mirror u64 counters into gauges; use delta()).
+    prom::DECISIONS_TOTAL
+        .with_label_values(&[agent, "hold"])
+        .set(summary.decisions_hold as i64);
+    prom::DECISIONS_TOTAL
+        .with_label_values(&[agent, "enter_long"])
+        .set(summary.decisions_enter_long as i64);
+    prom::DECISIONS_TOTAL
+        .with_label_values(&[agent, "enter_short"])
+        .set(summary.decisions_enter_short as i64);
+    prom::DECISIONS_TOTAL
+        .with_label_values(&[agent, "exit"])
+        .set(summary.decisions_exit as i64);
+
+    for (reason, value) in [
+        ("kill_switch", summary.entries_blocked_by_kill_switch),
+        ("stuck", summary.entries_blocked_by_stuck_file),
+        ("daily_dd", summary.entries_blocked_by_daily_dd),
+        ("session_dd", summary.entries_blocked_by_session_dd),
+        ("circuit_breaker", summary.entries_blocked_by_circuit_breaker),
+        ("ws_stale", summary.entries_blocked_by_ws_stale),
+        ("book_depth", summary.entries_blocked_by_book_depth),
+        ("maintenance", summary.entries_blocked_by_maintenance),
+    ] {
+        prom::ENTRIES_BLOCKED_TOTAL
+            .with_label_values(&[agent, reason])
+            .set(value as i64);
+    }
+
+    prom::REF_GUARD_SUPPRESSED_TOTAL
+        .with_label_values(&[agent, "extended"])
+        .set(summary.ext_book_suppressed_by_ref_guard as i64);
+    prom::REF_GUARD_SUPPRESSED_TOTAL
+        .with_label_values(&[agent, "lighter"])
+        .set(summary.lt_book_suppressed_by_ref_guard as i64);
+    prom::READ_MID_ERR_TOTAL
+        .with_label_values(&[agent, "extended"])
+        .set(summary.read_mid_err_ext as i64);
+    prom::READ_MID_ERR_TOTAL
+        .with_label_values(&[agent, "lighter"])
+        .set(summary.read_mid_err_lt as i64);
+    prom::EQUITY_SAMPLES_SKIPPED_PARTIAL_TOTAL
+        .with_label_values(&[agent])
+        .set(summary.equity_samples_skipped_partial as i64);
+
+    // Risk / kill state. `daily_snapshot` and `session_snapshot` return
+    // None during pre-equity warm-up; in that window leave the previous
+    // value so a transient None doesn't flap the dashboard to 0.
+    prom::KILL_SWITCH_ACTIVE
+        .with_label_values(&[agent])
+        .set(if kill_switch_active(&cfg.kill_switch_file) { 1 } else { 0 });
+    prom::STUCK_ACTIVE
+        .with_label_values(&[agent])
+        .set(if stuck.is_stuck() { 1 } else { 0 });
+
+    if let Some(s) = risk_manager.session_snapshot() {
+        prom::EQUITY_CURRENT_USD
+            .with_label_values(&[agent])
+            .set(s.current_equity);
+        prom::EQUITY_PEAK_USD
+            .with_label_values(&[agent])
+            .set(s.peak_equity);
+        prom::SESSION_DD_BPS
+            .with_label_values(&[agent])
+            .set(s.dd_bps);
+        prom::SESSION_DD_HALT_ACTIVE
+            .with_label_values(&[agent])
+            .set(if s.session_halted { 1 } else { 0 });
+        prom::EFFECTIVE_MAX_SESSION_LOSS_BPS
+            .with_label_values(&[agent])
+            .set(s.effective_max_session_loss_bps);
+    }
+    if let Some(d) = risk_manager.daily_snapshot() {
+        prom::DAILY_PNL_BPS
+            .with_label_values(&[agent])
+            .set(d.daily_pnl_bps);
+        prom::DAILY_DD_HALT_ACTIVE
+            .with_label_values(&[agent])
+            .set(if d.risk_halted { 1 } else { 0 });
+        prom::EFFECTIVE_MAX_DAILY_LOSS_BPS
+            .with_label_values(&[agent])
+            .set(d.effective_max_daily_loss_bps);
+    }
+    let cb = risk_manager.circuit_breaker_snapshot(now_unix_secs());
+    prom::CIRCUIT_BREAKER_ACTIVE
+        .with_label_values(&[agent])
+        .set(if cb.active { 1 } else { 0 });
+
+    // System health.
+    let ws_age = ws_health.ws_age(wall_clock_ms());
+    if let Some(ms) = ws_age.ext_age_ms {
+        prom::WS_AGE_MS
+            .with_label_values(&[agent, "extended"])
+            .set(ms as f64);
+    }
+    if let Some(ms) = ws_age.lt_age_ms {
+        prom::WS_AGE_MS
+            .with_label_values(&[agent, "lighter"])
+            .set(ms as f64);
+    }
+    if let Ok(meta) = std::fs::metadata(reporter.path()) {
+        if let Ok(mtime) = meta.modified() {
+            if let Ok(age) = std::time::SystemTime::now().duration_since(mtime) {
+                prom::SNAPSHOT_AGE_SECONDS
+                    .with_label_values(&[agent])
+                    .set(age.as_secs_f64());
+            }
         }
     }
 }

@@ -1,0 +1,517 @@
+{
+  "title": "xvenue-arb overview",
+  "uid": "xvenue-arb-overview",
+  "tags": ["xvenue-arb", "bot"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Liveness",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Scrape up",
+      "description": "1 = Alloy is reaching the /metrics endpoint; 0 = bot not exposing /metrics yet (e.g. PROM_LISTEN not set, or the bot has not been restarted after the exporter landed).",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "targets": [
+        { "expr": "up{job=\"xvenue-arb\"}", "legendFormat": "{{instance}}", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          },
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN" }, "1": { "text": "UP" } } }
+          ],
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "textMode": "value",
+        "colorMode": "background"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Uptime",
+      "gridPos": { "h": 4, "w": 5, "x": 4, "y": 1 },
+      "targets": [
+        {
+          "expr": "time() - xvenue_arb_process_start_timestamp_seconds",
+          "legendFormat": "{{agent}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s" }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "textMode": "value_and_name"
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "DRY_RUN",
+      "description": "1 = paper-fill path (no live orders dispatched). xvenue-arb is gated on bot-strategy#244 / #308 / #330 before flipping to dry_run=false.",
+      "gridPos": { "h": 4, "w": 4, "x": 9, "y": 1 },
+      "targets": [
+        { "expr": "xvenue_arb_dry_run_active", "legendFormat": "{{agent}}", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "LIVE", "color": "red" }, "1": { "text": "DRY_RUN", "color": "orange" } } }
+          ],
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "textMode": "value",
+        "colorMode": "background"
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Build",
+      "description": "Bot package version + dex-connector git SHA from xvenue_arb_bot_version_info labels. Confirms the running binary matches the source tree (addresses the running-binary-lags-source trap).",
+      "gridPos": { "h": 4, "w": 11, "x": 13, "y": 1 },
+      "targets": [
+        {
+          "expr": "xvenue_arb_bot_version_info",
+          "legendFormat": "v{{version}} dex={{dex_connector_sha}}",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" },
+        "textMode": "name",
+        "colorMode": "none"
+      }
+    },
+
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Spread / signal",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "collapsed": false
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Cross-venue dev (bps)",
+      "description": "Latest dev_bps snapshotted by the live tick loop. Positive = Extended rich vs Lighter. Entry signal compares |dev| against abs_threshold_bps.",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 6 },
+      "targets": [
+        { "expr": "xvenue_arb_dev_bps", "legendFormat": "{{agent}} dev", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": true }
+        }
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Capturable spread (bps)",
+      "description": "Touch-to-touch capturable spread, separated by direction. Drives the bot-strategy#309 maker-on-Lighter redesign analysis. Source: LivePaperSummary.last_cap_long_bps / last_cap_short_bps (None during book-depth warm-up — gap in series).",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 6 },
+      "targets": [
+        { "expr": "xvenue_arb_cap_long_bps", "legendFormat": "{{agent}} cap_long", "refId": "A" },
+        { "expr": "xvenue_arb_cap_short_bps", "legendFormat": "{{agent}} cap_short", "refId": "B" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": false }
+        }
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Inside half-spread per venue (bps)",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 15 },
+      "targets": [
+        { "expr": "xvenue_arb_inside_bps", "legendFormat": "{{agent}} {{venue}}", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" }
+      }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Lighter top-of-book size",
+      "description": "Latest top-of-book size on each Lighter side. Drives the lt_book_max_eth queue-depth filter.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 15 },
+      "targets": [
+        { "expr": "xvenue_arb_lt_touch_size", "legendFormat": "{{agent}} {{side}}", "refId": "A" }
+      ]
+    },
+
+    {
+      "id": 20,
+      "type": "row",
+      "title": "Position state",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
+      "collapsed": false
+    },
+    {
+      "id": 21,
+      "type": "state-timeline",
+      "title": "Position phase",
+      "description": "0=Flat 1=EnteringExtended 2=EnteringLighter 3=Held 4=Exiting 5=EmergencyFlattening. Long stalls in 1/2/4/5 are the operator's cue something is stuck.",
+      "gridPos": { "h": 6, "w": 18, "x": 0, "y": 23 },
+      "targets": [
+        { "expr": "xvenue_arb_phase_state", "legendFormat": "{{agent}}", "refId": "A" }
+      ],
+      "options": { "mergeValues": true, "showValue": "auto", "rowHeight": 0.9 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": {
+              "0": { "text": "FLAT",        "color": "transparent" },
+              "1": { "text": "ENT EXT",     "color": "yellow" },
+              "2": { "text": "ENT LT",      "color": "yellow" },
+              "3": { "text": "HELD",        "color": "blue" },
+              "4": { "text": "EXITING",     "color": "purple" },
+              "5": { "text": "EMERGENCY",   "color": "red" }
+            }}
+          ]
+        }
+      }
+    },
+    {
+      "id": 22,
+      "type": "stat",
+      "title": "Phase age",
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 23 },
+      "targets": [
+        { "expr": "xvenue_arb_position_age_seconds", "legendFormat": "{{agent}}", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "orange", "value": 600 },
+              { "color": "red",    "value": 1800 }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "textMode": "value",
+        "colorMode": "value"
+      }
+    },
+
+    {
+      "id": 30,
+      "type": "row",
+      "title": "Risk / kill state",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 29 },
+      "collapsed": false
+    },
+    {
+      "id": 31,
+      "type": "stat",
+      "title": "Halt flags (1 = active)",
+      "description": "OR of kill_switch / stuck / session_dd / daily_dd / circuit_breaker. Any 1 means the bot is blocking entries.",
+      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 30 },
+      "targets": [
+        { "expr": "xvenue_arb_kill_switch_active",       "legendFormat": "kill_switch",     "refId": "A" },
+        { "expr": "xvenue_arb_stuck_active",             "legendFormat": "stuck",           "refId": "B" },
+        { "expr": "xvenue_arb_session_dd_halt_active",   "legendFormat": "session_dd",      "refId": "C" },
+        { "expr": "xvenue_arb_daily_dd_halt_active",     "legendFormat": "daily_dd",        "refId": "D" },
+        { "expr": "xvenue_arb_circuit_breaker_active",   "legendFormat": "circuit_breaker", "refId": "E" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "OK", "color": "green" }, "1": { "text": "HALTED", "color": "red" } } }
+          ],
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "orientation": "horizontal"
+      }
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Equity (current vs peak, USD)",
+      "description": "Both venues' equity sum. Only published when both venues report (bot-strategy#360); single-venue maintenance leaves the series flat instead of dropping to half.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 35 },
+      "targets": [
+        { "expr": "xvenue_arb_equity_current_usd", "legendFormat": "current", "refId": "A" },
+        { "expr": "xvenue_arb_equity_peak_usd",    "legendFormat": "peak",    "refId": "B" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": true }
+        }
+      }
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Drawdown (bps)",
+      "description": "session_dd_bps (rolling peak) and daily_pnl_bps (UTC-rollover). Threshold lines mirror the bot's effective_max_*_loss_bps.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 35 },
+      "targets": [
+        { "expr": "xvenue_arb_session_dd_bps",                  "legendFormat": "session_dd",         "refId": "A" },
+        { "expr": "-xvenue_arb_daily_pnl_bps",                  "legendFormat": "daily_loss (-pnl)",  "refId": "B" },
+        { "expr": "xvenue_arb_effective_max_session_loss_bps",  "legendFormat": "session limit",      "refId": "C" },
+        { "expr": "xvenue_arb_effective_max_daily_loss_bps",    "legendFormat": "daily limit",        "refId": "D" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": true }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*limit" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
+              { "id": "custom.lineWidth", "value": 1 }
+            ]
+          }
+        ]
+      }
+    },
+
+    {
+      "id": 40,
+      "type": "row",
+      "title": "Activity",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 43 },
+      "collapsed": false
+    },
+    {
+      "id": 41,
+      "type": "timeseries",
+      "title": "Decisions per minute",
+      "description": "Rate of SignalEngine decisions per kind, derived via delta() from the mirrored u64 counters. Use this to confirm the loop is making decisions at the expected cadence.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 44 },
+      "targets": [
+        {
+          "expr": "delta(xvenue_arb_decisions_total[1m])",
+          "legendFormat": "{{agent}} {{kind}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "bars", "fillOpacity": 80 }
+        }
+      }
+    },
+    {
+      "id": 42,
+      "type": "timeseries",
+      "title": "Entries blocked per hour by reason",
+      "description": "delta() over the mirrored entries_blocked counters. Tall bars on the same reason across multiple windows are the cue to drill in.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 44 },
+      "targets": [
+        {
+          "expr": "delta(xvenue_arb_entries_blocked_total[1h])",
+          "legendFormat": "{{agent}} {{reason}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "bars", "fillOpacity": 60, "stacking": { "mode": "normal" } }
+        }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "values": ["last"] } }
+    },
+    {
+      "id": 43,
+      "type": "table",
+      "title": "Blocks last 24h",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 52 },
+      "targets": [
+        {
+          "expr": "delta(xvenue_arb_entries_blocked_total[24h])",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "__name__": true, "job": true, "host": true },
+            "indexByName": { "instance": 0, "agent": 1, "reason": 2, "Value": 3 },
+            "renameByName": { "instance": "host", "Value": "count" }
+          }
+        },
+        { "id": "sortBy", "options": { "fields": {}, "sort": [{ "field": "reason" }] } }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "align": "auto", "filterable": true },
+          "noValue": "0"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "count" },
+            "properties": [
+              { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "gradient" } },
+              { "id": "color", "value": { "mode": "continuous-GrYlRd" } },
+              { "id": "custom.align", "value": "center" },
+              { "id": "custom.width", "value": 100 }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 44,
+      "type": "timeseries",
+      "title": "Ref-guard suppressions per hour",
+      "description": "delta() on ref_guard_suppressed_total bucketed by venue. Sustained one-sided value points at a stuck quote on that venue.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 52 },
+      "targets": [
+        {
+          "expr": "delta(xvenue_arb_ref_guard_suppressed_total[1h])",
+          "legendFormat": "{{agent}} {{venue}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "bars", "fillOpacity": 60 }
+        }
+      }
+    },
+
+    {
+      "id": 50,
+      "type": "row",
+      "title": "System health",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 59 },
+      "collapsed": false
+    },
+    {
+      "id": 51,
+      "type": "timeseries",
+      "title": "WS book age (ms)",
+      "description": "ws_health latch ages per venue. Threshold against `ws_stale_emergency_ms` in config; crossing it trips Emergency{WsStale}.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 60 },
+      "targets": [
+        { "expr": "xvenue_arb_ws_age_ms", "legendFormat": "{{agent}} {{venue}}", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ms" }
+      }
+    },
+    {
+      "id": 52,
+      "type": "stat",
+      "title": "Snapshot age (seconds)",
+      "description": "Age of status.json on disk. Long age = the bot stopped publishing status; cross-check against `up{job=\"xvenue-arb\"}` and the dashboard's STALE flag.",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 60 },
+      "targets": [
+        { "expr": "xvenue_arb_snapshot_age_seconds", "legendFormat": "{{agent}}", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "orange", "value": 120 },
+              { "color": "red",    "value": 600 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "textMode": "value_and_name",
+        "colorMode": "background"
+      }
+    },
+    {
+      "id": 53,
+      "type": "timeseries",
+      "title": "read_mid errors per hour",
+      "description": "delta() on read_mid_err_total per venue. Post-warmup only — pre-warmup errors are debug-demoted upstream.",
+      "gridPos": { "h": 7, "w": 6, "x": 18, "y": 60 },
+      "targets": [
+        {
+          "expr": "delta(xvenue_arb_read_mid_err_total[1h])",
+          "legendFormat": "{{agent}} {{venue}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "bars", "fillOpacity": 60 }
+        }
+      }
+    },
+    {
+      "id": 54,
+      "type": "timeseries",
+      "title": "Equity samples skipped (partial) per hour",
+      "description": "Single-venue maintenance windows where the equity sample was dropped (bot-strategy#360). Spikes here correlate with synthetic-looking DD that turned out to be maintenance.",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 65 },
+      "targets": [
+        {
+          "expr": "delta(xvenue_arb_equity_samples_skipped_partial_total[1h])",
+          "legendFormat": "{{agent}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "bars", "fillOpacity": 60 }
+        }
+      }
+    }
+  ]
+}

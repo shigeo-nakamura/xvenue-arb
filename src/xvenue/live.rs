@@ -583,6 +583,7 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                     &ws_health,
                     &machine,
                     &mut risk_manager,
+                    &stuck,
                     reporter.as_mut(),
                 ).await;
             }

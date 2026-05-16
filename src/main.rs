@@ -13,6 +13,7 @@ use std::sync::Arc;
 use chrono::{DateTime, FixedOffset, Utc};
 use debot::error_counter::{self, ErrorCountingLogger};
 use debot::ports::live_dual::LiveVenueHub;
+use debot::prom;
 use debot::trade::execution::emergency_loop::{LegStateReader, LiveLegStateReader};
 use debot::trade::execution::live_venue_ops::LiveVenueOps;
 use debot::trade::execution::venue_ops::VenueOps;
@@ -163,6 +164,13 @@ async fn run() -> anyhow::Result<()> {
         cfg.symbol_lt,
         cfg.dry_run
     );
+
+    // bot-strategy#314 Group 5: bind the /metrics socket (no-op when
+    // PROM_LISTEN is unset) and stamp boot-time gauges so a first
+    // scrape carries version + uptime even before the first status
+    // tick lands.
+    prom::maybe_start_exporter();
+    prom::record_process_info(&cfg.agent_name, chrono::Utc::now().timestamp(), cfg.dry_run);
 
     #[cfg(not(all(feature = "lighter-sdk", feature = "extended-sdk")))]
     {

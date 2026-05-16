@@ -20,6 +20,8 @@ rust_decimal_macros = "1.0"
 lettre = "0.11.9"
 ctor = "0.2.9"
 once_cell = "1.19"
+# bot-strategy#314 Group 5: in-process exporter mirroring pairtrade::prom.
+prometheus = { version = "0.13", default-features = false }
 rand = { version = "0.8", features = ["std", "std_rng"] }
 rand_distr = "0.4"
 bincode = "1.3"

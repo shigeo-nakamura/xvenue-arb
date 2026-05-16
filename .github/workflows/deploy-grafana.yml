@@ -1,0 +1,63 @@
+name: Deploy Grafana Dashboards
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - "grafana/**.json"
+      - ".github/workflows/deploy-grafana.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-grafana:
+    runs-on: ubuntu-latest
+    environment: debot
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Push dashboards to Grafana
+        env:
+          GRAFANA_URL: ${{ secrets.GRAFANA_URL }}
+          GRAFANA_API_TOKEN: ${{ secrets.GRAFANA_API_TOKEN }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GRAFANA_URL}" ] || [ -z "${GRAFANA_API_TOKEN}" ]; then
+            echo "::error::GRAFANA_URL or GRAFANA_API_TOKEN secret is not set in the 'debot' environment"
+            exit 1
+          fi
+          shopt -s nullglob
+          files=(grafana/*.json)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No dashboards under grafana/ — nothing to do"
+            exit 0
+          fi
+          for f in "${files[@]}"; do
+            uid=$(jq -r '.uid // empty' "$f")
+            title=$(jq -r '.title // "(untitled)"' "$f")
+            if [ -z "$uid" ]; then
+              echo "::error file=$f::dashboard JSON is missing a top-level uid"
+              exit 1
+            fi
+            echo "::group::Deploying $f (uid=$uid, title=$title)"
+            payload=$(jq \
+              --arg msg "ci: deploy ${COMMIT_SHA}" \
+              '{dashboard: (. + {id: null}), overwrite: true, message: $msg}' \
+              "$f")
+            http_status=$(curl -sS -o /tmp/grafana_resp.json -w '%{http_code}' \
+              -X POST \
+              -H "Authorization: Bearer ${GRAFANA_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "$payload" \
+              "${GRAFANA_URL%/}/api/dashboards/db")
+            cat /tmp/grafana_resp.json
+            echo
+            if [ "$http_status" != "200" ]; then
+              echo "::error file=$f::Grafana API returned HTTP $http_status"
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
