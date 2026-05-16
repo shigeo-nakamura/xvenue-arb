@@ -11,7 +11,7 @@
 # /opt/debot/scripts/debot-xvenue-arb.env (see env.example).
 
 agent_name: debot-xvenue-arb-eth
-dry_run: true                 # 2026-05-06 paused after 4 LIVE RTs (-$0.11 net) confirmed the structural fee gap: Extended fees 5.32 bps/leg vs realised gross +1.34 bps/leg, because exit-side Lighter is still legacy taker (only entry routes through LighterMakerLoop) — half-spread rebate covers <40% of Extended fee burden. Re-enable LIVE only after exit-side LighterMakerLoop lands; tracked in follow-up to #309. Operator-paused via #308.
+dry_run: false                # 2026-05-16 re-LIVE per bot-strategy#330 DRY_RUN soak verdict (T+10d, 360 RTs, paper_net_bps_avg +5.81 cum / +11.00 marg on wider regime, wb_fill_rate 95.83% / wb_exit_fill_rate 97.22%, zero halts/emergencies). Exit-side LighterMakerLoop landed (87a5a1e + telemetry 0c2fda7 + projected PnL 57bdb2e). 24h LIVE window re-evaluates #328 acceptance (real maker share by qty ≥ 30%). Notional and chase budget unchanged. Operator-paused 2026-05-06 → re-LIVE-flipped 2026-05-16.
 
 # ---- Symbol pair (one symbol per process) ----
 symbol_ext: ETH-USD
