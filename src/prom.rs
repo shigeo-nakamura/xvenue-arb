@@ -367,11 +367,8 @@ async fn serve(addr: SocketAddr) -> Result<()> {
         };
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                sock.read(&mut buf),
-            )
-            .await;
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(2), sock.read(&mut buf)).await;
             let body = match encode_metrics() {
                 Ok(b) => b,
                 Err(e) => {

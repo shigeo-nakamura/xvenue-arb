@@ -334,7 +334,10 @@ fn publish_prom(
         ("stuck", summary.entries_blocked_by_stuck_file),
         ("daily_dd", summary.entries_blocked_by_daily_dd),
         ("session_dd", summary.entries_blocked_by_session_dd),
-        ("circuit_breaker", summary.entries_blocked_by_circuit_breaker),
+        (
+            "circuit_breaker",
+            summary.entries_blocked_by_circuit_breaker,
+        ),
         ("ws_stale", summary.entries_blocked_by_ws_stale),
         ("book_depth", summary.entries_blocked_by_book_depth),
         ("maintenance", summary.entries_blocked_by_maintenance),
@@ -363,9 +366,13 @@ fn publish_prom(
     // Risk / kill state. `daily_snapshot` and `session_snapshot` return
     // None during pre-equity warm-up; in that window leave the previous
     // value so a transient None doesn't flap the dashboard to 0.
-    prom::KILL_SWITCH_ACTIVE
-        .with_label_values(&[agent])
-        .set(if kill_switch_active(&cfg.kill_switch_file) { 1 } else { 0 });
+    prom::KILL_SWITCH_ACTIVE.with_label_values(&[agent]).set(
+        if kill_switch_active(&cfg.kill_switch_file) {
+            1
+        } else {
+            0
+        },
+    );
     prom::STUCK_ACTIVE
         .with_label_values(&[agent])
         .set(if stuck.is_stuck() { 1 } else { 0 });

@@ -294,6 +294,29 @@ pub(super) async fn handle_decision_exit(
             };
             match (ext_exit_qty, lt_exit_qty) {
                 (Some(ext_eq), Some(lt_eq)) => {
+                    // bot-strategy#418 — flush sub-min residuals BEFORE
+                    // logging "→ Flat" so the state machine actually
+                    // reaches Flat. The post_only chase loop honours
+                    // `dust_qty.max(min_qty)` as the "treat as fully
+                    // filled" floor (#299 / #331) and returns a
+                    // `Filled { qty }` smaller than the requested qty
+                    // when the venue settles the order in two trade
+                    // events and the trailing fill lands after the
+                    // loop's terminal poll. Without this flush
+                    // `lighter_open_qty` (or `extended_open_qty`) is
+                    // left at e.g. 0.0007 ETH < `lighter_min_qty=0.001`,
+                    // `maybe_complete_flat` keeps the phase at
+                    // `Exiting`, and the bot rejects every subsequent
+                    // `EntrySignal` until restart. The same min_qty
+                    // floor that the chase loop already trusts is the
+                    // natural threshold here.
+                    flush_sub_min_exit_residuals(
+                        machine,
+                        live.ext_min_qty,
+                        live.lt_min_qty,
+                        now_ts_ms,
+                    )?;
+
                     // Happy path — compute realised PnL (#268 S5-1).
                     // If the ctx is missing (shouldn't happen but
                     // defensive), fall back to 0.0 + log warn.
@@ -387,4 +410,200 @@ pub(super) async fn handle_decision_exit(
         }
     }
     Ok(())
+}
+
+/// bot-strategy#418 — close the residual gap left when the post_only
+/// chase loop's terminal qty under-reports the venue's final fill.
+///
+/// The chase loop calls a round done at `remaining ≤ dust_qty.max(min_qty)`
+/// and returns the qty it observed by that poll. When the venue settles the
+/// order in two trade events and the second trade lands a few ms after the
+/// terminal poll, the state machine ends up with
+/// `open_qty = requested - first_trade` (e.g. 0.0228 - 0.0221 = 0.0007),
+/// which is below the venue's min order size. `place_post_only` would
+/// reject any follow-up exit of that residual with `code:21706`, so the
+/// chase loop's "treat as fully filled" policy is correct — but the state
+/// machine never sees the policy. This helper bridges that gap by applying
+/// an additional `*ExitFilled { qty: residual }` event for any leg whose
+/// post-apply `open_qty` is strictly between zero and the leg's min_qty,
+/// letting `maybe_complete_flat` transition the phase to `Flat`.
+///
+/// `min_qty = 0` (the config default per #299 / #331) disables the flush
+/// for that leg, preserving the legacy back-compat semantics in which the
+/// dust gate alone governs sub-min residuals.
+fn flush_sub_min_exit_residuals(
+    machine: &mut PositionMachine,
+    ext_min_qty: Decimal,
+    lt_min_qty: Decimal,
+    now_ts_ms: u64,
+) -> Result<()> {
+    let (ext_residual, lt_residual) = match machine.position() {
+        Some(p) => (p.extended_open_qty, p.lighter_open_qty),
+        None => return Ok(()),
+    };
+    if ext_residual > Decimal::ZERO && ext_residual < ext_min_qty {
+        log::info!(
+            "[XVENUE] LIVE EXIT residual flush ext={} (< min_qty={}) — \
+             treating as fully closed (bot-strategy#418)",
+            ext_residual,
+            ext_min_qty,
+        );
+        machine.apply(now_ts_ms, Event::ExtendedExitFilled { qty: ext_residual })?;
+    }
+    if lt_residual > Decimal::ZERO && lt_residual < lt_min_qty {
+        log::info!(
+            "[XVENUE] LIVE EXIT residual flush lt={} (< min_qty={}) — \
+             treating as fully closed (bot-strategy#418)",
+            lt_residual,
+            lt_min_qty,
+        );
+        machine.apply(now_ts_ms, Event::LighterExitFilled { qty: lt_residual })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::xvenue::signal::ExitReason;
+    use crate::xvenue::state::Phase;
+    use rust_decimal_macros::dec;
+
+    fn held_machine(direction: SpreadDirection, qty: Decimal) -> PositionMachine {
+        let mut m = PositionMachine::new();
+        m.apply(
+            0,
+            Event::EntrySignal {
+                direction,
+                notional_usd: dec!(100),
+            },
+        )
+        .unwrap();
+        m.apply(0, Event::ExtendedFilled { qty }).unwrap();
+        m.apply(0, Event::LighterFilled { qty }).unwrap();
+        m
+    }
+
+    fn enter_exiting(m: &mut PositionMachine) {
+        m.apply(
+            1_000,
+            Event::ExitSignal {
+                reason: ExitReason::MeanCross,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn flush_zeroes_lighter_residual_below_min_and_transitions_to_flat() {
+        // Reproduces the 2026-05-16 stuck-Exiting incident: lt leg
+        // closes 0.0221 of 0.0228 leaving a 0.0007 residual that is
+        // below `lighter_min_qty=0.001` while the ext leg closes
+        // cleanly.
+        let mut m = held_machine(SpreadDirection::Short, dec!(0.0228));
+        enter_exiting(&mut m);
+        m.apply(1_100, Event::ExtendedExitFilled { qty: dec!(0.0228) })
+            .unwrap();
+        m.apply(1_200, Event::LighterExitFilled { qty: dec!(0.0221) })
+            .unwrap();
+        assert_eq!(m.phase(), Phase::Exiting, "pre-flush phase");
+        let p = m.position().unwrap();
+        assert_eq!(p.extended_open_qty, Decimal::ZERO);
+        assert_eq!(p.lighter_open_qty, dec!(0.0007));
+
+        flush_sub_min_exit_residuals(&mut m, dec!(0.01), dec!(0.001), 1_300).unwrap();
+
+        assert_eq!(
+            m.phase(),
+            Phase::Flat,
+            "flush should drain lt residual → Flat"
+        );
+        assert!(m.position().is_none());
+    }
+
+    #[test]
+    fn flush_zeroes_extended_residual_below_min_and_transitions_to_flat() {
+        // Symmetric coverage for the Extended leg residual.
+        let mut m = held_machine(SpreadDirection::Long, dec!(0.0228));
+        enter_exiting(&mut m);
+        m.apply(1_100, Event::ExtendedExitFilled { qty: dec!(0.0227) })
+            .unwrap();
+        m.apply(1_200, Event::LighterExitFilled { qty: dec!(0.0228) })
+            .unwrap();
+        assert_eq!(m.phase(), Phase::Exiting, "pre-flush phase");
+        let p = m.position().unwrap();
+        assert_eq!(p.extended_open_qty, dec!(0.0001));
+        assert_eq!(p.lighter_open_qty, Decimal::ZERO);
+
+        // ext_min_qty=0.01 (ETH on Extended per #299) — 0.0001 < 0.01.
+        flush_sub_min_exit_residuals(&mut m, dec!(0.01), dec!(0.001), 1_300).unwrap();
+
+        assert_eq!(m.phase(), Phase::Flat);
+        assert!(m.position().is_none());
+    }
+
+    #[test]
+    fn flush_is_noop_when_both_legs_already_zero() {
+        let mut m = held_machine(SpreadDirection::Short, dec!(0.0228));
+        enter_exiting(&mut m);
+        m.apply(1_100, Event::ExtendedExitFilled { qty: dec!(0.0228) })
+            .unwrap();
+        m.apply(1_200, Event::LighterExitFilled { qty: dec!(0.0228) })
+            .unwrap();
+        // Auto-flat already fired — machine.position is None.
+        assert_eq!(m.phase(), Phase::Flat);
+
+        flush_sub_min_exit_residuals(&mut m, dec!(0.01), dec!(0.001), 1_300).unwrap();
+
+        // Idempotent on a flat machine — phase stays Flat, no panic.
+        assert_eq!(m.phase(), Phase::Flat);
+        assert!(m.position().is_none());
+    }
+
+    #[test]
+    fn flush_does_not_touch_residual_at_or_above_min_qty() {
+        // 0.0015 residual with lt_min_qty=0.001 → strictly NOT < min,
+        // so the chase loop would have re-submitted. Leave the residual
+        // intact so the next exit cycle / Emergency loop handles it.
+        let mut m = held_machine(SpreadDirection::Short, dec!(0.0228));
+        enter_exiting(&mut m);
+        m.apply(1_100, Event::ExtendedExitFilled { qty: dec!(0.0228) })
+            .unwrap();
+        m.apply(1_200, Event::LighterExitFilled { qty: dec!(0.0213) })
+            .unwrap();
+        assert_eq!(m.phase(), Phase::Exiting);
+        let p_before = m.position().unwrap().lighter_open_qty;
+        assert_eq!(p_before, dec!(0.0015));
+
+        flush_sub_min_exit_residuals(&mut m, dec!(0.01), dec!(0.001), 1_300).unwrap();
+
+        assert_eq!(
+            m.phase(),
+            Phase::Exiting,
+            "residual ≥ min must stay Exiting"
+        );
+        assert_eq!(m.position().unwrap().lighter_open_qty, dec!(0.0015));
+    }
+
+    #[test]
+    fn flush_is_disabled_when_min_qty_is_zero_back_compat() {
+        // Default config has *_min_qty=0 (#299/#331 opt-in). With the
+        // floor disabled, a sub-dust residual must NOT be auto-flushed
+        // — the legacy dust gate inside the chase loop is the only
+        // arbiter. This guards against an accidental policy change for
+        // bots that haven't opted in.
+        let mut m = held_machine(SpreadDirection::Short, dec!(0.0228));
+        enter_exiting(&mut m);
+        m.apply(1_100, Event::ExtendedExitFilled { qty: dec!(0.0228) })
+            .unwrap();
+        m.apply(1_200, Event::LighterExitFilled { qty: dec!(0.0221) })
+            .unwrap();
+        let residual = m.position().unwrap().lighter_open_qty;
+        assert_eq!(residual, dec!(0.0007));
+
+        flush_sub_min_exit_residuals(&mut m, Decimal::ZERO, Decimal::ZERO, 1_300).unwrap();
+
+        assert_eq!(m.phase(), Phase::Exiting);
+        assert_eq!(m.position().unwrap().lighter_open_qty, dec!(0.0007));
+    }
 }
