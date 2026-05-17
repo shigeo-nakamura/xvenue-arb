@@ -28,6 +28,7 @@ use crate::trade::execution::extended_maker::ExtendedEntryRequest;
 use crate::trade::execution::lighter_fill::LighterFillRequest;
 use crate::trade::execution::parallel_exit::{ParallelExitLoop, ParallelExitOutcome};
 use crate::trade::execution::types::{ExtendedTerminal, LighterTerminal};
+use crate::trade::execution::venue_ops::VenueOps;
 
 /// Handle `Decision::Exit(reason)` — the post-gate exit dispatch.
 /// Branches on dry-run vs live:
@@ -316,6 +317,27 @@ pub(super) async fn handle_decision_exit(
                         live.lt_min_qty,
                         now_ts_ms,
                     )?;
+                    // bot-strategy#418 re-open (2026-05-17): the sub-min
+                    // flush only handles residuals strictly below min_qty.
+                    // A trailing trade ≥ min_qty (observed 0.0043 ETH on
+                    // a post_only order's second WS trade event arriving
+                    // after the chase loop returned its terminal qty)
+                    // leaves the state machine at e.g.
+                    // `lighter_open_qty=0.0222` while the venue is
+                    // actually flat. Reconcile against the venue's own
+                    // position read so the machine reflects reality
+                    // before maybe_complete_flat runs.
+                    reconcile_open_qty_with_exchange(
+                        machine,
+                        &*live.ext_ops,
+                        &*live.lt_ops,
+                        &live.ext_symbol,
+                        &live.lt_symbol,
+                        live.dust_qty.max(live.ext_min_qty),
+                        live.dust_qty.max(live.lt_min_qty),
+                        now_ts_ms,
+                    )
+                    .await?;
 
                     // Happy path — compute realised PnL (#268 S5-1).
                     // If the ctx is missing (shouldn't happen but
@@ -458,6 +480,109 @@ fn flush_sub_min_exit_residuals(
             lt_min_qty,
         );
         machine.apply(now_ts_ms, Event::LighterExitFilled { qty: lt_residual })?;
+    }
+    Ok(())
+}
+
+/// bot-strategy#418 re-open (2026-05-17): catch the residual case that
+/// [`flush_sub_min_exit_residuals`] cannot — a trailing trade *larger*
+/// than `min_qty` that lands after the post_only chase loop's terminal
+/// poll. The chase loop returns `Filled { qty: first_trade }` and the
+/// state machine subtracts only that, but the venue settled the rest
+/// in a follow-up trade event that the chase loop's terminal already
+/// missed. The state thinks `open_qty=residual` while the exchange
+/// position is actually flat (or below dust_floor); without this
+/// reconciliation the machine stays in `Exiting` forever and the bot
+/// silently parks.
+///
+/// We ask each venue what *its* position currently is (cheap call — the
+/// connectors back this with their WS position cache) and treat a value
+/// below `dust_floor` as "the venue says we're flat, so trust that".
+/// We then apply a synthetic `*ExitFilled { qty: state_open }` so
+/// `maybe_complete_flat` can drain the position.
+///
+/// A `get_positions` failure surfaces as a `warn!` rather than `Err` —
+/// the exit path has already filled both legs, blocking the happy path
+/// because of a transient API hiccup would convert a recoverable stuck
+/// state into a forced restart.
+///
+/// `dust_floor` is the same `dust_qty.max(min_qty)` floor the chase
+/// loop's "treat as fully filled" gate uses (#299 / #331). A venue
+/// position at or above the floor is treated as a genuine partial —
+/// we leave the state residual untouched and emit a warn so the
+/// operator can investigate. The Both-happy-path completes; the next
+/// exit cycle / Emergency loop will pick the residual up.
+async fn reconcile_open_qty_with_exchange(
+    machine: &mut PositionMachine,
+    ext_ops: &dyn VenueOps,
+    lt_ops: &dyn VenueOps,
+    ext_symbol: &str,
+    lt_symbol: &str,
+    ext_dust_floor: Decimal,
+    lt_dust_floor: Decimal,
+    now_ts_ms: u64,
+) -> Result<()> {
+    let (ext_open, lt_open) = match machine.position() {
+        Some(p) => (p.extended_open_qty, p.lighter_open_qty),
+        None => return Ok(()),
+    };
+    if ext_open > Decimal::ZERO {
+        match ext_ops.current_position_size(ext_symbol).await {
+            Ok(exchange_qty) if exchange_qty < ext_dust_floor => {
+                log::info!(
+                    "[XVENUE] LIVE EXIT exchange reconcile ext: state={} \
+                     exchange={} (< dust_floor={}) — flushing state residual \
+                     (bot-strategy#418 re-open)",
+                    ext_open,
+                    exchange_qty,
+                    ext_dust_floor,
+                );
+                machine.apply(now_ts_ms, Event::ExtendedExitFilled { qty: ext_open })?;
+            }
+            Ok(exchange_qty) => log::warn!(
+                "[XVENUE] LIVE EXIT exchange reconcile ext: state={} \
+                 exchange={} (≥ dust_floor={}) — leaving state residual; \
+                 next cycle or Emergency loop will pick it up \
+                 (bot-strategy#418 re-open)",
+                ext_open,
+                exchange_qty,
+                ext_dust_floor,
+            ),
+            Err(e) => log::warn!(
+                "[XVENUE] LIVE EXIT exchange reconcile ext: get_positions \
+                 failed ({}); skipping reconcile (bot-strategy#418 re-open)",
+                e
+            ),
+        }
+    }
+    if lt_open > Decimal::ZERO {
+        match lt_ops.current_position_size(lt_symbol).await {
+            Ok(exchange_qty) if exchange_qty < lt_dust_floor => {
+                log::info!(
+                    "[XVENUE] LIVE EXIT exchange reconcile lt: state={} \
+                     exchange={} (< dust_floor={}) — flushing state residual \
+                     (bot-strategy#418 re-open)",
+                    lt_open,
+                    exchange_qty,
+                    lt_dust_floor,
+                );
+                machine.apply(now_ts_ms, Event::LighterExitFilled { qty: lt_open })?;
+            }
+            Ok(exchange_qty) => log::warn!(
+                "[XVENUE] LIVE EXIT exchange reconcile lt: state={} \
+                 exchange={} (≥ dust_floor={}) — leaving state residual; \
+                 next cycle or Emergency loop will pick it up \
+                 (bot-strategy#418 re-open)",
+                lt_open,
+                exchange_qty,
+                lt_dust_floor,
+            ),
+            Err(e) => log::warn!(
+                "[XVENUE] LIVE EXIT exchange reconcile lt: get_positions \
+                 failed ({}); skipping reconcile (bot-strategy#418 re-open)",
+                e
+            ),
+        }
     }
     Ok(())
 }
@@ -605,5 +730,165 @@ mod tests {
 
         assert_eq!(m.phase(), Phase::Exiting);
         assert_eq!(m.position().unwrap().lighter_open_qty, dec!(0.0007));
+    }
+
+    // ------------------------------------------------------------------
+    // bot-strategy#418 re-open (2026-05-17) — exchange reconcile tests.
+    // ------------------------------------------------------------------
+
+    use crate::trade::execution::venue_ops::ScriptedVenueOps;
+
+    fn scripted_with_position(symbol: &str, qty: Decimal) -> ScriptedVenueOps {
+        let ops = ScriptedVenueOps::new();
+        ops.with_state(|s| {
+            s.current_positions.insert(symbol.to_string(), qty);
+        });
+        ops
+    }
+
+    #[tokio::test]
+    async fn reconcile_flushes_lighter_residual_when_exchange_is_flat() {
+        // Reproduces the 2026-05-17 stuck-Exiting incident: a trailing
+        // 0.0043 ETH trade lands after the post_only chase loop's
+        // terminal returns Filled{qty:0.0006}, so state.lighter_open_qty
+        // ends at 0.0222 while the venue is actually flat. min_qty
+        // (=0.001) flush does NOT trigger because 0.0222 ≥ min_qty.
+        let mut m = held_machine(SpreadDirection::Short, dec!(0.0228));
+        enter_exiting(&mut m);
+        m.apply(1_100, Event::ExtendedExitFilled { qty: dec!(0.0228) })
+            .unwrap();
+        m.apply(1_200, Event::LighterExitFilled { qty: dec!(0.0006) })
+            .unwrap();
+        assert_eq!(m.phase(), Phase::Exiting);
+        assert_eq!(m.position().unwrap().lighter_open_qty, dec!(0.0222));
+
+        // sub-min flush correctly does NOT clear this residual (≥ min).
+        flush_sub_min_exit_residuals(&mut m, dec!(0.01), dec!(0.001), 1_300).unwrap();
+        assert_eq!(m.position().unwrap().lighter_open_qty, dec!(0.0222));
+
+        // Venue says position=0 → reconcile should flush the residual.
+        let ext_ops = ScriptedVenueOps::new();
+        let lt_ops = scripted_with_position("ETH", Decimal::ZERO);
+        reconcile_open_qty_with_exchange(
+            &mut m,
+            &ext_ops,
+            &lt_ops,
+            "ETH-USD",
+            "ETH",
+            dec!(0.01),
+            dec!(0.001),
+            1_400,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            m.phase(),
+            Phase::Flat,
+            "reconcile should flush lt residual → Flat"
+        );
+        assert!(m.position().is_none());
+    }
+
+    #[tokio::test]
+    async fn reconcile_flushes_extended_residual_when_exchange_is_flat() {
+        // Symmetric coverage for the Extended leg residual.
+        let mut m = held_machine(SpreadDirection::Long, dec!(0.022));
+        enter_exiting(&mut m);
+        m.apply(1_100, Event::ExtendedExitFilled { qty: dec!(0.005) })
+            .unwrap();
+        m.apply(1_200, Event::LighterExitFilled { qty: dec!(0.022) })
+            .unwrap();
+        assert_eq!(m.phase(), Phase::Exiting);
+        assert_eq!(m.position().unwrap().extended_open_qty, dec!(0.017));
+
+        flush_sub_min_exit_residuals(&mut m, dec!(0.01), dec!(0.001), 1_300).unwrap();
+        assert_eq!(m.position().unwrap().extended_open_qty, dec!(0.017));
+
+        let ext_ops = scripted_with_position("ETH-USD", Decimal::ZERO);
+        let lt_ops = ScriptedVenueOps::new();
+        reconcile_open_qty_with_exchange(
+            &mut m,
+            &ext_ops,
+            &lt_ops,
+            "ETH-USD",
+            "ETH",
+            dec!(0.01),
+            dec!(0.001),
+            1_400,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(m.phase(), Phase::Flat);
+        assert!(m.position().is_none());
+    }
+
+    #[tokio::test]
+    async fn reconcile_leaves_residual_when_exchange_still_has_position() {
+        // Genuine partial: venue position 0.015 ETH ≥ dust_floor (0.001).
+        // Don't fabricate a fill — the next cycle / Emergency loop will
+        // pick the residual up. Phase stays Exiting.
+        let mut m = held_machine(SpreadDirection::Short, dec!(0.0228));
+        enter_exiting(&mut m);
+        m.apply(1_100, Event::ExtendedExitFilled { qty: dec!(0.0228) })
+            .unwrap();
+        m.apply(1_200, Event::LighterExitFilled { qty: dec!(0.0078) })
+            .unwrap();
+        assert_eq!(m.position().unwrap().lighter_open_qty, dec!(0.0150));
+
+        let ext_ops = ScriptedVenueOps::new();
+        let lt_ops = scripted_with_position("ETH", dec!(0.0150));
+        reconcile_open_qty_with_exchange(
+            &mut m,
+            &ext_ops,
+            &lt_ops,
+            "ETH-USD",
+            "ETH",
+            dec!(0.01),
+            dec!(0.001),
+            1_400,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            m.phase(),
+            Phase::Exiting,
+            "genuine partial must keep Exiting for follow-up"
+        );
+        assert_eq!(m.position().unwrap().lighter_open_qty, dec!(0.0150));
+    }
+
+    #[tokio::test]
+    async fn reconcile_is_noop_when_state_already_flat() {
+        // Clean exit (both legs fully filled in the chase loop) →
+        // maybe_complete_flat already fired, no residual, no venue call
+        // needed. The function must early-return on no-position.
+        let mut m = held_machine(SpreadDirection::Short, dec!(0.0228));
+        enter_exiting(&mut m);
+        m.apply(1_100, Event::ExtendedExitFilled { qty: dec!(0.0228) })
+            .unwrap();
+        m.apply(1_200, Event::LighterExitFilled { qty: dec!(0.0228) })
+            .unwrap();
+        assert_eq!(m.phase(), Phase::Flat);
+
+        let ext_ops = ScriptedVenueOps::new();
+        let lt_ops = ScriptedVenueOps::new();
+        reconcile_open_qty_with_exchange(
+            &mut m,
+            &ext_ops,
+            &lt_ops,
+            "ETH-USD",
+            "ETH",
+            dec!(0.01),
+            dec!(0.001),
+            1_400,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(m.phase(), Phase::Flat);
+        assert!(m.position().is_none());
     }
 }

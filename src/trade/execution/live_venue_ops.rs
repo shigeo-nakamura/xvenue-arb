@@ -241,6 +241,23 @@ impl VenueOps for LiveVenueOps {
     async fn is_upcoming_maintenance(&self, hours_ahead: i64) -> bool {
         self.conn.is_upcoming_maintenance(hours_ahead).await
     }
+
+    async fn current_position_size(&self, symbol: &str) -> Result<Decimal> {
+        let positions = self
+            .conn
+            .get_positions()
+            .await
+            .map_err(|e| anyhow!("get_positions {}: {}", symbol, e))?;
+        // PositionSnapshot.size is the unsigned magnitude (sign lives in
+        // `.sign`); the chase loop and state machine both deal in absolute
+        // qtys, so we mirror that convention. Returns 0 when the venue
+        // holds no position for the symbol (the natural "flat" state).
+        Ok(positions
+            .iter()
+            .find(|p| p.symbol == symbol)
+            .map(|p| p.size)
+            .unwrap_or(Decimal::ZERO))
+    }
 }
 
 #[cfg(test)]

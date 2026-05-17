@@ -127,6 +127,18 @@ pub trait VenueOps: Send + Sync {
     async fn is_upcoming_maintenance(&self, _hours_ahead: i64) -> bool {
         false
     }
+
+    /// Absolute size of the current open position for `symbol` (returns
+    /// `0` when the venue holds no position). Exit dispatch consults
+    /// this to reconcile the state machine's `*_open_qty` against the
+    /// actual venue position when the post_only chase loop's terminal
+    /// under-reports a trailing trade that arrived after the loop
+    /// returned (bot-strategy#418 re-open 2026-05-17). Default returns
+    /// `0` so impls that don't matter for this reconciliation (e.g.
+    /// scripted mocks for unrelated tests) stay opt-out.
+    async fn current_position_size(&self, _symbol: &str) -> Result<Decimal> {
+        Ok(Decimal::ZERO)
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -165,6 +177,11 @@ pub struct ScriptedVenueOpsState {
     pub cancel: VecDeque<ScriptedResponse>,
     pub poll_fill: VecDeque<ScriptedResponse>,
     pub close_all: VecDeque<ScriptedResponse>,
+
+    /// Per-symbol mock position size returned by
+    /// [`VenueOps::current_position_size`]. Defaults to empty (= 0 for
+    /// any symbol) so tests that don't care can ignore it.
+    pub current_positions: std::collections::HashMap<String, Decimal>,
 
     /// Default fill status returned when the `poll_fill` queue is
     /// empty. Tests that don't care about polling ordering can set
@@ -339,6 +356,14 @@ impl VenueOps for ScriptedVenueOps {
             Some(ScriptedResponse::Err(msg)) => Err(anyhow::anyhow!(msg)),
             _ => Ok(()),
         }
+    }
+
+    async fn current_position_size(&self, symbol: &str) -> Result<Decimal> {
+        let g = self.inner.lock().unwrap();
+        Ok(g.current_positions
+            .get(symbol)
+            .copied()
+            .unwrap_or(Decimal::ZERO))
     }
 }
 
