@@ -58,6 +58,14 @@ pub(crate) struct MakerLoopParams {
     /// Extended (#298) takes a fill that races the cancel by polling
     /// before sending cancel. Lighter (#322 taker) cancels first.
     pub taker_grace_before_cancel: bool,
+    /// bot-strategy#424 (Option B from #328): when `Some(tick)` and the
+    /// request is `reduce_only=true` (i.e. an exit-side post_only),
+    /// improve the touch by 1 tick to become the new best bid/ask
+    /// instead of joining the existing touch. `None` keeps the legacy
+    /// join-touch behavior on every round, which is what entry-side
+    /// post_only still uses. Extended currently runs taker-only on
+    /// xvenue-arb so this is opt-in via the Lighter wrapper only.
+    pub exit_improve_tick: Option<Decimal>,
 }
 
 /// Shape-identical to the per-venue Request structs (Extended /
@@ -179,7 +187,7 @@ async fn run_one_chase_round<V: VenueOps + ?Sized>(
             return Err(ExecutionFailure::VenueRejected);
         }
     };
-    let price = price_for_post_only(req.side, &book);
+    let price = price_for_post_only(req.side, &book, req.reduce_only, params.exit_improve_tick);
     if price <= Decimal::ZERO {
         return Err(ExecutionFailure::VenueRejected);
     }
@@ -398,11 +406,29 @@ async fn maybe_taker_grace_repoll<V: VenueOps + ?Sized>(
     }
 }
 
-fn price_for_post_only(side: OrderSide, book: &TopOfBook) -> Decimal {
-    match side {
-        // Buy post-only at the best bid (rest passively).
+fn price_for_post_only(
+    side: OrderSide,
+    book: &TopOfBook,
+    reduce_only: bool,
+    exit_improve_tick: Option<Decimal>,
+) -> Decimal {
+    let base = match side {
+        // Buy post-only at the best bid (rest passively, entry path).
         OrderSide::Long => book.best_bid,
-        // Sell post-only at the best ask.
+        // Sell post-only at the best ask (rest passively, entry path).
         OrderSide::Short => book.best_ask,
+    };
+    // bot-strategy#424: exit-side post_only improves by 1 tick to
+    // become the new touch. Joining the touch fails at exit time
+    // because the touch is in active flux around MeanCross and the
+    // post_only validator rejects crossed quotes; improving puts us
+    // 1 tick inside the spread so we're the new touch and aggressors
+    // walking through it hit us.
+    match (reduce_only, exit_improve_tick) {
+        (true, Some(tick)) if tick > Decimal::ZERO => match side {
+            OrderSide::Long => base + tick,   // exit buy → improve bid 1 tick up
+            OrderSide::Short => base - tick,  // exit sell → improve ask 1 tick down
+        },
+        _ => base,
     }
 }

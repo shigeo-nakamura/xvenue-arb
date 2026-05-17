@@ -82,6 +82,7 @@ lighter_chase_timeout_ms: 1500
 lighter_chase_grace_poll_ms: 500      # #322: post-cancel grace re-poll for chase rounds (catches WS-lag late fills before next round places fresh order)
 lighter_taker_grace_poll_ms: 1000     # #322: same grace re-poll for the taker fallback round (mirrors extended_taker_grace_poll_ms / #298)
 lighter_taker_fallback: true          # if chase rounds fail, taker the residual so cross-venue exposure doesn't dangle
+lighter_exit_improve_tick: 0.01       # bot-strategy#424 (Option B from #328): exit-side post_only improves the touch by 1 tick (= 0.01 USD ≈ 0.5 bps for ETH) instead of joining, so MeanCross exits become the new touch and aggressors hit. Entry side still joins (works at 41% maker share). 0 disables for back-compat.
 lighter_min_qty: 0.001                # bot-strategy#331 (Lighter mirror of #299): Lighter ETH post_only minimum. Live evidence (2026-05-05) showed Lighter rejects post_only with code:21706 on `base_amount=1` (=0.0001 ETH ≈ $0.24) when a previous chase round's partial fill leaves a sub-lot residual. 0.001 ETH (~$2.40) sits above the rejection floor and well below the 5% equity trade size (~0.021 ETH at $50 notional), so a sub-min residual after a partial fill is treated as fully filled instead of producing a noisy WARN that auto-files an error-watch issue.
 # Legacy LighterFillLoop knobs — still active on the EXIT side via
 # ParallelExitLoop. Keep set so a future revert to lighter_post_only:false

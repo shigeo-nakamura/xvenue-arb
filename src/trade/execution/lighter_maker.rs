@@ -121,6 +121,14 @@ impl<'a, V: VenueOps + ?Sized> LighterMakerLoop<'a, V> {
             poll_interval_ms: self.poll_interval_ms,
             chase_uses_venue_min_floor: true,
             taker_grace_before_cancel: false,
+            // bot-strategy#424: opt-in via YAML `lighter_exit_improve_tick`.
+            // 0 (default) → None → legacy join-touch behaviour. >0 → Some(t)
+            // → reduce_only requests improve the touch by `t` units.
+            exit_improve_tick: if self.cfg.exit_improve_tick > Decimal::ZERO {
+                Some(self.cfg.exit_improve_tick)
+            } else {
+                None
+            },
         };
         let shared_req = MakerRequest {
             symbol: req.symbol,
@@ -176,6 +184,7 @@ mod tests {
             post_only: true,
             chase_grace_poll_ms: 0,
             taker_grace_poll_ms: 0,
+            exit_improve_tick: Decimal::ZERO,
         }
     }
 
@@ -191,6 +200,7 @@ mod tests {
             post_only: true,
             chase_grace_poll_ms: 0,
             taker_grace_poll_ms: 0,
+            exit_improve_tick: Decimal::ZERO,
         }
     }
 
@@ -341,6 +351,124 @@ mod tests {
         let (_, _, _, price, _) = &posts[0];
         // Long → buy post-only at best_bid (2000)
         assert_eq!(*price, dec!(2000));
+    }
+
+    /// bot-strategy#424 Option B: when `exit_improve_tick > 0` and the
+    /// request is `reduce_only=true`, the post_only price improves the
+    /// touch by `tick` instead of joining it.
+    #[tokio::test(start_paused = true)]
+    async fn exit_post_only_improves_touch_by_tick() {
+        let ops = primed_book(dec!(2000), dec!(2001));
+        ops.with_state(|s| {
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.5),
+                    terminal: true,
+                    cancelled: false,
+                }));
+        });
+        let mut cfg = cfg_with_taker_fallback();
+        cfg.exit_improve_tick = dec!(0.01);
+        let lp = LighterMakerLoop::new(&ops, &cfg).with_poll_interval(10);
+        // reduce_only=true (exit-side) + Short → SELL improved 1 tick
+        // BELOW best_ask: 2001.00 - 0.01 = 2000.99.
+        let req = LighterMakerRequest {
+            symbol: "ETH".to_string(),
+            side: OrderSide::Short,
+            target_qty: dec!(0.5),
+            dust_qty: Decimal::ZERO,
+            venue_min_qty: Decimal::ZERO,
+            reduce_only: true,
+        };
+        let _ = lp.run(req).await;
+        let posts = ops.snapshot_posts();
+        let (_, _, _, price, _) = &posts[0];
+        assert_eq!(*price, dec!(2000.99));
+    }
+
+    /// Symmetric coverage: exit-side Long (e.g. closing a short Lighter
+    /// position) improves the bid 1 tick UP.
+    #[tokio::test(start_paused = true)]
+    async fn exit_post_only_improves_bid_for_long() {
+        let ops = primed_book(dec!(2000), dec!(2001));
+        ops.with_state(|s| {
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.5),
+                    terminal: true,
+                    cancelled: false,
+                }));
+        });
+        let mut cfg = cfg_with_taker_fallback();
+        cfg.exit_improve_tick = dec!(0.01);
+        let lp = LighterMakerLoop::new(&ops, &cfg).with_poll_interval(10);
+        let req = LighterMakerRequest {
+            symbol: "ETH".to_string(),
+            side: OrderSide::Long,
+            target_qty: dec!(0.5),
+            dust_qty: Decimal::ZERO,
+            venue_min_qty: Decimal::ZERO,
+            reduce_only: true,
+        };
+        let _ = lp.run(req).await;
+        let posts = ops.snapshot_posts();
+        let (_, _, _, price, _) = &posts[0];
+        // Long exit → BUY improved 1 tick ABOVE best_bid: 2000 + 0.01 = 2000.01
+        assert_eq!(*price, dec!(2000.01));
+    }
+
+    /// Back-compat: entry-side post_only ignores `exit_improve_tick`
+    /// even when set (only `reduce_only=true` triggers the improve).
+    #[tokio::test(start_paused = true)]
+    async fn entry_post_only_ignores_improve_tick() {
+        let ops = primed_book(dec!(2000), dec!(2001));
+        ops.with_state(|s| {
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.5),
+                    terminal: true,
+                    cancelled: false,
+                }));
+        });
+        let mut cfg = cfg_with_taker_fallback();
+        cfg.exit_improve_tick = dec!(0.01);
+        let lp = LighterMakerLoop::new(&ops, &cfg).with_poll_interval(10);
+        // reduce_only=false (entry) → join touch regardless of tick.
+        let _ = lp.run(req_long(dec!(0.5))).await;
+        let posts = ops.snapshot_posts();
+        let (_, _, _, price, _) = &posts[0];
+        assert_eq!(*price, dec!(2000));
+    }
+
+    /// Back-compat: `exit_improve_tick=0` keeps legacy join-touch even
+    /// for reduce_only=true requests. This is the default for bots
+    /// that haven't opted in via YAML.
+    #[tokio::test(start_paused = true)]
+    async fn exit_with_zero_tick_falls_back_to_join_touch() {
+        let ops = primed_book(dec!(2000), dec!(2001));
+        ops.with_state(|s| {
+            s.poll_fill
+                .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_qty: dec!(0.5),
+                    terminal: true,
+                    cancelled: false,
+                }));
+        });
+        let cfg = cfg_with_taker_fallback(); // exit_improve_tick stays 0
+        let lp = LighterMakerLoop::new(&ops, &cfg).with_poll_interval(10);
+        let req = LighterMakerRequest {
+            symbol: "ETH".to_string(),
+            side: OrderSide::Short,
+            target_qty: dec!(0.5),
+            dust_qty: Decimal::ZERO,
+            venue_min_qty: Decimal::ZERO,
+            reduce_only: true,
+        };
+        let _ = lp.run(req).await;
+        let posts = ops.snapshot_posts();
+        let (_, _, _, price, _) = &posts[0];
+        // Falls back to join-touch (best_ask = 2001).
+        assert_eq!(*price, dec!(2001));
     }
 
     /// Push N non-terminal poll responses. The grace-poll tests need

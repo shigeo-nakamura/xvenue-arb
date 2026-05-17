@@ -330,6 +330,7 @@ mod tests {
             post_only: false,
             chase_grace_poll_ms: 0,
             taker_grace_poll_ms: 0,
+            exit_improve_tick: Decimal::ZERO,
         }
     }
 

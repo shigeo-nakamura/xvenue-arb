@@ -115,6 +115,11 @@ impl<'a, V: VenueOps + ?Sized> ExtendedMakerLoop<'a, V> {
             poll_interval_ms: self.poll_interval_ms,
             chase_uses_venue_min_floor: false,
             taker_grace_before_cancel: true,
+            // Extended currently runs taker-only on xvenue-arb (#302),
+            // so the exit-side improve path (#424) is unused here. Opt
+            // out by passing None — keeps legacy join-touch if Extended
+            // post_only is ever re-enabled.
+            exit_improve_tick: None,
         };
         let shared_req = MakerRequest {
             symbol: req.symbol,

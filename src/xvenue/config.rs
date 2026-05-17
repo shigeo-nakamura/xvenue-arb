@@ -16,6 +16,7 @@ use std::fs::File;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use rust_decimal::Decimal;
 use serde::Deserialize;
 
 use super::signal::{SignalConfig, SignalMode};
@@ -181,6 +182,14 @@ pub struct XvenueConfig {
     /// fallback round. Mirrors `extended_taker_grace_poll_ms` (#298).
     #[serde(default = "default_lighter_taker_grace_poll_ms")]
     pub lighter_taker_grace_poll_ms: u64,
+    /// bot-strategy#424 (Option B from #328): when > 0 and the Lighter
+    /// request is `reduce_only=true` (exit-side post_only), improve
+    /// the touch by this many price units instead of joining the
+    /// existing best bid/ask. 0 (default) keeps the legacy join-touch
+    /// behaviour for back-compat. For Lighter ETH the natural value
+    /// is 0.01 (= 1 cent = ~0.5 bps at $2200).
+    #[serde(default)]
+    pub lighter_exit_improve_tick: Decimal,
     /// bot-strategy#331 (Lighter mirror of #299): per-asset Lighter
     /// venue minimum order size. The chase loop's "remaining ≤ floor"
     /// gate uses `dust_qty.max(lighter_min_qty)`, so a residual below
@@ -497,6 +506,7 @@ impl XvenueConfig {
             post_only: self.lighter_post_only,
             chase_grace_poll_ms: self.lighter_chase_grace_poll_ms,
             taker_grace_poll_ms: self.lighter_taker_grace_poll_ms,
+            exit_improve_tick: self.lighter_exit_improve_tick,
         }
     }
 

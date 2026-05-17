@@ -192,6 +192,22 @@ pub struct LighterMakerConfig {
     /// Mirrors `ExtendedMakerConfig::taker_grace_poll_ms`. 0 disables.
     /// `lighter_taker_grace_poll_ms` in YAML.
     pub taker_grace_poll_ms: u64,
+    /// bot-strategy#424 (Option B from #328): when > 0 AND the request
+    /// is `reduce_only=true` (exit-side), improve the touch by this
+    /// many price units to become the new best bid/ask instead of
+    /// joining the existing touch. `lighter_exit_improve_tick` in
+    /// YAML. 0 (default) keeps the legacy join-touch behaviour for
+    /// back-compat with bots that haven't opted in yet.
+    ///
+    /// Rationale: live observation #328 showed exit-side maker share
+    /// stuck at 21% (vs entry 41%) because the touch is in active
+    /// flux at MeanCross — post_only quotes at the touch are either
+    /// crossed-on-arrival (rejected by the post_only validator) or
+    /// stranded behind the new touch (no aggressor reaches). 1-tick
+    /// improvement (0.01 USD for Lighter ETH) gives up half a basis
+    /// point of inside spread but converts the quote into the new
+    /// touch, where the next aggressor walking the spread will hit.
+    pub exit_improve_tick: Decimal,
 }
 
 impl LighterMakerConfig {
@@ -365,6 +381,7 @@ mod tests {
             post_only: true,
             chase_grace_poll_ms: 0,
             taker_grace_poll_ms: 0,
+            exit_improve_tick: Decimal::ZERO,
         };
         assert!(cfg.validate().is_err());
     }
@@ -382,6 +399,7 @@ mod tests {
             post_only: true,
             chase_grace_poll_ms: 0,
             taker_grace_poll_ms: 0,
+            exit_improve_tick: Decimal::ZERO,
         };
         assert!(cfg.validate().is_err());
     }
@@ -401,6 +419,7 @@ mod tests {
             post_only: false,
             chase_grace_poll_ms: 0,
             taker_grace_poll_ms: 0,
+            exit_improve_tick: Decimal::ZERO,
         };
         assert!(cfg.validate().is_ok());
     }
@@ -418,6 +437,7 @@ mod tests {
             post_only: true,
             chase_grace_poll_ms: 0,
             taker_grace_poll_ms: 0,
+            exit_improve_tick: Decimal::ZERO,
         };
         assert_eq!(cfg.worst_case_budget_ms(), 1_000);
         // chase_retries=0 still costs at least one round.
