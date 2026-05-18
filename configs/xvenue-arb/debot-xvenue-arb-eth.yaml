@@ -111,7 +111,7 @@ lighter_fill_timeout_ms: 1000
 # ---- Risk ----
 ws_stale_emergency_ms: 5000
 max_inventory_skew_usd: 50.0
-leg_mismatch_timeout_ms: 10000   # bot-strategy#288: must exceed Extended chase + taker budget. extended_chase_retries=3 × extended_chase_timeout_ms=2000 + 1 taker round × 2000 = 8 s; 10 s leaves 2 s buffer. Below this, the 2026-05-03 round-trip pattern (Lighter fills in ~1 s, Extended still chasing) triggers leg-mismatch every exit and forces the IOC 50bps emergency close.
+leg_mismatch_timeout_ms: 15000   # bot-strategy#288 + #428: bumped 10000 → 15000 on 2026-05-18 after the threshold-loosened window observed 7 leg-mismatch EmergencyFlattening events in 4 h (28% of entries). Root cause: Lighter taker IOC reports filled=0 because the connector's WS cache hasn't propagated the fill yet; the per-round 3 s taker grace-poll wants to wait but loses the race to leg_mismatch_timeout when the post-only chase has already burned ~7 s. With 15 s, grace-poll has time to recover the fill. Cost: ≤5 s extra naked-Extended exposure in the rare *true* Lighter-failure case (≈5 bps). No effect on entry/exit signal logic or chase budgets. See bot-strategy#428 comment 2026-05-18.
 kill_switch_file: /opt/debot/KILL_SWITCH   # external operator pause — pairtrade-symmetric (#244 D-1)
 stuck_file: /var/run/xvenue-arb/STUCK      # runner self-write on unrecoverable emergency (#244 D-2..6 follow-up)
 emergency_retry_interval_ms: 30000     # slow-mm 167-min stuck fix (docs/execution_layer.md §5)
