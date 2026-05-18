@@ -9,6 +9,7 @@ pub mod bt_grid;
 pub mod config;
 mod emergency_handlers;
 mod entry_dispatch;
+mod entry_filter;
 mod exit_dispatch;
 pub mod live;
 pub mod live_exec;
