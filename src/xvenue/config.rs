@@ -204,6 +204,30 @@ pub struct XvenueConfig {
     #[serde(default = "default_lighter_min_qty")]
     pub lighter_min_qty: f64,
 
+    // ---- Defensive entry filter (bot-strategy#429) ----
+    /// Rolling-window size in seconds for the entry filter's recent-
+    /// quote ring buffer. With `spread_bucket_ms = 5000` (default), a
+    /// 60s window holds ~12 samples. Larger windows make the filter
+    /// more sensitive to historical regime instability; smaller ones
+    /// make it more responsive to immediate quote state.
+    #[serde(default = "default_entry_filter_window_sec")]
+    pub entry_filter_window_sec: u64,
+    /// Block new entries when the rolling-max of `lt_inside_bps` over
+    /// the recent window exceeds this threshold. Predicts ForceClose
+    /// risk: in the 2026-05-17/18 24h LIVE window, every ForceClose
+    /// cycle was preceded (≤30s) by a `lt_inside_bps` spike of 5+ bps
+    /// from the typical ~0.5 bps baseline. `None` (default) disables.
+    #[serde(default)]
+    pub entry_filter_lt_inside_max_bps: Option<f64>,
+    /// Block new entries when either side's `lt_bid_size` or
+    /// `lt_ask_size` minimum over the recent window falls below this
+    /// floor (in ETH). The pre-ForceClose pattern showed lt_bid_sz
+    /// collapsing to ~0.06 ETH 10s before entry; current-snapshot
+    /// depth checks miss this because the book partially refills by
+    /// entry time. `None` (default) disables.
+    #[serde(default)]
+    pub entry_filter_lt_min_depth_eth: Option<f64>,
+
     // ---- Realised PnL fees (#268 S5-1) ----
     /// Per-side fee rate the realised-PnL helper subtracts on each
     /// venue leg (entry + exit). Default 5 bps for Extended is the
@@ -627,6 +651,9 @@ fn default_lighter_taker_grace_poll_ms() -> u64 {
 }
 fn default_lighter_min_qty() -> f64 {
     0.0
+}
+fn default_entry_filter_window_sec() -> u64 {
+    60
 }
 fn default_signal_mode() -> String {
     "mid_to_mid".to_string()

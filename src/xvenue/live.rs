@@ -177,6 +177,12 @@ pub struct LivePaperSummary {
     /// for the maker fill premise to hold). 0 when the filter is
     /// disabled (`lt_book_max_eth: None`).
     pub entries_blocked_by_book_depth: u64,
+    /// bot-strategy#429: count of `Decision::Enter` outcomes dropped
+    /// because the defensive entry filter observed an unhealthy Lighter
+    /// regime over the recent rolling window (inside-spread spike
+    /// and/or top-of-book depth collapse). 0 when both filter
+    /// thresholds are disabled in YAML.
+    pub entries_blocked_by_entry_filter: u64,
     /// bot-strategy#309 step 5: would-be maker fill telemetry, only
     /// populated in paper-mode (dry_run + no live executor). Each
     /// `Decision::Enter` increments `attempts`, the depth-conditional
@@ -462,6 +468,12 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
     status_ivl.tick().await; // discard the immediate-fire tick
     let mut open_qty: Option<Decimal> = None;
     let mut warmup = VenueWarmup::default();
+    // bot-strategy#429: rolling-window quote history for the defensive
+    // entry filter. Always live; the filter itself is opt-in via the
+    // two `entry_filter_lt_*` thresholds, so when neither is set this
+    // costs ~one push per tick and does not gate anything.
+    let mut quote_history =
+        super::entry_filter::RecentQuoteHistory::new(cfg.entry_filter_window_sec);
     // Emergency-flatten throttle state (#244 Sprint 4 step 3/3).
     // Reset whenever phase != EmergencyFlattening so each entry into
     // the flatten loop starts with a fresh attempt budget. The
@@ -532,6 +544,7 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                     &mut skew_monitor,
                     live_exec.as_deref(),
                     &mut live_entry_ctx,
+                    &mut quote_history,
                 ).await {
                     // Read-mid / decision errors are logged but don't
                     // terminate the loop. Phase 3 will add a consec-fail
@@ -885,6 +898,7 @@ async fn drive_emergency_flatten_round(
 mod tests {
     use super::super::emergency_handlers::book_depth_blocks_entry;
     use super::super::entry_dispatch::handle_decision_enter;
+    use super::super::entry_filter::RecentQuoteHistory;
     use super::super::exit_dispatch::handle_decision_exit;
     use super::super::live_pnl::{
         compute_realised_pnl, paper_pnl_projection, would_be_maker_fill_outcome,
@@ -1320,6 +1334,7 @@ max_hold_sec: 60
         let mut warmup = VenueWarmup::default();
         let mut ws_health = WsHealthMonitor::new(0);
         let mut skew_monitor = SkewMonitor::new(0.0);
+        let mut quote_history = RecentQuoteHistory::new(0);
         run_one_tick(
             &cfg,
             &*hub,
@@ -1337,6 +1352,7 @@ max_hold_sec: 60
             &mut skew_monitor,
             None,
             &mut None,
+            &mut quote_history,
         )
         .await
         .unwrap();
@@ -1361,6 +1377,7 @@ max_hold_sec: 60
         let mut warmup = VenueWarmup::default();
         let mut ws_health = WsHealthMonitor::new(0);
         let mut skew_monitor = SkewMonitor::new(0.0);
+        let mut quote_history = RecentQuoteHistory::new(0);
         run_one_tick(
             &cfg,
             &*hub,
@@ -1378,6 +1395,7 @@ max_hold_sec: 60
             &mut skew_monitor,
             None,
             &mut None,
+            &mut quote_history,
         )
         .await
         .unwrap();
@@ -1432,6 +1450,7 @@ max_hold_sec: 60
         let mut ws_health = WsHealthMonitor::new(0);
         let mut skew_monitor = SkewMonitor::new(0.0);
         for _ in 0..total_ticks {
+            let mut quote_history = RecentQuoteHistory::new(0);
             run_one_tick(
                 &cfg,
                 &*hub,
@@ -1449,6 +1468,7 @@ max_hold_sec: 60
                 &mut skew_monitor,
                 None,
                 &mut None,
+                &mut quote_history,
             )
             .await
             .unwrap();
@@ -1511,6 +1531,7 @@ max_hold_sec: 60
         let mut ws_health = WsHealthMonitor::new(0);
         let mut skew_monitor = SkewMonitor::new(0.0);
         for _ in 0..(warm_n + breach_n) {
+            let mut quote_history = RecentQuoteHistory::new(0);
             run_one_tick(
                 &cfg,
                 &*hub,
@@ -1528,6 +1549,7 @@ max_hold_sec: 60
                 &mut skew_monitor,
                 None,
                 &mut None,
+                &mut quote_history,
             )
             .await
             .unwrap();
@@ -1584,6 +1606,7 @@ max_hold_sec: 60
         let mut ws_health = WsHealthMonitor::new(0);
         let mut skew_monitor = SkewMonitor::new(0.0);
         for _ in 0..(warm_n + breach_n) {
+            let mut quote_history = RecentQuoteHistory::new(0);
             run_one_tick(
                 &cfg,
                 &*hub,
@@ -1601,6 +1624,7 @@ max_hold_sec: 60
                 &mut skew_monitor,
                 None,
                 &mut None,
+                &mut quote_history,
             )
             .await
             .unwrap();
@@ -1656,6 +1680,7 @@ max_hold_sec: 60
         let mut ws_health = WsHealthMonitor::new(0);
         let mut skew_monitor = SkewMonitor::new(0.0);
         for _ in 0..(warm_n + breach_n) {
+            let mut quote_history = RecentQuoteHistory::new(0);
             run_one_tick(
                 &cfg,
                 &*hub,
@@ -1673,6 +1698,7 @@ max_hold_sec: 60
                 &mut skew_monitor,
                 None,
                 &mut None,
+                &mut quote_history,
             )
             .await
             .unwrap();
@@ -1754,6 +1780,7 @@ max_hold_sec: 60
         // attempted (run_one_tick reads Extended first), so neither
         // venue is marked ready.
         for _ in 0..2 {
+            let mut quote_history = RecentQuoteHistory::new(0);
             run_one_tick(
                 &cfg,
                 &*hub,
@@ -1771,6 +1798,7 @@ max_hold_sec: 60
                 &mut skew_monitor,
                 None,
                 &mut None,
+                &mut quote_history,
             )
             .await
             .expect("warm-up errors must not propagate");
@@ -1784,6 +1812,7 @@ max_hold_sec: 60
         // first two ticks since reads are sequential), so Lighter
         // returns Err. Because lt_ready is still false, run_one_tick
         // again returns Ok(()) silently.
+        let mut quote_history = RecentQuoteHistory::new(0);
         run_one_tick(
             &cfg,
             &*hub,
@@ -1801,6 +1830,7 @@ max_hold_sec: 60
             &mut skew_monitor,
             None,
             &mut None,
+            &mut quote_history,
         )
         .await
         .expect("warm-up errors must not propagate");
@@ -1810,6 +1840,7 @@ max_hold_sec: 60
         // Two more ticks drain Lighter's fail counter; the next tick
         // after that produces a successful read on both legs.
         for _ in 0..2 {
+            let mut quote_history = RecentQuoteHistory::new(0);
             run_one_tick(
                 &cfg,
                 &*hub,
@@ -1827,10 +1858,12 @@ max_hold_sec: 60
                 &mut skew_monitor,
                 None,
                 &mut None,
+                &mut quote_history,
             )
             .await
             .expect("warm-up errors must not propagate");
         }
+        let mut quote_history = RecentQuoteHistory::new(0);
         run_one_tick(
             &cfg,
             &*hub,
@@ -1848,6 +1881,7 @@ max_hold_sec: 60
             &mut skew_monitor,
             None,
             &mut None,
+            &mut quote_history,
         )
         .await
         .expect("post-warmup tick must succeed");
@@ -1893,6 +1927,7 @@ max_hold_sec: 60
         let mut ws_health = WsHealthMonitor::new(0);
         let mut skew_monitor = SkewMonitor::new(0.0);
         let hub = AlwaysFailHub;
+        let mut quote_history = RecentQuoteHistory::new(0);
         let err = run_one_tick(
             &cfg,
             &hub,
@@ -1910,6 +1945,7 @@ max_hold_sec: 60
             &mut skew_monitor,
             None,
             &mut None,
+            &mut quote_history,
         )
         .await
         .expect_err("post-warmup read_mid Err must propagate as Err");
@@ -1969,6 +2005,7 @@ max_hold_sec: 60
         let hub = LighterFailHub {
             ext_mid: Decimal::from(2000),
         };
+        let mut quote_history = RecentQuoteHistory::new(0);
         let err = run_one_tick(
             &cfg,
             &hub,
@@ -1986,6 +2023,7 @@ max_hold_sec: 60
             &mut skew_monitor,
             None,
             &mut None,
+            &mut quote_history,
         )
         .await
         .expect_err("post-warmup Lighter read_mid Err must propagate");
@@ -2085,6 +2123,7 @@ emergency_complete_grace_ms: 0  # tests assert immediate-complete on zero (#287 
         let mut ws_health = WsHealthMonitor::new(0);
         let mut skew_monitor = SkewMonitor::new(0.0);
         let mut live_entry_ctx: Option<LiveEntryCtx> = None;
+        let mut quote_history = RecentQuoteHistory::new(cfg.entry_filter_window_sec);
         for _ in 0..iters {
             run_one_tick(
                 cfg,
@@ -2103,6 +2142,7 @@ emergency_complete_grace_ms: 0  # tests assert immediate-complete on zero (#287 
                 &mut skew_monitor,
                 Some(live),
                 &mut live_entry_ctx,
+                &mut quote_history,
             )
             .await
             .unwrap();
@@ -3578,6 +3618,7 @@ leg_mismatch_timeout_ms: 100
         let mut skew_monitor = SkewMonitor::new(0.0);
         let mut live_entry_ctx: Option<LiveEntryCtx> = None;
 
+        let mut quote_history = RecentQuoteHistory::new(0);
         run_one_tick(
             &cfg,
             &*hub,
@@ -3595,6 +3636,7 @@ leg_mismatch_timeout_ms: 100
             &mut skew_monitor,
             Some(&live),
             &mut live_entry_ctx,
+            &mut quote_history,
         )
         .await
         .unwrap();
@@ -3653,6 +3695,7 @@ leg_mismatch_timeout_ms: 100
         let mut live_entry_ctx: Option<LiveEntryCtx> = None;
 
         for _ in 0..3 {
+            let mut quote_history = RecentQuoteHistory::new(0);
             run_one_tick(
                 &cfg,
                 &*hub,
@@ -3670,6 +3713,7 @@ leg_mismatch_timeout_ms: 100
                 &mut skew_monitor,
                 Some(&live),
                 &mut live_entry_ctx,
+                &mut quote_history,
             )
             .await
             .unwrap();
@@ -3712,6 +3756,7 @@ leg_mismatch_timeout_ms: 100
         let mut skew_monitor = SkewMonitor::new(0.0);
         let mut live_entry_ctx: Option<LiveEntryCtx> = None;
 
+        let mut quote_history = RecentQuoteHistory::new(0);
         run_one_tick(
             &cfg,
             &*hub,
@@ -3729,6 +3774,7 @@ leg_mismatch_timeout_ms: 100
             &mut skew_monitor,
             Some(&live),
             &mut live_entry_ctx,
+            &mut quote_history,
         )
         .await
         .unwrap();

@@ -426,8 +426,8 @@ fn price_for_post_only(
     // walking through it hit us.
     match (reduce_only, exit_improve_tick) {
         (true, Some(tick)) if tick > Decimal::ZERO => match side {
-            OrderSide::Long => base + tick,   // exit buy → improve bid 1 tick up
-            OrderSide::Short => base - tick,  // exit sell → improve ask 1 tick down
+            OrderSide::Long => base + tick,  // exit buy → improve bid 1 tick up
+            OrderSide::Short => base - tick, // exit sell → improve ask 1 tick down
         },
         _ => base,
     }

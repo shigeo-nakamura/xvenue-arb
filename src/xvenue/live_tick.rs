@@ -19,6 +19,9 @@ use super::emergency_handlers::{
     force_flatten_on_session_dd_halt, handle_skew_breach_emergency, handle_ws_stale_emergency,
 };
 use super::entry_dispatch::handle_decision_enter;
+use super::entry_filter::{
+    evaluate_entry_filter, EntryFilterOutcome, QuoteSample, RecentQuoteHistory,
+};
 use super::exit_dispatch::handle_decision_exit;
 use super::live::{
     wall_clock_ms, LiveEntryCtx, LivePaperSummary, MidSnapshot, Venue, VenueHub, VenueWarmup,
@@ -94,6 +97,7 @@ pub(super) async fn run_one_tick<H: VenueHub + ?Sized>(
     skew_monitor: &mut SkewMonitor,
     live_exec: Option<&LiveExecution>,
     live_entry_ctx: &mut Option<LiveEntryCtx>,
+    quote_history: &mut RecentQuoteHistory,
 ) -> Result<()> {
     // Drain any pending SIGUSR1 — arms the STUCK file if needed.
     let _ = stuck.poll_sigusr1();
@@ -224,6 +228,18 @@ pub(super) async fn run_one_tick<H: VenueHub + ?Sized>(
         }
         summary.last_lt_bid_size = Some(lt_snap.bid_size.to_f64().unwrap_or(0.0));
         summary.last_lt_ask_size = Some(lt_snap.ask_size.to_f64().unwrap_or(0.0));
+
+        // bot-strategy#429: feed the rolling-window history for the
+        // defensive entry filter. Only push when both venues have
+        // populated books — same gate as the snapshot fields above —
+        // so scripted-hub tests don't pollute the buffer with
+        // synthetic zeros.
+        quote_history.push(QuoteSample {
+            ts_ms: now_ts_ms,
+            lt_inside_bps: summary.last_lt_inside_bps.unwrap_or(0.0),
+            lt_bid_size: summary.last_lt_bid_size.unwrap_or(0.0),
+            lt_ask_size: summary.last_lt_ask_size.unwrap_or(0.0),
+        });
     }
 
     if let (Some(r), Some(d)) = (reporter.as_deref_mut(), dev) {
@@ -307,6 +323,55 @@ pub(super) async fn run_one_tick<H: VenueHub + ?Sized>(
             );
             summary.entries_blocked_by_book_depth += 1;
             decision = Decision::Hold;
+        }
+    }
+
+    // bot-strategy#429: defensive entry filter. Runs after the
+    // book-depth gate so a "too thick" block isn't re-counted as a
+    // "regime unstable" block. Both fields opt-in via YAML; when
+    // both are `None` evaluate_entry_filter returns Allow and the
+    // call is a no-op.
+    if let Decision::Enter(dir) = decision {
+        match evaluate_entry_filter(
+            quote_history,
+            cfg.entry_filter_lt_inside_max_bps,
+            cfg.entry_filter_lt_min_depth_eth,
+        ) {
+            EntryFilterOutcome::Allow => {}
+            EntryFilterOutcome::BlockInsideSpike {
+                observed_bps,
+                threshold_bps,
+            } => {
+                log::warn!(
+                    "[XVENUE] entry filter blocked: inside-spike dir={:?} \
+                     observed_max_bps={:.2} threshold_bps={:.2} \
+                     window_samples={} window_sec={}",
+                    dir,
+                    observed_bps,
+                    threshold_bps,
+                    quote_history.len(),
+                    cfg.entry_filter_window_sec,
+                );
+                summary.entries_blocked_by_entry_filter += 1;
+                decision = Decision::Hold;
+            }
+            EntryFilterOutcome::BlockMinDepth {
+                observed_eth,
+                floor_eth,
+            } => {
+                log::warn!(
+                    "[XVENUE] entry filter blocked: depth-floor dir={:?} \
+                     observed_min_eth={:.4} floor_eth={:.4} \
+                     window_samples={} window_sec={}",
+                    dir,
+                    observed_eth,
+                    floor_eth,
+                    quote_history.len(),
+                    cfg.entry_filter_window_sec,
+                );
+                summary.entries_blocked_by_entry_filter += 1;
+                decision = Decision::Hold;
+            }
         }
     }
 
