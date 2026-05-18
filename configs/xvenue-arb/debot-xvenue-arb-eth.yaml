@@ -31,6 +31,17 @@ max_hold_sec: 600
 force_close_dev_bps: 30.0
 entry_check_threshold_at_fire: true   # strict (matches Python sim, #166 part 3)
 
+# ---- Defensive entry filter (bot-strategy#429 Sprint 1 Track A) ----
+# Rolling-window guard against the ForceClose tail pattern from #424
+# (5.5% of cycles avg -29.4 bps): every ForceClose entry had a Lighter
+# inside-spread spike (>5 bps) or top-of-book depth collapse (<0.5 ETH)
+# in the 30s window preceding entry, even though the entry-tick snapshot
+# looked healthy. Both fields are opt-in (Option<f64>) — leaving either
+# unset disables that gate. Counter: entries_blocked_by_entry_filter.
+entry_filter_window_sec: 60
+entry_filter_lt_inside_max_bps: 5.0   # block when recent max lt_inside > 5 bps
+entry_filter_lt_min_depth_eth: 0.5    # block when either side's min size in window < 0.5 ETH
+
 # Funding cycle filter (tight per #166 part 7: keeps 82% of PnL)
 funding_cycle_sec: 3600
 funding_lockout_pre_sec: 660
