@@ -33,14 +33,21 @@ entry_check_threshold_at_fire: true   # strict (matches Python sim, #166 part 3)
 
 # ---- Defensive entry filter (bot-strategy#429 Sprint 1 Track A) ----
 # Rolling-window guard against the ForceClose tail pattern from #424
-# (5.5% of cycles avg -29.4 bps): every ForceClose entry had a Lighter
-# inside-spread spike (>5 bps) or top-of-book depth collapse (<0.5 ETH)
-# in the 30s window preceding entry, even though the entry-tick snapshot
-# looked healthy. Both fields are opt-in (Option<f64>) — leaving either
-# unset disables that gate. Counter: entries_blocked_by_entry_filter.
+# (5.5% of cycles avg -29.4 bps). Every ForceClose entry had a Lighter
+# inside-spread spike or top-of-book depth collapse in the 30s window
+# preceding entry. Initial thresholds (0.5 ETH / 5 bps, 2026-05-18
+# 09:49 UTC deploy) over-blocked: 22/22 signals filtered in 80 min
+# because the min-over-window catches normal Lighter ETH book bouncy
+# (frequent 0.1-0.4 ETH micro-dips) instead of the catastrophic
+# ForceClose precursor (0.0586 ETH / 6.98 bps at the worst case).
+# Loosened 12:30 UTC to catch the worst precursors only:
+#  - depth 0.5 → 0.1 ETH (worst case 0.0586 still caught)
+#  - inside 5  → 8 bps  (worst case 6.98 still caught; 138 bps spike still caught)
+# Counter: entries_blocked_by_entry_filter. Both fields opt-in via
+# Option<f64> — leaving either unset disables that gate.
 entry_filter_window_sec: 60
-entry_filter_lt_inside_max_bps: 5.0   # block when recent max lt_inside > 5 bps
-entry_filter_lt_min_depth_eth: 0.5    # block when either side's min size in window < 0.5 ETH
+entry_filter_lt_inside_max_bps: 8.0   # block when recent max lt_inside > 8 bps
+entry_filter_lt_min_depth_eth: 0.1    # block when either side's min size in window < 0.1 ETH
 
 # Funding cycle filter (tight per #166 part 7: keeps 82% of PnL)
 funding_cycle_sec: 3600
