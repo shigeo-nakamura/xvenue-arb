@@ -302,6 +302,30 @@ async fn run_taker_round<V: VenueOps + ?Sized>(
     {
         Ok(o) => o,
         Err(e) => {
+            // bot-strategy#430 Pattern B: Extended occasionally rejects a
+            // reduce-only IOC with "Position is missing for reduce-only
+            // order" when its post-entry account state has not yet
+            // converged on a position the bot's state machine believes
+            // is open. Investigation of the 2026-05-18 00:42 UTC event
+            // (#430 Phase 1) confirmed that in this state the emergency
+            // loop's subsequent get_positions read returns zero on both
+            // legs — i.e. the leg is effectively already closed when the
+            // exit fires. Short-circuit the chase round with a "filled
+            // = residual" success so the caller sees a clean exit
+            // instead of routing through EmergencyFlattening for a
+            // position that is structurally already flat. Lighter does
+            // not produce this error pattern (verified across 124 RTs);
+            // the substring match is Extended-specific in practice.
+            let msg = format!("{:?}", e);
+            if req.reduce_only && msg.contains("Position is missing for reduce-only") {
+                log::warn!(
+                    "[{}] place_taker reported reduce-only position missing — \
+                     treating as already-flat (residual={}). #430 Pattern B short-circuit.",
+                    params.log_prefix,
+                    residual
+                );
+                return Ok(residual);
+            }
             log::warn!("[{}] place_taker err={:?}", params.log_prefix, e);
             return Err(ExecutionFailure::TakerRejected);
         }
@@ -430,5 +454,112 @@ fn price_for_post_only(
             OrderSide::Short => base - tick, // exit sell → improve ask 1 tick down
         },
         _ => base,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trade::execution::venue_ops::{
+        ScriptedResponse, ScriptedVenueOps, ScriptedVenueOpsState,
+    };
+    use rust_decimal_macros::dec;
+
+    fn base_params() -> MakerLoopParams {
+        MakerLoopParams {
+            log_prefix: "test/extmaker",
+            chase_retries: 1,
+            chase_timeout_ms: 500,
+            chase_grace_poll_ms: 0,
+            taker_grace_poll_ms: 0,
+            taker_fallback: true,
+            post_only: false,
+            poll_interval_ms: 50,
+            chase_uses_venue_min_floor: false,
+            taker_grace_before_cancel: true,
+            exit_improve_tick: None,
+        }
+    }
+
+    fn exit_request() -> MakerRequest {
+        MakerRequest {
+            symbol: "ETH-USD".into(),
+            side: OrderSide::Long,
+            target_qty: dec!(0.023),
+            dust_qty: dec!(0),
+            venue_min_qty: dec!(0),
+            reduce_only: true,
+        }
+    }
+
+    /// bot-strategy#430 Pattern B: when Extended rejects a reduce-only
+    /// IOC with "Position is missing for reduce-only order" the chase
+    /// round must treat the leg as already flat (Ok(residual)) so the
+    /// caller emits a clean exit instead of routing to
+    /// EmergencyFlattening for a position that is structurally already
+    /// zero. The substring match here mirrors the production error
+    /// shape captured in the 2026-05-18 00:42 UTC EmergencyFlattening
+    /// journal.
+    #[tokio::test]
+    async fn taker_round_short_circuits_on_position_missing_reduce_only() {
+        let ops = ScriptedVenueOps::new();
+        ops.with_state(|s: &mut ScriptedVenueOpsState| {
+            s.place_taker.push_back(ScriptedResponse::Err(
+                "create_order_taker_ioc ETH-USD: Server response error: \
+                 Position is missing for reduce-only order"
+                    .into(),
+            ));
+        });
+
+        let params = base_params();
+        let req = exit_request();
+        let residual = req.target_qty;
+
+        let result = run_taker_round(&ops, &params, &req, residual).await;
+
+        assert_eq!(
+            result.unwrap(),
+            residual,
+            "reduce-only position-missing must short-circuit to filled=residual"
+        );
+    }
+
+    /// Generic taker rejections (e.g. transient 5xx, signature errors)
+    /// must still surface as TakerRejected. Only the very specific
+    /// reduce-only "Position is missing" substring is short-circuited.
+    #[tokio::test]
+    async fn taker_round_does_not_short_circuit_on_generic_error() {
+        let ops = ScriptedVenueOps::new();
+        ops.with_state(|s: &mut ScriptedVenueOpsState| {
+            s.place_taker.push_back(ScriptedResponse::Err(
+                "create_order_taker_ioc ETH-USD: 503 Service Unavailable".into(),
+            ));
+        });
+
+        let params = base_params();
+        let req = exit_request();
+        let result = run_taker_round(&ops, &params, &req, req.target_qty).await;
+        assert!(matches!(result, Err(ExecutionFailure::TakerRejected)));
+    }
+
+    /// The short-circuit must NOT fire when the request is not
+    /// reduce_only (entry-side). An entry-side "Position is missing"
+    /// would be a real connector bug, not a structurally-flat leg.
+    #[tokio::test]
+    async fn taker_round_does_not_short_circuit_on_entry_side_error() {
+        let ops = ScriptedVenueOps::new();
+        ops.with_state(|s: &mut ScriptedVenueOpsState| {
+            s.place_taker.push_back(ScriptedResponse::Err(
+                "create_order_taker_ioc ETH-USD: Server response error: \
+                 Position is missing for reduce-only order"
+                    .into(),
+            ));
+        });
+
+        let params = base_params();
+        let mut req = exit_request();
+        req.reduce_only = false; // entry-side
+        let result = run_taker_round(&ops, &params, &req, req.target_qty).await;
+        assert!(matches!(result, Err(ExecutionFailure::TakerRejected)));
     }
 }

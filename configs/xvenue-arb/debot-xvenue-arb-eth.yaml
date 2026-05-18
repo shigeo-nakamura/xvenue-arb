@@ -71,7 +71,7 @@ extended_chase_retries: 3
 extended_chase_timeout_ms: 2000   # poll_until_terminal_or_deadline reuses this for the taker poll budget; left at 2000 ms which the 2026-05-02 #244 live probe established as enough for Extended fill ack.
 extended_taker_fallback: true
 extended_min_qty: 0.01            # bot-strategy#299: Extended ETH min order size. Skip taker fallback when post_only fills target_qty within this floor — connector would otherwise reject with "Order size 0 below min 0.01" and emit a noisy WARN.
-extended_taker_grace_poll_ms: 1000   # bot-strategy#298: WS-lag grace re-poll after taker `filled=0 cancelled=false`. Largely obviated by #302 (true IOC terminates immediately), kept defensively until verified to be unnecessary.
+extended_taker_grace_poll_ms: 3000   # bot-strategy#298 + #432: WS-lag grace re-poll after taker `filled=0 cancelled=false`. Bumped 1000 → 3000 because the 2026-05-17/18 24h LIVE window showed two EmergencyFlattening cycles (EF1 22:17 UTC + EF3 07:12 UTC) where Extended actually filled the IOC at the venue but `get_filled_orders` WS cache hadn't propagated yet at the 1000 ms grace; tracked as connector-side bug in #432. Until that lands, 3000 ms covers the observed ≥3 s WS lag and prevents the false-fail.
 extended_taker_slippage_bps: 50   # bot-strategy#302: slippage budget for the IOC taker path (`create_order_taker_ioc`). The connector places at touch ± 1 tick ± slippage so the order crosses on the first opposing level even when the book moves a few ticks between read and submit. Mirrors `close_all_positions`'s default. Tune downward (e.g. 20 bps) once we have a few weeks of fill-cost data on the IOC path.
 
 # ---- Execution: Lighter (post_only chase via LighterMakerLoop, #309/#317) ----
