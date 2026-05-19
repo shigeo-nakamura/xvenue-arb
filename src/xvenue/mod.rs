@@ -7,6 +7,7 @@
 pub mod bt;
 pub mod bt_grid;
 pub mod config;
+mod data_dump;
 mod emergency_handlers;
 mod entry_dispatch;
 mod entry_filter;

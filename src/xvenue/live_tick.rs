@@ -14,6 +14,7 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
 use super::config::XvenueConfig;
+use super::data_dump::{render_dump_row, RotatingDumpWriter};
 use super::emergency_handlers::{
     apply_entry_gates, apply_reference_guard, book_depth_blocks_entry,
     force_flatten_on_session_dd_halt, handle_skew_breach_emergency, handle_ws_stale_emergency,
@@ -43,6 +44,34 @@ use crate::risk::ws_health::WsHealthMonitor;
 /// this tick" exactly like the previous inline `return Ok(())`. A
 /// hard error propagates as `Err`. On success the warm-up latch is
 /// flipped on for the corresponding venue.
+/// bot-strategy#455: render + write one venue's per-tick dump row.
+/// Wall-clock timestamp comes from `wall_clock_ms()` so the BT replay
+/// can align ext+lt rows on the same evaluation tick (matching the
+/// pairtrade convention). `exchange_ts` carries the venue's own per-snap
+/// ts (`snap.ts_ms`) so stale-quote diagnostics stay accurate.
+fn write_dump_row_if_enabled(
+    writer: Option<&mut RotatingDumpWriter>,
+    symbol: &str,
+    snap: &MidSnapshot,
+) {
+    let Some(w) = writer else {
+        return;
+    };
+    let line = render_dump_row(
+        symbol,
+        wall_clock_ms() as i64,
+        snap.ts_ms,
+        snap.mid,
+        snap.bid,
+        snap.ask,
+        snap.bid_size,
+        snap.ask_size,
+    );
+    if let Err(e) = w.write_line(&line) {
+        log::error!("[XVENUE/dump] write failed: {:?}", e);
+    }
+}
+
 async fn read_both_mids<H: VenueHub + ?Sized>(
     hub: &H,
     warmup: &mut VenueWarmup,
@@ -98,6 +127,12 @@ pub(super) async fn run_one_tick<H: VenueHub + ?Sized>(
     live_exec: Option<&LiveExecution>,
     live_entry_ctx: &mut Option<LiveEntryCtx>,
     quote_history: &mut RecentQuoteHistory,
+    // bot-strategy#455: optional per-venue dump writers. Live runner
+    // hands them in here so each successful read_mid round produces one
+    // JSONL row per venue. `None` disables; the BT replay reads the
+    // resulting `*_YYYYMMDD.jsonl` files directly via DualReplay.
+    ext_dump_writer: Option<&mut RotatingDumpWriter>,
+    lt_dump_writer: Option<&mut RotatingDumpWriter>,
 ) -> Result<()> {
     // Drain any pending SIGUSR1 — arms the STUCK file if needed.
     let _ = stuck.poll_sigusr1();
@@ -105,6 +140,13 @@ pub(super) async fn run_one_tick<H: VenueHub + ?Sized>(
     let Some((mut ext_snap, mut lt_snap)) = read_both_mids(hub, warmup, summary).await? else {
         return Ok(());
     };
+
+    // bot-strategy#455: drop one JSONL row per venue per successful
+    // read_mid. Schema mirrors the pairtrade dump format so a future
+    // `bt single --ext-dump <own> --lt-dump <own>` can replay this
+    // bot's own market data and BT trade-count matches live.
+    write_dump_row_if_enabled(ext_dump_writer, &cfg.symbol_ext, &ext_snap);
+    write_dump_row_if_enabled(lt_dump_writer, &cfg.symbol_lt, &lt_snap);
 
     // Record successful WS observations for health tracking. Any
     // `read_mid` Ok is a sign that the venue's WS subscription is

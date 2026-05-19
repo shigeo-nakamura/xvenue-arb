@@ -250,6 +250,19 @@ pub struct XvenueConfig {
     pub max_inventory_skew_usd: f64,
     #[serde(default = "default_leg_mismatch_timeout_ms")]
     pub leg_mismatch_timeout_ms: u64,
+    /// bot-strategy#455: optional per-venue path for the per-tick
+    /// market-data JSONL dump. When set, the live runner writes one
+    /// row per evaluation tick to `{path}_YYYYMMDD.jsonl` (UTC date
+    /// rotation), matching the pairtrade dump format so the BT can
+    /// replay xvenue-arb's own data. None (or empty string) disables.
+    ///
+    /// Example values:
+    ///   /opt/debot/market_data_xvenue_ext  (writes ..._20260519.jsonl)
+    ///   /opt/debot/market_data_xvenue_lt
+    #[serde(default)]
+    pub ext_market_data_dump_path: String,
+    #[serde(default)]
+    pub lt_market_data_dump_path: String,
     /// Pairtrade-symmetric **external KILL_SWITCH file**, dropped by
     /// the operator to block new entries (existing positions exit
     /// normally). bot-strategy#244 D-1. See `docs/execution_layer.md`
