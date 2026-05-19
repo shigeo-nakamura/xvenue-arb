@@ -68,6 +68,18 @@ pub struct BtConfig {
     /// Defaults to `false` so the pre-#454-2b taker-only baseline is
     /// preserved when this field is unset.
     pub lighter_post_only: bool,
+    /// bot-strategy#454 step 2c: per-side adverse-drift cost charged
+    /// when a Lighter post-only side MISSES and falls back to taker.
+    /// Represents the expected book drift during the chase window
+    /// (`lighter_chase_retries × lighter_chase_timeout_ms` ≈ 6 s today).
+    /// Applied in bps × notional on top of the taker fill cost.
+    /// Default 0 — calibratable; tune to match the live miss-rate cost
+    /// observed in journal data.
+    pub lighter_chase_miss_penalty_bps: f64,
+    /// bot-strategy#454 step 2c: same as `lighter_chase_miss_penalty_bps`
+    /// for the Extended side. Only meaningful when a future re-flip
+    /// turns `extended_post_only` on; harmless when false.
+    pub extended_chase_miss_penalty_bps: f64,
     /// Path to a Binance 1m kline JSONL (one row per minute with
     /// `ts_ms` / `high` / `low`) used as a stale-quote reference. When
     /// set together with `binance_ref_max_dev_bps > 0`, any venue mid
@@ -96,6 +108,8 @@ impl Default for BtConfig {
             extended_round_trip_slippage_bps: 0.0,
             lighter_round_trip_slippage_bps: 0.0,
             lighter_post_only: false,
+            lighter_chase_miss_penalty_bps: 0.0,
+            extended_chase_miss_penalty_bps: 0.0,
             binance_ref_path: None,
             binance_ref_max_dev_bps: 0.0,
             record_buckets: false,
@@ -626,6 +640,10 @@ fn compute_leg_slippage_cost(
     post_only_with_fallback: bool,
     entry_seed: u64,
     exit_seed: u64,
+    // bot-strategy#454 step 2c: per-side penalty added to a missed
+    // post-only side's taker-fallback cost, representing the expected
+    // book drift during the chase window.
+    chase_miss_penalty_bps: f64,
 ) -> Decimal {
     let bps_div = Decimal::from(10_000);
     let entry_cost = side_signed_cost(
@@ -635,6 +653,8 @@ fn compute_leg_slippage_cost(
         entry_side,
         post_only_with_fallback,
         entry_seed,
+        chase_miss_penalty_bps,
+        notional_usd,
     );
     let exit_cost = side_signed_cost(
         exit_book,
@@ -643,6 +663,8 @@ fn compute_leg_slippage_cost(
         exit_side,
         post_only_with_fallback,
         exit_seed,
+        chase_miss_penalty_bps,
+        notional_usd,
     );
     match (entry_cost, exit_cost) {
         (Some(e), Some(x)) => e + x,
@@ -664,6 +686,7 @@ fn compute_leg_slippage_cost(
 /// depth fill-probability model. The seed makes the outcome
 /// deterministic per BT run (test reproducibility) and per side
 /// (independent draws on entry vs exit).
+#[allow(clippy::too_many_arguments)]
 fn side_signed_cost(
     book: Option<BookSnapshot>,
     mid: Decimal,
@@ -671,6 +694,10 @@ fn side_signed_cost(
     side: IocSide,
     post_only: bool,
     seed: u64,
+    // bot-strategy#454 step 2c: bps × notional added to a missed
+    // post-only side's taker-fallback cost.
+    chase_miss_penalty_bps: f64,
+    notional_usd: Decimal,
 ) -> Option<Decimal> {
     let book = book?;
     if post_only {
@@ -685,7 +712,15 @@ fn side_signed_cost(
             };
             return Some(signed_side_cost(maker_fill, mid, side, qty));
         }
-        // Miss → taker fallback (cross the touch, same as step 2a).
+        // Miss → taker fallback (cross the touch, same as step 2a) PLUS
+        // a chase-miss penalty for the expected book drift during the
+        // chase window.
+        let taker_fill = book.ioc_fill_price(side, qty)?;
+        let taker_cost = signed_side_cost(taker_fill, mid, side, qty);
+        let penalty = decimal_from_f64(chase_miss_penalty_bps).unwrap_or(Decimal::ZERO)
+            * notional_usd
+            / Decimal::from(10_000);
+        return Some(taker_cost + penalty);
     }
     let taker_fill = book.ioc_fill_price(side, qty)?;
     Some(signed_side_cost(taker_fill, mid, side, qty))
@@ -805,6 +840,7 @@ fn settle_trade(
         // Extended seeds intentionally unused while post_only=false.
         0,
         0,
+        cfg.extended_chase_miss_penalty_bps,
     );
     let lt_slip = compute_leg_slippage_cost(
         leg.entry_lt_book,
@@ -819,6 +855,7 @@ fn settle_trade(
         cfg.lighter_post_only,
         lt_entry_seed,
         lt_exit_seed,
+        cfg.lighter_chase_miss_penalty_bps,
     );
 
     // Fees: round-trip on each leg = 2 * fee_bps * notional / 10_000.
@@ -1274,6 +1311,7 @@ mod tests {
             false, // post_only — irrelevant for missing-book path
             0,
             0,
+            0.0, // chase miss penalty
         );
         // 5 bps × $50 / 10_000 = $0.025
         assert_eq!(cost, dec!(0.025));
@@ -1307,6 +1345,7 @@ mod tests {
             false, // taker path
             0,
             0,
+            0.0,
         );
         assert_eq!(cost, dec!(0.025));
     }
@@ -1390,6 +1429,7 @@ mod tests {
             true, // post_only
             42,
             43,
+            0.0, // chase miss penalty — irrelevant, no miss in this fixture
         );
         // Per side, maker fill = our rest side (opposite of taker touch):
         //   Buy maker → fill at bid = 1999.5 → cost = 1999.5 - 2000 = -0.5
@@ -1423,9 +1463,78 @@ mod tests {
             true, // post_only — but p=0
             7,
             8,
+            0.0, // no chase miss penalty for this test
         );
         // Same as taker path: +0.025 per round-trip.
         assert_eq!(cost, dec!(0.025));
+    }
+
+    /// bot-strategy#454 step 2c — chase miss penalty: when post-only
+    /// misses and falls back to taker, add `chase_miss_penalty_bps ×
+    /// notional / 10_000` per side on top of the taker cost.
+    ///
+    /// Use the same `p=0` fixture as the miss-fallback test: 2 missed
+    /// sides at penalty=3 bps × \$50 = +$0.015 per side, +$0.030 RT,
+    /// on top of the +0.025 taker cost = +\$0.055 total.
+    #[test]
+    fn chase_miss_penalty_adds_to_taker_fallback_cost() {
+        let book = BookSnapshot {
+            mid: dec!(2000.0),
+            bid_price: dec!(1999.5),
+            ask_price: dec!(2000.5),
+            bid_size: dec!(0.025),
+            ask_size: dec!(0.025),
+        };
+        let cost = compute_leg_slippage_cost(
+            Some(book),
+            Some(book),
+            dec!(2000.0),
+            dec!(2000.0),
+            dec!(0.025),
+            IocSide::Buy,
+            IocSide::Sell,
+            0.0,
+            dec!(50),
+            true,
+            11,
+            12,
+            3.0, // 3 bps per side chase-miss penalty
+        );
+        // Taker fallback: +$0.025 RT (per the post_only_falls_back_to_taker test).
+        // Plus 2 sides × 3 bps × $50 / 10_000 = +$0.030.
+        // Total = +$0.055.
+        assert_eq!(cost, dec!(0.055));
+    }
+
+    /// bot-strategy#454 step 2c — penalty only applies when the side
+    /// actually misses. With infinite depth (always fills as maker),
+    /// the chase-miss penalty MUST NOT fire.
+    #[test]
+    fn chase_miss_penalty_not_applied_when_maker_fills() {
+        let book = BookSnapshot {
+            mid: dec!(2000.0),
+            bid_price: dec!(1999.5),
+            ask_price: dec!(2000.5),
+            bid_size: dec!(1_000_000),
+            ask_size: dec!(1_000_000),
+        };
+        let cost = compute_leg_slippage_cost(
+            Some(book),
+            Some(book),
+            dec!(2000.0),
+            dec!(2000.0),
+            dec!(0.025),
+            IocSide::Buy,
+            IocSide::Sell,
+            0.0,
+            dec!(50),
+            true,
+            42,
+            43,
+            999.0, // huge penalty — must not fire because we always fill
+        );
+        // Same as the "earns half-spread" test: -$0.025.
+        assert_eq!(cost, dec!(-0.025));
     }
 
     /// bot-strategy#454 step 2b — deterministic Bernoulli: same seed +

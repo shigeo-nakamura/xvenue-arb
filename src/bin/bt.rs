@@ -153,6 +153,12 @@ fn build_base(args: &Args, symbol: &str) -> Result<BtConfig> {
     // depth-aware maker fill model on the Lighter leg, mirroring the
     // live YAML knob `lighter_post_only: true`.
     cfg.lighter_post_only = args.opt::<bool>("lighter-post-only", false)?;
+    // bot-strategy#454 step 2c: per-side adverse-drift cost added to
+    // a missed post-only side's taker-fallback cost.
+    cfg.lighter_chase_miss_penalty_bps =
+        args.opt::<f64>("lighter-chase-miss-penalty-bps", 0.0)?;
+    cfg.extended_chase_miss_penalty_bps =
+        args.opt::<f64>("extended-chase-miss-penalty-bps", 0.0)?;
     cfg.signal.min_warmup_samples = args.opt::<usize>("warmup-samples", 60)?;
     cfg.spread.bucket_ms = args.opt::<u64>("bucket-ms", 1_000)?;
     // Phase 0 v2 parity diagnostic. When set, Enter fires at the bar
