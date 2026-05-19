@@ -32,6 +32,7 @@ use rust_decimal::Decimal;
 use tokio::sync::oneshot;
 
 use super::config::XvenueConfig;
+use super::data_dump::RotatingDumpWriter;
 use super::live_exec::LiveExecution;
 use super::live_pnl::compute_realised_pnl;
 use super::signal::{SignalEngine, SpreadDirection};
@@ -532,6 +533,14 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
     // operator-driven Reset. Stays None in paper mode.
     let mut live_entry_ctx: Option<LiveEntryCtx> = None;
 
+    // bot-strategy#455: optional per-venue market-data JSONL writers.
+    // Live runner opens them once on boot from the YAML knobs and
+    // hands them to `run_one_tick` so each successful read_mid round
+    // appends one row per venue. Off (None) when path is empty —
+    // unchanged behaviour for older deploys.
+    let mut ext_dump_writer = open_dump_writer(&cfg.ext_market_data_dump_path, "ext");
+    let mut lt_dump_writer = open_dump_writer(&cfg.lt_market_data_dump_path, "lt");
+
     // Drop an initial snapshot so the dashboard sees the DRY_RUN pill /
     // agent identity on boot instead of waiting for the first
     // status_log_interval_ms (60 s default). Equity is best-effort —
@@ -581,6 +590,8 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                     live_exec.as_deref(),
                     &mut live_entry_ctx,
                     &mut quote_history,
+                    ext_dump_writer.as_mut(),
+                    lt_dump_writer.as_mut(),
                 ).await {
                     // Read-mid / decision errors are logged but don't
                     // terminate the loop. Phase 3 will add a consec-fail
@@ -663,6 +674,32 @@ pub(super) fn wall_clock_ms() -> u64 {
 /// so removing the file resumes entries on the next tick (#244 D-1).
 pub(super) fn kill_switch_active(path: &str) -> bool {
     !path.is_empty() && std::path::Path::new(path).exists()
+}
+
+/// bot-strategy#455: open the per-venue market-data dump writer when
+/// the YAML knob is set. Empty path → `None` (writer is fully
+/// disabled, zero overhead per tick). Open error → log and disable —
+/// we don't want a permissions issue on `/opt/debot` to crash the live
+/// runner.
+fn open_dump_writer(path: &str, label: &str) -> Option<RotatingDumpWriter> {
+    if path.is_empty() {
+        return None;
+    }
+    match RotatingDumpWriter::new(path) {
+        Ok(w) => {
+            log::info!("[XVENUE/dump] {} writer opened at {}", label, path);
+            Some(w)
+        }
+        Err(e) => {
+            log::error!(
+                "[XVENUE/dump] {} writer at {} failed to open: {:?} — dump disabled",
+                label,
+                path,
+                e
+            );
+            None
+        }
+    }
 }
 
 /// Live-mode emergency-flatten round driver invoked from the tick arm
@@ -1622,6 +1659,8 @@ max_hold_sec: 60
             None,
             &mut None,
             &mut quote_history,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1665,6 +1704,8 @@ max_hold_sec: 60
             None,
             &mut None,
             &mut quote_history,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1738,6 +1779,8 @@ max_hold_sec: 60
                 None,
                 &mut None,
                 &mut quote_history,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1819,6 +1862,8 @@ max_hold_sec: 60
                 None,
                 &mut None,
                 &mut quote_history,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1894,6 +1939,8 @@ max_hold_sec: 60
                 None,
                 &mut None,
                 &mut quote_history,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1968,6 +2015,8 @@ max_hold_sec: 60
                 None,
                 &mut None,
                 &mut quote_history,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -2068,6 +2117,8 @@ max_hold_sec: 60
                 None,
                 &mut None,
                 &mut quote_history,
+                None,
+                None,
             )
             .await
             .expect("warm-up errors must not propagate");
@@ -2100,6 +2151,8 @@ max_hold_sec: 60
             None,
             &mut None,
             &mut quote_history,
+            None,
+            None,
         )
         .await
         .expect("warm-up errors must not propagate");
@@ -2128,6 +2181,8 @@ max_hold_sec: 60
                 None,
                 &mut None,
                 &mut quote_history,
+                None,
+                None,
             )
             .await
             .expect("warm-up errors must not propagate");
@@ -2151,6 +2206,8 @@ max_hold_sec: 60
             None,
             &mut None,
             &mut quote_history,
+            None,
+            None,
         )
         .await
         .expect("post-warmup tick must succeed");
@@ -2215,6 +2272,8 @@ max_hold_sec: 60
             None,
             &mut None,
             &mut quote_history,
+            None,
+            None,
         )
         .await
         .expect_err("post-warmup read_mid Err must propagate as Err");
@@ -2293,6 +2352,8 @@ max_hold_sec: 60
             None,
             &mut None,
             &mut quote_history,
+            None,
+            None,
         )
         .await
         .expect_err("post-warmup Lighter read_mid Err must propagate");
@@ -2412,6 +2473,8 @@ emergency_complete_grace_ms: 0  # tests assert immediate-complete on zero (#287 
                 Some(live),
                 &mut live_entry_ctx,
                 &mut quote_history,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -4127,6 +4190,8 @@ leg_mismatch_timeout_ms: 100
             Some(&live),
             &mut live_entry_ctx,
             &mut quote_history,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -4204,6 +4269,8 @@ leg_mismatch_timeout_ms: 100
                 Some(&live),
                 &mut live_entry_ctx,
                 &mut quote_history,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -4265,6 +4332,8 @@ leg_mismatch_timeout_ms: 100
             Some(&live),
             &mut live_entry_ctx,
             &mut quote_history,
+            None,
+            None,
         )
         .await
         .unwrap();

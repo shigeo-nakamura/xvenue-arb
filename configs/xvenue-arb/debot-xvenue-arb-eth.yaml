@@ -25,6 +25,17 @@ min_warmup_samples: 90        # ~7.5 min at 5s buckets
 
 # ---- Signal engine ----
 abs_threshold_bps: 6.0        # bot-strategy#437 2026-05-19: raised 5.0→6.0 to escape fee wall observed today (Phase 1 LIVE flip reverted, 7-loss streak pre-restart, -$0.35 realised today). BT 3-day sweep with calibrated slippage (15 ext + 8 lt bps RT, calibrated to match live -10 bps/RT at threshold=5) projected threshold=6 reduces trades ~50% (4→2 over 3d) while flipping mean bps/RT from +1.81 → +7.51. Threshold≥8 produces 0 BT trades = effective halt; 6.0 is the next graceful step. Revisit after 24h soak.
+
+# bot-strategy#455: per-venue market-data dump writers for own-source BT replay.
+# Writes one JSONL row per evaluation tick to {path}_YYYYMMDD.jsonl (UTC date
+# rotation). Schema matches the pairtrade dump format, so BT replays via
+# `bt single --ext-dump <ext_path>_YYYYMMDD.jsonl --lt-dump <lt_path>_YYYYMMDD.jsonl`.
+# Capture target: ≥3 days, then re-run #454 step 3 calibration against
+# xvenue-arb's own dumps (current cross-source dumps undercount trade
+# opportunities ~50× — see #454 comment 2026-05-19).
+# Empty string disables.
+ext_market_data_dump_path: /opt/debot/market_data_xvenue_ext
+lt_market_data_dump_path: /opt/debot/market_data_xvenue_lt
 persistence_sec: 15
 exit_at_mean_cross: true
 max_hold_sec: 600
