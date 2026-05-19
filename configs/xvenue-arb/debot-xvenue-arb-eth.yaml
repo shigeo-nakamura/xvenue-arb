@@ -24,7 +24,7 @@ max_abs_spread_bps: 100.0     # outlier filter (feed-stall guard)
 min_warmup_samples: 90        # ~7.5 min at 5s buckets
 
 # ---- Signal engine ----
-abs_threshold_bps: 5.0        # Phase 1 ETH champion
+abs_threshold_bps: 6.0        # bot-strategy#437 2026-05-19: raised 5.0→6.0 to escape fee wall observed today (Phase 1 LIVE flip reverted, 7-loss streak pre-restart, -$0.35 realised today). BT 3-day sweep with calibrated slippage (15 ext + 8 lt bps RT, calibrated to match live -10 bps/RT at threshold=5) projected threshold=6 reduces trades ~50% (4→2 over 3d) while flipping mean bps/RT from +1.81 → +7.51. Threshold≥8 produces 0 BT trades = effective halt; 6.0 is the next graceful step. Revisit after 24h soak.
 persistence_sec: 15
 exit_at_mean_cross: true
 max_hold_sec: 600
