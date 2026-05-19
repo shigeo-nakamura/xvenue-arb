@@ -273,24 +273,30 @@ pub(super) async fn handle_decision_exit(
     .await;
     match outcome {
         ParallelExitOutcome::Both { ext, lt } => {
-            let ext_exit_qty = match ext {
-                ExtendedTerminal::Filled { qty: q } => {
+            let (ext_exit_qty, ext_exit_avg_fill_price) = match ext {
+                ExtendedTerminal::Filled {
+                    qty: q,
+                    avg_fill_price,
+                } => {
                     machine.apply(now_ts_ms, Event::ExtendedExitFilled { qty: q })?;
-                    Some(q)
+                    (Some(q), avg_fill_price)
                 }
                 ExtendedTerminal::Failed { reason: r } => {
                     log::error!("[XVENUE] LIVE EXIT ext failed reason={:?}", r);
-                    None
+                    (None, None)
                 }
             };
-            let lt_exit_qty = match lt {
-                LighterTerminal::Filled { qty: q } => {
+            let (lt_exit_qty, lt_exit_avg_fill_price) = match lt {
+                LighterTerminal::Filled {
+                    qty: q,
+                    avg_fill_price,
+                } => {
                     machine.apply(now_ts_ms, Event::LighterExitFilled { qty: q })?;
-                    Some(q)
+                    (Some(q), avg_fill_price)
                 }
                 LighterTerminal::Failed { reason: r } => {
                     log::error!("[XVENUE] LIVE EXIT lt failed reason={:?}", r);
-                    None
+                    (None, None)
                 }
             };
             match (ext_exit_qty, lt_exit_qty) {
@@ -349,6 +355,10 @@ pub(super) async fn handle_decision_exit(
                             ctx.lt_entry_mid,
                             ext_snap.mid,
                             lt_snap.mid,
+                            ctx.ext_entry_avg_fill_price,
+                            ctx.lt_entry_avg_fill_price,
+                            ext_exit_avg_fill_price,
+                            lt_exit_avg_fill_price,
                             ctx.ext_entry_qty,
                             ctx.lt_entry_qty,
                             ext_eq,
@@ -409,10 +419,10 @@ pub(super) async fn handle_decision_exit(
             // documented contract for case 11). PnL is not computed —
             // see #268 S5-1 'Out of scope' for partial trade PnL
             // accounting.
-            if let Some(ExtendedTerminal::Filled { qty: q }) = ext {
+            if let Some(ExtendedTerminal::Filled { qty: q, .. }) = ext {
                 machine.apply(now_ts_ms, Event::ExtendedExitFilled { qty: q })?;
             }
-            if let Some(LighterTerminal::Filled { qty: q }) = lt {
+            if let Some(LighterTerminal::Filled { qty: q, .. }) = lt {
                 machine.apply(now_ts_ms, Event::LighterExitFilled { qty: q })?;
             }
             let _ = live_entry_ctx.take();

@@ -84,6 +84,12 @@ pub(crate) struct MakerRequest {
 /// its venue-specific `Terminal::{Filled, Failed}` variant.
 pub(crate) struct MakerLoopOutcome {
     pub total_filled: Decimal,
+    /// Sum of `fill_price * fill_qty` across every chase round +
+    /// taker fallback round that contributed a fill. `None` when
+    /// the venue layer did not surface any per-round
+    /// `filled_value_this_round` — caller must fall back to mid-
+    /// based PnL. bot-strategy#435.
+    pub total_filled_value: Option<Decimal>,
     pub last_failure: Option<ExecutionFailure>,
 }
 
@@ -96,6 +102,13 @@ pub(crate) async fn run_maker_loop<V: VenueOps + ?Sized>(
     req: &MakerRequest,
 ) -> MakerLoopOutcome {
     let mut total_filled = Decimal::ZERO;
+    // bot-strategy#435: accumulate filled_value across rounds.
+    // Invariant: `Some(x)` means we have authoritative volume-weighted
+    // fill cost across every contributing round so far; `None` means
+    // at least one round produced a fill but the venue layer did not
+    // surface its value, so the aggregate cannot be trusted as
+    // avg_fill_price. Caller falls back to mid-based PnL when None.
+    let mut total_filled_value: Option<Decimal> = Some(Decimal::ZERO);
     let mut last_failure: Option<ExecutionFailure> = None;
 
     let chase_floor = if params.chase_uses_venue_min_floor {
@@ -115,6 +128,11 @@ pub(crate) async fn run_maker_loop<V: VenueOps + ?Sized>(
             match run_one_chase_round(ops, params, req, remaining, round).await {
                 Ok(outcome) => {
                     total_filled += outcome.filled_this_round;
+                    total_filled_value = accumulate_value(
+                        total_filled_value,
+                        outcome.filled_this_round,
+                        outcome.filled_value_this_round,
+                    );
                     if outcome.terminal_cancelled && outcome.filled_this_round.is_zero() {
                         // Venue cancelled with zero fill — most likely
                         // the post-only price moved through. Continue
@@ -126,6 +144,7 @@ pub(crate) async fn run_maker_loop<V: VenueOps + ?Sized>(
                     if total_filled >= req.target_qty - chase_floor {
                         return MakerLoopOutcome {
                             total_filled,
+                            total_filled_value,
                             last_failure,
                         };
                     }
@@ -145,13 +164,16 @@ pub(crate) async fn run_maker_loop<V: VenueOps + ?Sized>(
     let residual = req.target_qty - total_filled;
     if residual > taker_floor && params.taker_fallback {
         match run_taker_round(ops, params, req, residual).await {
-            Ok(taker_filled) => {
+            Ok((taker_filled, taker_value)) => {
                 total_filled += taker_filled;
+                total_filled_value =
+                    accumulate_value(total_filled_value, taker_filled, taker_value);
             }
             Err(failure) => {
                 if total_filled.is_zero() {
                     return MakerLoopOutcome {
                         total_filled,
+                        total_filled_value,
                         last_failure: Some(failure),
                     };
                 }
@@ -164,7 +186,28 @@ pub(crate) async fn run_maker_loop<V: VenueOps + ?Sized>(
 
     MakerLoopOutcome {
         total_filled,
+        total_filled_value,
         last_failure,
+    }
+}
+
+/// Fold a per-round `(filled_qty, filled_value)` into the running
+/// `total_filled_value` aggregate. The aggregate is `None` once any
+/// round with a non-zero fill failed to provide `filled_value` — at
+/// that point we cannot reconstruct the volume-weighted avg fill
+/// price for the whole cycle, so the caller must fall back to mid-
+/// based PnL. bot-strategy#435.
+fn accumulate_value(
+    acc: Option<Decimal>,
+    round_qty: Decimal,
+    round_value: Option<Decimal>,
+) -> Option<Decimal> {
+    if round_qty.is_zero() {
+        return acc;
+    }
+    match (acc, round_value) {
+        (Some(a), Some(v)) => Some(a + v),
+        _ => None,
     }
 }
 
@@ -261,6 +304,7 @@ async fn run_one_chase_round<V: VenueOps + ?Sized>(
                     );
                     outcome = PollOutcome {
                         filled_this_round: s.filled_qty,
+                        filled_value_this_round: s.filled_value,
                         terminal_cancelled: s.cancelled,
                     };
                 } else {
@@ -290,12 +334,19 @@ async fn run_one_chase_round<V: VenueOps + ?Sized>(
     Ok(outcome)
 }
 
+/// Run one taker fallback round. Returns `(filled_qty, filled_value)`
+/// — `filled_value` is `Some(sum(fill_price * fill_qty))` when the
+/// venue layer surfaced it via `OrderFillStatus.filled_value`, else
+/// `None`. The Pattern B short-circuit (reduce-only "Position is
+/// missing") returns `(residual, None)` because there is no real
+/// fill — caller falls back to mid-based PnL for that synthetic
+/// success. bot-strategy#435.
 async fn run_taker_round<V: VenueOps + ?Sized>(
     ops: &V,
     params: &MakerLoopParams,
     req: &MakerRequest,
     residual: Decimal,
-) -> Result<Decimal, ExecutionFailure> {
+) -> Result<(Decimal, Option<Decimal>), ExecutionFailure> {
     let placed = match ops
         .place_taker(&req.symbol, req.side, residual, req.reduce_only)
         .await
@@ -324,7 +375,12 @@ async fn run_taker_round<V: VenueOps + ?Sized>(
                     params.log_prefix,
                     residual
                 );
-                return Ok(residual);
+                // Synthetic success — no real fill happened, so we
+                // cannot report a filled_value. Caller falls back to
+                // mid-based PnL for this leg (acceptable because the
+                // EmergencyFlattening reconcile path that triggered
+                // this branch contributes 0 incremental cost).
+                return Ok((residual, None));
             }
             log::warn!("[{}] place_taker err={:?}", params.log_prefix, e);
             return Err(ExecutionFailure::TakerRejected);
@@ -370,7 +426,7 @@ async fn run_taker_round<V: VenueOps + ?Sized>(
     }
 
     if outcome.filled_this_round > Decimal::ZERO {
-        Ok(outcome.filled_this_round)
+        Ok((outcome.filled_this_round, outcome.filled_value_this_round))
     } else if outcome.terminal_cancelled {
         Err(ExecutionFailure::TakerRejected)
     } else {
@@ -405,6 +461,7 @@ async fn maybe_taker_grace_repoll<V: VenueOps + ?Sized>(
                 );
                 PollOutcome {
                     filled_this_round: s.filled_qty,
+                    filled_value_this_round: s.filled_value,
                     terminal_cancelled: s.cancelled,
                 }
             } else {
@@ -519,8 +576,8 @@ mod tests {
 
         assert_eq!(
             result.unwrap(),
-            residual,
-            "reduce-only position-missing must short-circuit to filled=residual"
+            (residual, None),
+            "reduce-only position-missing must short-circuit to (filled=residual, value=None)"
         );
     }
 

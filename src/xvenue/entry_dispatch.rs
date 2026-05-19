@@ -246,7 +246,10 @@ pub(super) async fn handle_decision_enter<H: VenueHub + ?Sized>(
         })
         .await;
     match ext_term {
-        ExtendedTerminal::Filled { qty } => {
+        ExtendedTerminal::Filled {
+            qty,
+            avg_fill_price: ext_entry_avg_fill_price,
+        } => {
             // bot-strategy#244 / #282 silent-reject gate: any
             // successful fill resets the consec-Timeout counter so a
             // healthy run doesn't leave a stale stuck arm pending.
@@ -287,7 +290,10 @@ pub(super) async fn handle_decision_enter<H: VenueHub + ?Sized>(
                     .await
             };
             match lt_term {
-                LighterTerminal::Filled { qty: lt_filled } => {
+                LighterTerminal::Filled {
+                    qty: lt_filled,
+                    avg_fill_price: lt_entry_avg_fill_price,
+                } => {
                     machine.apply(now_ts_ms, Event::LighterFilled { qty: lt_filled })?;
                     *open_qty = Some(lt_filled);
                     // Capture entry context for the realised-PnL
@@ -298,6 +304,8 @@ pub(super) async fn handle_decision_enter<H: VenueHub + ?Sized>(
                         direction: dir,
                         ext_entry_mid: ext_snap.mid,
                         lt_entry_mid: lt_snap.mid,
+                        ext_entry_avg_fill_price,
+                        lt_entry_avg_fill_price,
                         ext_entry_qty: qty,
                         lt_entry_qty: lt_filled,
                     });

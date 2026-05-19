@@ -125,17 +125,30 @@ fn maker_exit_or_entry(flag: Option<bool>) -> bool {
 /// the fee rate (`*_fee_bps`) applies to that notional. Entry +
 /// exit fees on both venues sum into the total.
 ///
-/// Mid-based pricing is an approximation — actual fill prices on
-/// Lighter taker can be a tick worse than mid, and Extended
-/// post-only fills happen at the touch which is already at mid
-/// (zero spread cost). The fee-rate default (5 bps) is set
-/// conservatively to absorb this approximation.
+/// Pricing uses **actual volume-weighted average fill prices** when
+/// the executor surfaced them via `*Terminal::Filled.avg_fill_price`,
+/// and falls back to the mid price for the affected leg/side when
+/// the executor did not (e.g. dry-run paper synthesis, reduce-only
+/// Position-is-missing short-circuit). Pre-#435 this function used
+/// mids unconditionally, which over-reported gross by ~10-12 bps/RT
+/// on xvenue-arb at \$50 notional (the actual IOC slippage plus
+/// post-only chase-up cost is invisible to a mid-based calculation).
+/// See bot-strategy#435 for the diagnosis and ground-truth analysis.
+///
+/// The fee rate (`*_fee_bps`) is applied to the **fill-priced**
+/// notional, so the fee charge matches what the venue's
+/// realised_pnl export reports.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn compute_realised_pnl(
     direction: SpreadDirection,
     ext_entry_mid: Decimal,
     lt_entry_mid: Decimal,
     ext_exit_mid: Decimal,
     lt_exit_mid: Decimal,
+    ext_entry_avg_fill_price: Option<Decimal>,
+    lt_entry_avg_fill_price: Option<Decimal>,
+    ext_exit_avg_fill_price: Option<Decimal>,
+    lt_exit_avg_fill_price: Option<Decimal>,
     ext_entry_qty: Decimal,
     lt_entry_qty: Decimal,
     ext_exit_qty: Decimal,
@@ -147,8 +160,12 @@ pub(super) fn compute_realised_pnl(
     if realised_qty <= Decimal::ZERO {
         return Decimal::ZERO;
     }
-    let entry_spread = ext_entry_mid - lt_entry_mid;
-    let exit_spread = ext_exit_mid - lt_exit_mid;
+    let ext_entry_px = ext_entry_avg_fill_price.unwrap_or(ext_entry_mid);
+    let lt_entry_px = lt_entry_avg_fill_price.unwrap_or(lt_entry_mid);
+    let ext_exit_px = ext_exit_avg_fill_price.unwrap_or(ext_exit_mid);
+    let lt_exit_px = lt_exit_avg_fill_price.unwrap_or(lt_exit_mid);
+    let entry_spread = ext_entry_px - lt_entry_px;
+    let exit_spread = ext_exit_px - lt_exit_px;
     let gross = match direction {
         SpreadDirection::Long => (exit_spread - entry_spread) * realised_qty,
         SpreadDirection::Short => (entry_spread - exit_spread) * realised_qty,
@@ -156,8 +173,8 @@ pub(super) fn compute_realised_pnl(
     let bps_div = Decimal::new(10_000, 0);
     let ext_rate = Decimal::from_f64_retain(ext_fee_bps).unwrap_or(Decimal::ZERO) / bps_div;
     let lt_rate = Decimal::from_f64_retain(lt_fee_bps).unwrap_or(Decimal::ZERO) / bps_div;
-    let ext_fees = (ext_entry_mid * ext_entry_qty + ext_exit_mid * ext_exit_qty) * ext_rate;
-    let lt_fees = (lt_entry_mid * lt_entry_qty + lt_exit_mid * lt_exit_qty) * lt_rate;
+    let ext_fees = (ext_entry_px * ext_entry_qty + ext_exit_px * ext_exit_qty) * ext_rate;
+    let lt_fees = (lt_entry_px * lt_entry_qty + lt_exit_px * lt_exit_qty) * lt_rate;
     gross - ext_fees - lt_fees
 }
 

@@ -12,7 +12,7 @@
 //!   above dust.
 //! - Partial-fill aggregation across rounds (catalogue case 6) so
 //!   a 60 % maker fill + 40 % taker fallback emits one
-//!   `ExtendedTerminal::Filled { qty: full }` rather than a stream
+//!   `ExtendedTerminal::Filled { qty: full, avg_fill_price: None }` rather than a stream
 //!   of partial events the state machine can't make sense of.
 //!
 //! What this module does NOT own:
@@ -133,6 +133,10 @@ impl<'a, V: VenueOps + ?Sized> ExtendedMakerLoop<'a, V> {
         if outcome.total_filled > Decimal::ZERO {
             ExtendedTerminal::Filled {
                 qty: outcome.total_filled,
+                avg_fill_price: super::types::avg_price_from_value_qty(
+                    outcome.total_filled_value,
+                    outcome.total_filled,
+                ),
             }
         } else {
             ExtendedTerminal::Failed {
@@ -214,6 +218,7 @@ mod tests {
             // Single poll returns terminal-filled with the full qty.
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.1),
                     terminal: true,
                     cancelled: false,
@@ -222,7 +227,13 @@ mod tests {
         let cfg = cfg_with_taker_fallback();
         let lp = ExtendedMakerLoop::new(&ops, &cfg).with_poll_interval(10);
         let res = lp.run_entry(req_long(dec!(0.1))).await;
-        assert_eq!(res, ExtendedTerminal::Filled { qty: dec!(0.1) });
+        assert_eq!(
+            res,
+            ExtendedTerminal::Filled {
+                qty: dec!(0.1),
+                avg_fill_price: None
+            }
+        );
         let posts = ops.snapshot_posts();
         assert_eq!(posts.len(), 1);
         assert_eq!(posts[0].3, dec!(78000)); // post-only at best bid
@@ -276,6 +287,7 @@ mod tests {
             for _ in 0..6 {
                 s.poll_fill
                     .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                        filled_value: None,
                         filled_qty: Decimal::ZERO,
                         terminal: false,
                         cancelled: false,
@@ -289,6 +301,7 @@ mod tests {
             // maker's 6 non-terminal polls.
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.1),
                     terminal: true,
                     cancelled: false,
@@ -307,7 +320,13 @@ mod tests {
         };
         let lp = ExtendedMakerLoop::new(&ops, &cfg).with_poll_interval(20);
         let res = lp.run_entry(req_long(dec!(0.1))).await;
-        assert_eq!(res, ExtendedTerminal::Filled { qty: dec!(0.1) });
+        assert_eq!(
+            res,
+            ExtendedTerminal::Filled {
+                qty: dec!(0.1),
+                avg_fill_price: None
+            }
+        );
         assert_eq!(ops.snapshot_posts().len(), 1);
         assert_eq!(ops.snapshot_takers().len(), 1);
     }
@@ -326,12 +345,14 @@ mod tests {
             // Maker round 1 polls — partial 0.04, then terminal at 0.04.
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.04),
                     terminal: false,
                     cancelled: false,
                 }));
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.04),
                     terminal: true,
                     cancelled: false,
@@ -339,6 +360,7 @@ mod tests {
             // Taker fallback poll: fills the 0.06 residual.
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.06),
                     terminal: true,
                     cancelled: false,
@@ -358,7 +380,13 @@ mod tests {
         let lp = ExtendedMakerLoop::new(&ops, &cfg).with_poll_interval(20);
         let res = lp.run_entry(req_long(dec!(0.1))).await;
         // Maker 0.04 + taker 0.06 = 0.10.
-        assert_eq!(res, ExtendedTerminal::Filled { qty: dec!(0.1) });
+        assert_eq!(
+            res,
+            ExtendedTerminal::Filled {
+                qty: dec!(0.1),
+                avg_fill_price: None
+            }
+        );
     }
 
     /// Post-only short uses best_ask, not best_bid.
@@ -372,6 +400,7 @@ mod tests {
             };
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.1),
                     terminal: true,
                     cancelled: false,
@@ -398,6 +427,7 @@ mod tests {
             };
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.1),
                     terminal: true,
                     cancelled: false,
@@ -416,7 +446,13 @@ mod tests {
         };
         let lp = ExtendedMakerLoop::new(&ops, &cfg).with_poll_interval(10);
         let res = lp.run_entry(req_long(dec!(0.1))).await;
-        assert_eq!(res, ExtendedTerminal::Filled { qty: dec!(0.1) });
+        assert_eq!(
+            res,
+            ExtendedTerminal::Filled {
+                qty: dec!(0.1),
+                avg_fill_price: None
+            }
+        );
         assert!(ops.snapshot_posts().is_empty());
         assert_eq!(ops.snapshot_takers().len(), 1);
     }
@@ -449,6 +485,7 @@ mod tests {
             // Taker succeeds.
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.1),
                     terminal: true,
                     cancelled: false,
@@ -457,7 +494,13 @@ mod tests {
         let cfg = cfg_with_taker_fallback();
         let lp = ExtendedMakerLoop::new(&ops, &cfg).with_poll_interval(10);
         let res = lp.run_entry(req_long(dec!(0.1))).await;
-        assert_eq!(res, ExtendedTerminal::Filled { qty: dec!(0.1) });
+        assert_eq!(
+            res,
+            ExtendedTerminal::Filled {
+                qty: dec!(0.1),
+                avg_fill_price: None
+            }
+        );
     }
 
     /// Place error + no fallback → VenueRejected.
@@ -496,6 +539,7 @@ mod tests {
             // FIFO: round 1 first → terminal-cancelled with zero fill.
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.0),
                     terminal: true,
                     cancelled: true,
@@ -503,6 +547,7 @@ mod tests {
             // Round 2 next → terminal-filled.
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.1),
                     terminal: true,
                     cancelled: false,
@@ -521,7 +566,13 @@ mod tests {
         };
         let lp = ExtendedMakerLoop::new(&ops, &cfg).with_poll_interval(20);
         let res = lp.run_entry(req_long(dec!(0.1))).await;
-        assert_eq!(res, ExtendedTerminal::Filled { qty: dec!(0.1) });
+        assert_eq!(
+            res,
+            ExtendedTerminal::Filled {
+                qty: dec!(0.1),
+                avg_fill_price: None
+            }
+        );
         assert_eq!(ops.snapshot_posts().len(), 2);
     }
 
@@ -536,6 +587,7 @@ mod tests {
             };
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.1),
                     terminal: true,
                     cancelled: false,
@@ -583,6 +635,7 @@ mod tests {
             // residual = 0.0006 < venue_min_qty (0.01) → no taker.
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.021),
                     terminal: true,
                     cancelled: false,
@@ -609,7 +662,13 @@ mod tests {
             reduce_only: false,
         };
         let res = lp.run_entry(req).await;
-        assert_eq!(res, ExtendedTerminal::Filled { qty: dec!(0.021) });
+        assert_eq!(
+            res,
+            ExtendedTerminal::Filled {
+                qty: dec!(0.021),
+                avg_fill_price: None
+            }
+        );
         assert!(
             ops.snapshot_takers().is_empty(),
             "taker must not be called when residual < venue_min_qty"
@@ -631,6 +690,7 @@ mod tests {
             // would loop, so report terminal-filled with the partial).
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.021),
                     terminal: true,
                     cancelled: false,
@@ -638,6 +698,7 @@ mod tests {
             // Taker poll fills the 0.0006 residual.
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.0006),
                     terminal: true,
                     cancelled: false,
@@ -658,7 +719,13 @@ mod tests {
         // venue_min_qty=0 keeps the old behavior — residual > dust → taker.
         let req = req_long(dec!(0.0216));
         let res = lp.run_entry(req).await;
-        assert_eq!(res, ExtendedTerminal::Filled { qty: dec!(0.0216) });
+        assert_eq!(
+            res,
+            ExtendedTerminal::Filled {
+                qty: dec!(0.0216),
+                avg_fill_price: None
+            }
+        );
         assert_eq!(
             ops.snapshot_takers().len(),
             1,
@@ -683,6 +750,7 @@ mod tests {
             // the deadline (FillStatus with terminal=false stays open).
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: Decimal::ZERO,
                     terminal: false,
                     cancelled: false,
@@ -690,6 +758,7 @@ mod tests {
             // The grace re-poll sees the late fill.
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.021),
                     terminal: true,
                     cancelled: false,
@@ -710,7 +779,10 @@ mod tests {
         let res = lp.run_entry(req_long(dec!(0.021))).await;
         assert_eq!(
             res,
-            ExtendedTerminal::Filled { qty: dec!(0.021) },
+            ExtendedTerminal::Filled {
+                qty: dec!(0.021),
+                avg_fill_price: None
+            },
             "grace-poll should recover the late fill instead of returning Failed{{Timeout}}"
         );
     }
@@ -729,6 +801,7 @@ mod tests {
             // Initial taker poll: never terminal.
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: Decimal::ZERO,
                     terminal: false,
                     cancelled: false,
@@ -736,6 +809,7 @@ mod tests {
             // Grace re-poll: still no fill.
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: Decimal::ZERO,
                     terminal: false,
                     cancelled: false,

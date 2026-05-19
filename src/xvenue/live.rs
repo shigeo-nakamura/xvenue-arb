@@ -338,14 +338,20 @@ pub struct LivePaperSummary {
 #[derive(Debug, Clone)]
 pub struct LiveEntryCtx {
     pub direction: SpreadDirection,
-    /// Per-venue mid at the time the entry leg landed. Mid-based
-    /// approximation — actual fill prices would be slightly worse
-    /// (post-only at touch / taker crosses spread) but the
-    /// difference is absorbed into the fee rate (default 5 bps
-    /// covers typical maker/taker mix). Replace with real fill
-    /// prices in a Sprint 6 once the executor surfaces them.
+    /// Per-venue mid at the time the entry leg landed. Used as the
+    /// fallback when the executor did not surface an avg fill price
+    /// for the entry round (e.g. dry-run paper synthesis, reduce-only
+    /// "Position is missing" short-circuit). bot-strategy#435.
     pub ext_entry_mid: Decimal,
     pub lt_entry_mid: Decimal,
+    /// Volume-weighted average fill price for the entry leg, derived
+    /// from the venue's per-partial-fill metadata via
+    /// `*Terminal::Filled.avg_fill_price`. `None` means at least one
+    /// contributing round did not surface a fill value — downstream
+    /// `compute_realised_pnl` falls back to `*_entry_mid` for the
+    /// affected leg. bot-strategy#435.
+    pub ext_entry_avg_fill_price: Option<Decimal>,
+    pub lt_entry_avg_fill_price: Option<Decimal>,
     pub ext_entry_qty: Decimal,
     pub lt_entry_qty: Decimal,
 }
@@ -2178,6 +2184,7 @@ emergency_complete_grace_ms: 0  # tests assert immediate-complete on zero (#287 
             // sizing layer picks — terminal=true on the first poll so
             // the run completes in O(1) polls.
             s.default_fill = OrderFillStatus {
+                filled_value: None,
                 filled_qty: dec!(1),
                 terminal: true,
                 cancelled: false,
@@ -2186,6 +2193,7 @@ emergency_complete_grace_ms: 0  # tests assert immediate-complete on zero (#287 
         let lt_vops = Arc::new(ScriptedVenueOps::new());
         lt_vops.with_state(|s| {
             s.default_fill = OrderFillStatus {
+                filled_value: None,
                 filled_qty: dec!(1),
                 terminal: true,
                 cancelled: false,
@@ -2230,6 +2238,7 @@ emergency_complete_grace_ms: 0  # tests assert immediate-complete on zero (#287 
         // its call count stays zero.
         lt_vops.with_state(|s| {
             s.default_fill = OrderFillStatus {
+                filled_value: None,
                 filled_qty: dec!(1),
                 terminal: true,
                 cancelled: false,
@@ -2268,6 +2277,7 @@ emergency_complete_grace_ms: 0  # tests assert immediate-complete on zero (#287 
         let ext_vops = Arc::new(ScriptedVenueOps::new());
         ext_vops.with_state(|s| {
             s.default_fill = OrderFillStatus {
+                filled_value: None,
                 filled_qty: dec!(1),
                 terminal: true,
                 cancelled: false,
@@ -2670,6 +2680,7 @@ leg_mismatch_timeout_ms: 100
             // exit takers — extended_post_only=false in cfg means
             // both cycles skip maker and hit place_taker.
             s.default_fill = OrderFillStatus {
+                filled_value: None,
                 filled_qty: dec!(1),
                 terminal: true,
                 cancelled: false,
@@ -2678,6 +2689,7 @@ leg_mismatch_timeout_ms: 100
         let lt_vops = Arc::new(ScriptedVenueOps::new());
         lt_vops.with_state(|s| {
             s.default_fill = OrderFillStatus {
+                filled_value: None,
                 filled_qty: dec!(1),
                 terminal: true,
                 cancelled: false,
@@ -2723,6 +2735,7 @@ leg_mismatch_timeout_ms: 100
         let ext_vops = Arc::new(ScriptedVenueOps::new());
         ext_vops.with_state(|s| {
             s.default_fill = OrderFillStatus {
+                filled_value: None,
                 filled_qty: dec!(1),
                 terminal: true,
                 cancelled: false,
@@ -2735,6 +2748,7 @@ leg_mismatch_timeout_ms: 100
         lt_vops.with_state(|s| {
             s.poll_fill.push_back(
                 crate::trade::execution::venue_ops::ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(1),
                     terminal: true,
                     cancelled: false,
@@ -2779,6 +2793,7 @@ leg_mismatch_timeout_ms: 100
         let ext_vops = Arc::new(ScriptedVenueOps::new());
         ext_vops.with_state(|s| {
             s.default_fill = OrderFillStatus {
+                filled_value: None,
                 filled_qty: dec!(1),
                 terminal: true,
                 cancelled: false,
@@ -2789,6 +2804,7 @@ leg_mismatch_timeout_ms: 100
             // Entry: terminal-filled (queued — first pop).
             s.poll_fill.push_back(
                 crate::trade::execution::venue_ops::ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(1),
                     terminal: true,
                     cancelled: false,
@@ -2798,6 +2814,7 @@ leg_mismatch_timeout_ms: 100
             // LighterTerminal::Failed{Cancelled}. ParallelExitLoop
             // returns `Both { ext: Filled, lt: Failed }`.
             s.default_fill = OrderFillStatus {
+                filled_value: None,
                 filled_qty: Decimal::ZERO,
                 terminal: true,
                 cancelled: true,
@@ -3285,6 +3302,10 @@ leg_mismatch_timeout_ms: 100
             dec!(100),
             dec!(110),
             dec!(105),
+            None,
+            None,
+            None,
+            None,
             dec!(1),
             dec!(1),
             dec!(1),
@@ -3293,6 +3314,93 @@ leg_mismatch_timeout_ms: 100
             0.0,
         );
         assert_eq!(pnl, dec!(5));
+    }
+
+    /// bot-strategy#435: when avg_fill_price is provided for every
+    /// leg + side, the function uses it instead of mids. Reproduces
+    /// the 2026-05-19 05:14 UTC live cycle:
+    ///
+    ///   - Short direction, qty 0.023
+    ///   - Mid view at ENTER: ext=2131.05, lt=2128.77
+    ///   - Mid view at EXIT:  ext=2129.45, lt=2129.82
+    ///   - Actual fills (Extended trade_pnl exports + Lighter CSV):
+    ///       ext_entry SELL 2128.20, ext_exit BUY 2129.50
+    ///       lt_entry  BUY  2129.61, lt_exit  SELL 2130.08
+    ///   - Extended fees 5 bps both sides
+    ///
+    /// Expected: ground-truth realised across both venues comes to
+    /// roughly -\$0.043 (Ext -0.054 trade -0.024 fees, Lt +0.011),
+    /// vs the mid-based +\$0.0121 the pre-#435 function reported.
+    /// We assert the fill-based path matches the venue export
+    /// within rounding.
+    #[test]
+    fn pnl_uses_fill_prices_when_provided_short_cycle() {
+        let pnl = compute_realised_pnl(
+            SpreadDirection::Short,
+            dec!(2131.05),       // ext_entry_mid (ignored — fill provided)
+            dec!(2128.77),       // lt_entry_mid (ignored)
+            dec!(2129.45),       // ext_exit_mid (ignored)
+            dec!(2129.82),       // lt_exit_mid (ignored)
+            Some(dec!(2128.20)), // ext entry fill
+            Some(dec!(2129.61)), // lt entry fill
+            Some(dec!(2129.50)), // ext exit fill
+            Some(dec!(2130.08)), // lt exit fill
+            dec!(0.023),         // ext_entry_qty
+            dec!(0.023),         // lt_entry_qty (use 0.023 to keep min identical)
+            dec!(0.023),         // ext_exit_qty
+            dec!(0.023),         // lt_exit_qty
+            5.0,                 // ext fee bps
+            0.0,                 // lt fee bps
+        );
+        // Manual derivation:
+        //   entry_spread = 2128.20 - 2129.61 = -1.41
+        //   exit_spread  = 2129.50 - 2130.08 = -0.58
+        //   gross (Short) = (entry - exit) * qty = (-1.41 - -0.58) * 0.023 = -0.01909
+        //   ext_fees = (2128.20 + 2129.50) * 0.023 * 0.0005 = 0.0489...
+        //   net = -0.01909 - 0.0489 = -0.0680 USDC
+        // (Lighter has 0 fees by config.)
+        let expected = dec!(-0.06799385);
+        let diff = (pnl - expected).abs();
+        assert!(
+            diff < dec!(0.0001),
+            "fill-based PnL {} did not match expected {} (diff {})",
+            pnl,
+            expected,
+            diff
+        );
+    }
+
+    /// Mixed: entry has fill prices but exit doesn't (e.g. exit
+    /// went through `Position is missing` reduce-only short-circuit
+    /// which returns synthetic success without a real fill). The
+    /// function falls back to the exit *mid* only for the missing
+    /// side; the entry path still uses fills. This is the back-compat
+    /// behaviour required so the existing mid-based dry-run paper
+    /// path and the emergency-recovery 0.0 placeholder don't break
+    /// when only some sides surface fill data. bot-strategy#435.
+    #[test]
+    fn pnl_falls_back_to_mid_per_leg_when_fill_unavailable() {
+        let pnl = compute_realised_pnl(
+            SpreadDirection::Long,
+            dec!(100),       // ext_entry_mid (fallback, not used)
+            dec!(100),       // lt_entry_mid (fallback, not used)
+            dec!(110),       // ext_exit_mid (USED — exit fill is None)
+            dec!(105),       // lt_exit_mid (USED — exit fill is None)
+            Some(dec!(101)), // ext entry fill — replaces mid
+            Some(dec!(102)), // lt entry fill — replaces mid
+            None,            // ext exit — fall back to mid 110
+            None,            // lt exit  — fall back to mid 105
+            dec!(1),
+            dec!(1),
+            dec!(1),
+            dec!(1),
+            0.0,
+            0.0,
+        );
+        // entry_spread = 101 - 102 = -1
+        // exit_spread  = 110 - 105 = +5
+        // gross (Long) = (5 - (-1)) * 1 = 6
+        assert_eq!(pnl, dec!(6));
     }
 
     #[test]
@@ -3305,6 +3413,10 @@ leg_mismatch_timeout_ms: 100
             dec!(100),
             dec!(105),
             dec!(100),
+            None,
+            None,
+            None,
+            None,
             dec!(1),
             dec!(1),
             dec!(1),
@@ -3324,6 +3436,10 @@ leg_mismatch_timeout_ms: 100
             dec!(100),
             dec!(105),
             dec!(110),
+            None,
+            None,
+            None,
+            None,
             dec!(1),
             dec!(1),
             dec!(1),
@@ -3348,6 +3464,10 @@ leg_mismatch_timeout_ms: 100
             dec!(100),
             dec!(100),
             dec!(100),
+            None,
+            None,
+            None,
+            None,
             dec!(1),
             dec!(1),
             dec!(1),
@@ -3368,6 +3488,10 @@ leg_mismatch_timeout_ms: 100
             dec!(100),
             dec!(110),
             dec!(105),
+            None,
+            None,
+            None,
+            None,
             dec!(1),
             dec!(1),
             Decimal::ZERO,
@@ -3389,6 +3513,10 @@ leg_mismatch_timeout_ms: 100
             dec!(100),
             dec!(110),
             dec!(105),
+            None,
+            None,
+            None,
+            None,
             dec!(1),
             dec!(1),
             dec!(0.5),
@@ -3416,6 +3544,10 @@ leg_mismatch_timeout_ms: 100
             dec!(2000),
             dec!(2004),
             dec!(2000),
+            None,
+            None,
+            None,
+            None,
             dec!(0.025),
             dec!(0.025),
             dec!(0.025),
@@ -3448,6 +3580,7 @@ leg_mismatch_timeout_ms: 100
         let ext_vops = Arc::new(ScriptedVenueOps::new());
         ext_vops.with_state(|s| {
             s.default_fill = OrderFillStatus {
+                filled_value: None,
                 filled_qty: dec!(1),
                 terminal: true,
                 cancelled: false,
@@ -3456,6 +3589,7 @@ leg_mismatch_timeout_ms: 100
         let lt_vops = Arc::new(ScriptedVenueOps::new());
         lt_vops.with_state(|s| {
             s.default_fill = OrderFillStatus {
+                filled_value: None,
                 filled_qty: dec!(1),
                 terminal: true,
                 cancelled: false,
@@ -3503,6 +3637,7 @@ leg_mismatch_timeout_ms: 100
             // poll — keeps the test deterministic without juggling
             // queues.
             s.default_fill = OrderFillStatus {
+                filled_value: None,
                 filled_qty: dec!(0.5),
                 terminal: true,
                 cancelled: false,
@@ -3511,6 +3646,7 @@ leg_mismatch_timeout_ms: 100
         let lt_vops = Arc::new(ScriptedVenueOps::new());
         lt_vops.with_state(|s| {
             s.default_fill = OrderFillStatus {
+                filled_value: None,
                 filled_qty: dec!(1.0),
                 terminal: true,
                 cancelled: false,

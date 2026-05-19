@@ -140,15 +140,23 @@ impl<'a, V: VenueOps + ?Sized> LighterFillLoop<'a, V> {
         let _ = self.ops.cancel(&req.symbol, &placed.order_id).await;
 
         let filled = outcome.filled_this_round;
+        let avg_fill_price =
+            super::types::avg_price_from_value_qty(outcome.filled_value_this_round, filled);
         if filled >= req.target_qty - req.dust_qty && filled > Decimal::ZERO {
-            return LighterTerminal::Filled { qty: filled };
+            return LighterTerminal::Filled {
+                qty: filled,
+                avg_fill_price,
+            };
         }
         if filled > Decimal::ZERO {
             // Partial fill above zero but below dust threshold —
             // still surface as `Filled{partial}` per case 7.
             // Skew monitor catches downstream if the resulting
             // skew breaches `max_inventory_skew_usd`.
-            return LighterTerminal::Filled { qty: filled };
+            return LighterTerminal::Filled {
+                qty: filled,
+                avg_fill_price,
+            };
         }
         if outcome.terminal_cancelled {
             LighterTerminal::Failed {
@@ -229,6 +237,7 @@ mod tests {
         ops.with_state(|s| {
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.1),
                     terminal: true,
                     cancelled: false,
@@ -237,7 +246,13 @@ mod tests {
         let cfg = cfg_market();
         let lp = LighterFillLoop::new(&ops, &cfg).with_poll_interval(10);
         let res = lp.run(req_long(dec!(0.1))).await;
-        assert_eq!(res, LighterTerminal::Filled { qty: dec!(0.1) });
+        assert_eq!(
+            res,
+            LighterTerminal::Filled {
+                qty: dec!(0.1),
+                avg_fill_price: None
+            }
+        );
         assert_eq!(ops.snapshot_takers().len(), 1);
         assert!(ops.snapshot_posts().is_empty());
     }
@@ -269,12 +284,14 @@ mod tests {
             // run out the clock. Aggregator keeps the max.
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.04),
                     terminal: false,
                     cancelled: false,
                 }));
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.06),
                     terminal: false,
                     cancelled: false,
@@ -291,7 +308,13 @@ mod tests {
         let res = lp.run(req_long(dec!(0.1))).await;
         // 0.06 is the latest aggregator value (above dust=0.0001
         // but below target=0.1). Partial-emit per case 7.
-        assert_eq!(res, LighterTerminal::Filled { qty: dec!(0.06) });
+        assert_eq!(
+            res,
+            LighterTerminal::Filled {
+                qty: dec!(0.06),
+                avg_fill_price: None
+            }
+        );
     }
 
     /// Aggressive-limit reads top-of-book and crosses the spread.
@@ -305,6 +328,7 @@ mod tests {
             };
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.1),
                     terminal: true,
                     cancelled: false,
@@ -313,7 +337,13 @@ mod tests {
         let cfg = cfg_aggressive();
         let lp = LighterFillLoop::new(&ops, &cfg).with_poll_interval(10);
         let res = lp.run(req_long(dec!(0.1))).await;
-        assert_eq!(res, LighterTerminal::Filled { qty: dec!(0.1) });
+        assert_eq!(
+            res,
+            LighterTerminal::Filled {
+                qty: dec!(0.1),
+                avg_fill_price: None
+            }
+        );
         // place_taker captures (symbol, side, qty, reduce_only) only;
         // price is enforced venue-side. Verify the place call ran.
         assert_eq!(ops.snapshot_takers().len(), 1);
@@ -382,6 +412,7 @@ mod tests {
         ops.with_state(|s| {
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: Decimal::ZERO,
                     terminal: true,
                     cancelled: true,
@@ -404,6 +435,7 @@ mod tests {
         ops.with_state(|s| {
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.1),
                     terminal: true,
                     cancelled: false,
