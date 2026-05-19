@@ -170,6 +170,139 @@ impl BtSummary {
     }
 }
 
+/// Maximum full-spread (in bps of mid) the IOC fill model will treat as
+/// tradable. Beyond this, the book is judged a phantom / stale-guard
+/// read and the BT falls back to the flat slippage knob. bot-strategy#454.
+const MAX_TRADABLE_FULL_SPREAD_BPS: i64 = 50;
+
+/// Top-of-book snapshot at an evaluation point — used by the IOC fill
+/// model to compute the actual fill price as a function of side, qty,
+/// and the resting liquidity. bot-strategy#454 step 2a.
+///
+/// Only the touch level is captured because the replay dumps only carry
+/// top-of-book (`bid_price` / `ask_price` / `bid_size` / `ask_size`),
+/// not full L2. The fill model walks "into the book" via a simple
+/// 1-bps-per-overflow-multiple heuristic when our qty exceeds the top
+/// level — adequate for the bot's `$50` notional regime where the top
+/// is usually deeper than our order, but acknowledged as conservative
+/// when notional ramps approach top-of-book size.
+#[derive(Debug, Clone, Copy)]
+pub struct BookSnapshot {
+    pub mid: Decimal,
+    pub bid_price: Decimal,
+    pub ask_price: Decimal,
+    pub bid_size: Decimal,
+    pub ask_size: Decimal,
+}
+
+impl BookSnapshot {
+    /// True when both sides have a positive price AND a positive size
+    /// AND the inside spread is plausible. The IOC fill model is
+    /// undefined on degenerate books, and on phantom books with wild
+    /// guard prices (Lighter's dump occasionally records bid=mid-X / ask=mid+X
+    /// pairs hundreds of dollars wide when one side has no near-touch
+    /// liquidity — e.g. `bid=1774 ask=2494 mid=2134` with 0.1 size on
+    /// both sides). We treat anything wider than `MAX_TRADABLE_FULL_SPREAD_BPS`
+    /// as a non-tradable book so the BT falls back to the flat slippage
+    /// knob instead of charging a $720-wide phantom IOC at the touch.
+    pub fn tradable(&self) -> bool {
+        if self.bid_price <= Decimal::ZERO
+            || self.ask_price <= Decimal::ZERO
+            || self.bid_size <= Decimal::ZERO
+            || self.ask_size <= Decimal::ZERO
+            || self.mid <= Decimal::ZERO
+        {
+            return false;
+        }
+        // Spread sanity check. Lighter ETH normally runs <= ~5 bps full
+        // spread (per memory bot-strategy#192 — wider than Extended's
+        // ~0.5 bps but well within this cap). Anything past 50 bps is a
+        // stale / one-sided guard book.
+        let full_spread = self.ask_price - self.bid_price;
+        if full_spread <= Decimal::ZERO {
+            return false;
+        }
+        let full_spread_bps = full_spread / self.mid * Decimal::from(10_000);
+        full_spread_bps <= Decimal::from(MAX_TRADABLE_FULL_SPREAD_BPS)
+    }
+
+    /// IOC taker fill price for `qty` on the venue side implied by
+    /// `direction`. Walking model:
+    ///
+    /// - If `qty <= touch_size`: fill at the touch (best_ask for buy /
+    ///   best_bid for sell). Slippage vs mid is the half-spread.
+    /// - If `qty > touch_size`: fill at the touch plus a 1 bp penalty
+    ///   for each whole multiple of `touch_size` we exceed. e.g.
+    ///   `qty = 1.5 * touch_size` → +1 bp; `qty = 3 * touch_size` → +3
+    ///   bps. Heuristic-only because the dump lacks L2; tune the
+    ///   multiplier if calibration shows it's biased.
+    ///
+    /// Returns `None` if the book isn't tradable (caller falls back to
+    /// the flat `*_round_trip_slippage_bps` knob).
+    pub fn ioc_fill_price(&self, side: IocSide, qty: Decimal) -> Option<Decimal> {
+        if !self.tradable() || qty <= Decimal::ZERO {
+            return None;
+        }
+        let (touch_price, touch_size) = match side {
+            IocSide::Buy => (self.ask_price, self.ask_size),
+            IocSide::Sell => (self.bid_price, self.bid_size),
+        };
+        if touch_price <= Decimal::ZERO || touch_size <= Decimal::ZERO {
+            return None;
+        }
+        if qty <= touch_size {
+            return Some(touch_price);
+        }
+        // Overflow penalty: 1 bp per full overflow multiple of
+        // touch_size. Adverse direction depending on side.
+        let overflow_ratio = (qty / touch_size).to_f64().unwrap_or(1.0);
+        let extra_multiples = (overflow_ratio - 1.0).max(0.0).floor();
+        let penalty_bps = extra_multiples; // 1 bp per overflow multiple
+        let penalty = Decimal::from_f64(penalty_bps / 10_000.0).unwrap_or(Decimal::ZERO);
+        let signed_penalty = match side {
+            IocSide::Buy => Decimal::ONE + penalty,
+            IocSide::Sell => Decimal::ONE - penalty,
+        };
+        Some(touch_price * signed_penalty)
+    }
+}
+
+/// Which side of the touch a marketable taker order lands on. Mirrors
+/// `dex_connector::OrderSide` semantically but avoids dragging the
+/// connector type into the BT model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IocSide {
+    /// We're buying — cross the ask.
+    Buy,
+    /// We're selling — cross the bid.
+    Sell,
+}
+
+/// Helper: which side does each leg land on at entry, given the round-trip
+/// `direction`? Long spread (= long Extended, short Lighter) buys Ext and
+/// sells Lt at entry; Short is symmetric.
+pub fn entry_sides(direction: SpreadDirection) -> (IocSide, IocSide) {
+    match direction {
+        SpreadDirection::Long => (IocSide::Buy, IocSide::Sell),
+        SpreadDirection::Short => (IocSide::Sell, IocSide::Buy),
+    }
+}
+
+/// Helper: exit sides are simply reversed.
+pub fn exit_sides(direction: SpreadDirection) -> (IocSide, IocSide) {
+    let (ext, lt) = entry_sides(direction);
+    (
+        match ext {
+            IocSide::Buy => IocSide::Sell,
+            IocSide::Sell => IocSide::Buy,
+        },
+        match lt {
+            IocSide::Buy => IocSide::Sell,
+            IocSide::Sell => IocSide::Buy,
+        },
+    )
+}
+
 /// Track the open position's entry context for PnL settlement on exit.
 struct OpenLeg {
     direction: SpreadDirection,
@@ -177,6 +310,11 @@ struct OpenLeg {
     entry_dev_bps: f64,
     entry_ext_mid: Decimal,
     entry_lt_mid: Decimal,
+    /// bot-strategy#454 step 2a: per-leg book snapshots at entry, so
+    /// settle_trade can compute the actual IOC fill price (vs the prior
+    /// flat-slippage approximation).
+    entry_ext_book: Option<BookSnapshot>,
+    entry_lt_book: Option<BookSnapshot>,
     qty: Decimal,
 }
 
@@ -230,8 +368,10 @@ async fn run_bt_async(replay: &DualReplay, cfg: BtConfig) -> Result<BtSummary> {
         // Both connectors carry valid current-cursor snapshots; read
         // each. Symbols may differ per venue (Extended vs Lighter
         // dumps record under whatever each DEX uses).
-        let (ext_mid, mut ext_book_ok) = read_snapshot(&ext, &cfg.symbol_extended).await?;
-        let (lt_mid, mut lt_book_ok) = read_snapshot(&lt, &cfg.symbol_lighter).await?;
+        let (ext_book, mut ext_book_ok) = read_snapshot(&ext, &cfg.symbol_extended).await?;
+        let (lt_book, mut lt_book_ok) = read_snapshot(&lt, &cfg.symbol_lighter).await?;
+        let ext_mid = ext_book.mid;
+        let lt_mid = lt_book.mid;
 
         // Binance 1m reference cross-check: when the loaded reference
         // covers the current minute, suppress any side whose mid drifts
@@ -333,6 +473,8 @@ async fn run_bt_async(replay: &DualReplay, cfg: BtConfig) -> Result<BtSummary> {
                     entry_dev_bps: dev_at_entry,
                     entry_ext_mid: ext_mid,
                     entry_lt_mid: lt_mid,
+                    entry_ext_book: if ext_book_ok { Some(ext_book) } else { None },
+                    entry_lt_book: if lt_book_ok { Some(lt_book) } else { None },
                     qty,
                 });
             }
@@ -346,7 +488,19 @@ async fn run_bt_async(replay: &DualReplay, cfg: BtConfig) -> Result<BtSummary> {
                 machine.apply(ts_ms, Event::LighterExitFilled { qty })?;
 
                 let dev_at_exit = dev.unwrap_or(0.0);
-                let record = settle_trade(&cfg, leg, ts_ms, dev_at_exit, ext_mid, lt_mid, reason);
+                let exit_ext_book = if ext_book_ok { Some(ext_book) } else { None };
+                let exit_lt_book = if lt_book_ok { Some(lt_book) } else { None };
+                let record = settle_trade(
+                    &cfg,
+                    leg,
+                    ts_ms,
+                    dev_at_exit,
+                    ext_mid,
+                    lt_mid,
+                    exit_ext_book,
+                    exit_lt_book,
+                    reason,
+                );
                 trades.push(record);
             }
         }
@@ -374,7 +528,10 @@ async fn run_bt_async(replay: &DualReplay, cfg: BtConfig) -> Result<BtSummary> {
 /// phantom spread that the Phase 0 v2 Python sim avoids by computing
 /// mid from bid/ask. This was the dominant source of the Rust-vs-Python
 /// BT divergence (bot-strategy#166).
-async fn read_snapshot(c: &Arc<ReplayConnector>, symbol: &str) -> Result<(Decimal, bool)> {
+async fn read_snapshot(
+    c: &Arc<ReplayConnector>,
+    symbol: &str,
+) -> Result<(BookSnapshot, bool)> {
     use dex_connector::DexConnector;
     let ob = c
         .get_order_book(symbol, 1)
@@ -382,24 +539,33 @@ async fn read_snapshot(c: &Arc<ReplayConnector>, symbol: &str) -> Result<(Decima
         .map_err(|e| anyhow!("get_order_book({}): {:?}", symbol, e))?;
     let bid = ob.bids.first();
     let ask = ob.asks.first();
-    let book_ok = bid.map(|b| b.size > Decimal::ZERO).unwrap_or(false)
-        && ask.map(|a| a.size > Decimal::ZERO).unwrap_or(false);
-    let mid = match (bid, ask) {
-        (Some(b), Some(a)) if b.price > Decimal::ZERO && a.price > Decimal::ZERO => {
-            (b.price + a.price) / Decimal::from(2)
-        }
-        _ => {
-            // Degenerate / one-sided book: fall back to ticker price so
-            // we don't blow up. The book_ok flag will still suppress
-            // committing this sample upstream.
-            let t = c
-                .get_ticker(symbol, None)
-                .await
-                .map_err(|e| anyhow!("get_ticker({}): {:?}", symbol, e))?;
-            t.price
-        }
+    let bid_size = bid.map(|b| b.size).unwrap_or(Decimal::ZERO);
+    let ask_size = ask.map(|a| a.size).unwrap_or(Decimal::ZERO);
+    let bid_price = bid.map(|b| b.price).unwrap_or(Decimal::ZERO);
+    let ask_price = ask.map(|a| a.price).unwrap_or(Decimal::ZERO);
+    let book_ok = bid_size > Decimal::ZERO && ask_size > Decimal::ZERO;
+    let mid = if bid_price > Decimal::ZERO && ask_price > Decimal::ZERO {
+        (bid_price + ask_price) / Decimal::from(2)
+    } else {
+        // Degenerate / one-sided book: fall back to ticker price so we
+        // don't blow up. `book_ok=false` will still suppress committing
+        // this sample upstream.
+        let t = c
+            .get_ticker(symbol, None)
+            .await
+            .map_err(|e| anyhow!("get_ticker({}): {:?}", symbol, e))?;
+        t.price
     };
-    Ok((mid, book_ok))
+    Ok((
+        BookSnapshot {
+            mid,
+            bid_price,
+            ask_price,
+            bid_size,
+            ask_size,
+        },
+        book_ok,
+    ))
 }
 
 fn entry_qty(notional_usd: Decimal, ext_mid: Decimal) -> Result<Decimal> {
@@ -409,6 +575,46 @@ fn entry_qty(notional_usd: Decimal, ext_mid: Decimal) -> Result<Decimal> {
     Ok(notional_usd / ext_mid)
 }
 
+/// bot-strategy#454 step 2a — per-leg slippage cost in USD.
+///
+/// When both entry and exit book snapshots are present, compute
+/// `|fill - mid| * qty` for each side (entry + exit), summed. Falls
+/// back to the legacy flat `fallback_round_trip_slippage_bps * notional`
+/// formula when either snapshot is missing, so pre-#454 tests and
+/// dry-run fixtures keep working.
+#[allow(clippy::too_many_arguments)]
+fn compute_leg_slippage_cost(
+    entry_book: Option<BookSnapshot>,
+    exit_book: Option<BookSnapshot>,
+    entry_mid: Decimal,
+    exit_mid: Decimal,
+    qty: Decimal,
+    entry_side: IocSide,
+    exit_side: IocSide,
+    fallback_round_trip_slippage_bps: f64,
+    notional_usd: Decimal,
+) -> Decimal {
+    let bps_div = Decimal::from(10_000);
+    let book_side_cost = |book: Option<BookSnapshot>, mid: Decimal, side: IocSide| -> Option<Decimal> {
+        let book = book?;
+        let fill = book.ioc_fill_price(side, qty)?;
+        let adverse = (fill - mid).abs();
+        Some(adverse * qty)
+    };
+    let entry_cost = book_side_cost(entry_book, entry_mid, entry_side);
+    let exit_cost = book_side_cost(exit_book, exit_mid, exit_side);
+    match (entry_cost, exit_cost) {
+        (Some(e), Some(x)) => e + x,
+        _ => {
+            // Legacy flat slippage when book data is missing on either
+            // side. Equivalent to the pre-#454 single-knob model.
+            decimal_from_f64(fallback_round_trip_slippage_bps).unwrap_or(Decimal::ZERO)
+                * notional_usd
+                / bps_div
+        }
+    }
+}
+
 fn settle_trade(
     cfg: &BtConfig,
     leg: OpenLeg,
@@ -416,6 +622,8 @@ fn settle_trade(
     exit_dev_bps: f64,
     exit_ext_mid: Decimal,
     exit_lt_mid: Decimal,
+    exit_ext_book: Option<BookSnapshot>,
+    exit_lt_book: Option<BookSnapshot>,
     reason: ExitReason,
 ) -> TradeRecord {
     // Spread P&L: a Long-spread position opens with [+1 ext, -1 lt] qty
@@ -432,14 +640,45 @@ fn settle_trade(
     };
     let gross = signed_qty * (ext_delta - lt_delta);
 
+    // bot-strategy#454 step 2a — IOC slippage from book snapshots.
+    //
+    // When a venue book snapshot is available at entry AND exit we
+    // model the actual fill price (touch + walk-into-book penalty per
+    // `BookSnapshot::ioc_fill_price`). The per-leg slippage cost is the
+    // sum of `|fill_price - mid| * qty` across both legs' entry+exit
+    // sides — i.e. the *real* dollar cost of crossing the inside spread.
+    //
+    // When a snapshot is missing (degenerate book / pre-#454 fixtures),
+    // we fall back to the legacy flat `*_round_trip_slippage_bps` knob
+    // so existing tests stay green.
+    let (ext_entry_side, lt_entry_side) = entry_sides(leg.direction);
+    let (ext_exit_side, lt_exit_side) = exit_sides(leg.direction);
+    let ext_slip = compute_leg_slippage_cost(
+        leg.entry_ext_book,
+        exit_ext_book,
+        leg.entry_ext_mid,
+        exit_ext_mid,
+        leg.qty,
+        ext_entry_side,
+        ext_exit_side,
+        cfg.extended_round_trip_slippage_bps,
+        cfg.trade_notional_usd,
+    );
+    let lt_slip = compute_leg_slippage_cost(
+        leg.entry_lt_book,
+        exit_lt_book,
+        leg.entry_lt_mid,
+        exit_lt_mid,
+        leg.qty,
+        lt_entry_side,
+        lt_exit_side,
+        cfg.lighter_round_trip_slippage_bps,
+        cfg.trade_notional_usd,
+    );
+
     // Fees: round-trip on each leg = 2 * fee_bps * notional / 10_000.
     // Simplification: notional is held constant at the configured value
     // (entry/exit price drift typically <1% on these holds).
-    //
-    // Slippage is added to fees as bps * notional. It represents the
-    // bid-ask cost of crossing the book vs hitting mid (already round-
-    // trip). Set to 0 to keep mid-fill semantics. bot-strategy#166
-    // Phase 1 fill-model refinement.
     let two = Decimal::from(2);
     let bps_div = Decimal::from(10_000);
     let ext_fee = decimal_from_f64(cfg.extended_taker_fee_bps).unwrap_or(Decimal::ZERO)
@@ -449,12 +688,6 @@ fn settle_trade(
     let lt_fee = decimal_from_f64(cfg.lighter_taker_fee_bps).unwrap_or(Decimal::ZERO)
         * cfg.trade_notional_usd
         * two
-        / bps_div;
-    let ext_slip = decimal_from_f64(cfg.extended_round_trip_slippage_bps).unwrap_or(Decimal::ZERO)
-        * cfg.trade_notional_usd
-        / bps_div;
-    let lt_slip = decimal_from_f64(cfg.lighter_round_trip_slippage_bps).unwrap_or(Decimal::ZERO)
-        * cfg.trade_notional_usd
         / bps_div;
     let fees = ext_fee + lt_fee + ext_slip + lt_slip;
     let net = gross - fees;
@@ -567,6 +800,31 @@ mod tests {
             as_ = ask_size,
             sym = symbol,
             p = mid,
+            ets = timestamp_ms / 1000
+        )
+    }
+
+    /// bot-strategy#454 step 2a: fixture variant that lets the caller
+    /// set an explicit bid/ask spread so the IOC fill model has a non-
+    /// zero half-spread to charge. Mid is `(bid + ask) / 2`.
+    fn dump_line_spread(
+        timestamp_ms: i64,
+        symbol: &str,
+        bid: f64,
+        ask: f64,
+        bid_size: f64,
+        ask_size: f64,
+    ) -> String {
+        let mid = (bid + ask) / 2.0;
+        format!(
+            r#"{{"timestamp":{ts},"prices":{{"{sym}":{{"price":"{m}","funding_rate":"0","bid_price":"{b}","ask_price":"{a}","bid_size":"{bs}","ask_size":"{as_}","exchange_ts":{ets}}}}}}}"#,
+            ts = timestamp_ms,
+            b = bid,
+            a = ask,
+            bs = bid_size,
+            as_ = ask_size,
+            sym = symbol,
+            m = mid,
             ets = timestamp_ms / 1000
         )
     }
@@ -849,12 +1107,119 @@ mod tests {
         assert!(summary.trades.is_empty());
     }
 
+    /// bot-strategy#454 step 2a — legacy flat slippage still applies
+    /// when no book snapshot is available. Build a fixture where one
+    /// venue's book is degenerate (zero size on one side) and confirm
+    /// the fallback path is exercised. We can't easily express this
+    /// with the existing run_bt because the same flag also suppresses
+    /// the spread commit, so we exercise `compute_leg_slippage_cost`
+    /// directly instead.
     #[test]
-    fn slippage_subtracts_from_net_pnl() {
-        // Same one-cycle setup as bt_runs_one_full_cycle_with_mean_cross_exit
-        // but with explicit slippage configured. Verifies that fees +
-        // slippage are deducted and result is lower than the no-slippage
-        // baseline. bot-strategy#166 Phase 1 fill-model refinement.
+    fn flat_slippage_applies_when_book_snapshot_missing() {
+        let cost = compute_leg_slippage_cost(
+            None,
+            None,
+            dec!(2000),
+            dec!(2000),
+            dec!(0.025),
+            IocSide::Buy,
+            IocSide::Sell,
+            5.0, // bps
+            dec!(50),
+        );
+        // 5 bps × $50 / 10_000 = $0.025
+        assert_eq!(cost, dec!(0.025));
+    }
+
+    /// bot-strategy#454 step 2a — book-aware path: when both snapshots
+    /// are present, slippage = |fill - mid| × qty across entry + exit.
+    /// The fallback flat knob is ignored even when set.
+    #[test]
+    fn book_aware_slippage_uses_snapshots_over_flat_knob() {
+        // Bid 1999.5 / Ask 2000.5 / mid 2000.0 → half-spread = 0.5 per
+        // unit. Qty 0.025 → cost per side = 0.5 × 0.025 = 0.0125.
+        // Entry + exit = 0.025 USD per leg. Flat knob ignored.
+        let book = BookSnapshot {
+            mid: dec!(2000.0),
+            bid_price: dec!(1999.5),
+            ask_price: dec!(2000.5),
+            bid_size: dec!(10),
+            ask_size: dec!(10),
+        };
+        let cost = compute_leg_slippage_cost(
+            Some(book),
+            Some(book),
+            dec!(2000.0),
+            dec!(2000.0),
+            dec!(0.025),
+            IocSide::Buy,
+            IocSide::Sell,
+            999.0, // intentionally absurd flat knob — must be ignored
+            dec!(50),
+        );
+        assert_eq!(cost, dec!(0.025));
+    }
+
+    /// bot-strategy#454 step 2a — IOC overflow penalty: qty > touch size
+    /// triggers a 1 bp/overflow-multiple penalty. Touch size = 0.01,
+    /// qty = 0.025 → overflow ratio 2.5 → floor(1.5) = 1 multiple → 1 bp.
+    #[test]
+    fn ioc_fill_price_penalises_qty_exceeding_top_size() {
+        let book = BookSnapshot {
+            mid: dec!(2000),
+            bid_price: dec!(1999),
+            ask_price: dec!(2001),
+            bid_size: dec!(0.01),
+            ask_size: dec!(0.01),
+        };
+        // Buy 0.025 ETH while ask_size is 0.01: overflow ratio = 2.5,
+        // extra multiples = floor(1.5) = 1 → +1 bp penalty above ask.
+        let fill = book.ioc_fill_price(IocSide::Buy, dec!(0.025)).unwrap();
+        // 2001 × (1 + 0.0001) = 2001.2001
+        let expected = dec!(2001) * (Decimal::ONE + dec!(0.0001));
+        assert_eq!(fill, expected);
+    }
+
+    /// bot-strategy#454 step 2a — qty ≤ touch fills at the touch.
+    #[test]
+    fn ioc_fill_price_at_touch_when_qty_under_top_size() {
+        let book = BookSnapshot {
+            mid: dec!(2000),
+            bid_price: dec!(1999),
+            ask_price: dec!(2001),
+            bid_size: dec!(10),
+            ask_size: dec!(10),
+        };
+        assert_eq!(
+            book.ioc_fill_price(IocSide::Buy, dec!(0.025)).unwrap(),
+            dec!(2001)
+        );
+        assert_eq!(
+            book.ioc_fill_price(IocSide::Sell, dec!(0.025)).unwrap(),
+            dec!(1999)
+        );
+    }
+
+    /// bot-strategy#454 step 2a — degenerate book returns None.
+    #[test]
+    fn ioc_fill_price_none_on_degenerate_book() {
+        let book = BookSnapshot {
+            mid: dec!(2000),
+            bid_price: dec!(0),
+            ask_price: dec!(2001),
+            bid_size: dec!(10),
+            ask_size: dec!(10),
+        };
+        assert!(book.ioc_fill_price(IocSide::Buy, dec!(0.025)).is_none());
+    }
+
+    /// bot-strategy#454 step 2a — end-to-end: a one-cycle BT with an
+    /// explicit bid/ask spread should charge book-aware slippage equal
+    /// to the per-leg half-spread × qty across entry + exit, summed
+    /// across the two venues. With Ext 1-tick spread and Lt 5-tick
+    /// spread, slip is dominated by Lt.
+    #[test]
+    fn book_aware_slippage_charges_half_spread_in_run_bt() {
         let dir = tempfile::tempdir().unwrap();
         let mut ext_lines = Vec::new();
         let mut lt_lines = Vec::new();
@@ -862,49 +1227,53 @@ mod tests {
             let ts_ms = 1_776_000_000_000 + i * 1_000;
             let lt_mid = 78_000.0_f64;
             let ext_mid = if (60..130).contains(&i) {
-                lt_mid * 1.002
+                lt_mid * 1.002 // +20 bps breach
             } else {
                 lt_mid
             };
-            ext_lines.push(dump_line(ts_ms, "BTC", ext_mid));
-            lt_lines.push(dump_line(ts_ms, "BTC", lt_mid));
+            // Extended: 0.5-wide book (1 bp half-spread on each side)
+            ext_lines.push(dump_line_spread(
+                ts_ms,
+                "BTC",
+                ext_mid - 0.25,
+                ext_mid + 0.25,
+                1.0,
+                1.0,
+            ));
+            // Lighter: 5-wide book (3 bps half-spread on each side)
+            lt_lines.push(dump_line_spread(
+                ts_ms,
+                "BTC",
+                lt_mid - 2.5,
+                lt_mid + 2.5,
+                1.0,
+                1.0,
+            ));
         }
         let ext_path = write_dump(dir.path(), "ext.jsonl", &ext_lines);
         let lt_path = write_dump(dir.path(), "lt.jsonl", &lt_lines);
-
-        let make_cfg = || {
-            let mut c = BtConfig::default();
-            c.signal.min_warmup_samples = 30;
-            c.signal.persistence_sec = 5;
-            c.signal.abs_threshold_bps = 5.0;
-            c.extended_taker_fee_bps = 0.0;
-            c.lighter_taker_fee_bps = 0.0;
-            c.trade_notional_usd = dec!(100);
-            c
-        };
-
         let replay =
             DualReplay::new(ext_path.to_str().unwrap(), lt_path.to_str().unwrap()).unwrap();
-        let baseline = run_bt(&replay, make_cfg()).unwrap();
-        assert_eq!(baseline.trades.len(), 1);
-        let baseline_net = baseline.trades[0].net_pnl_usd;
-
-        // Re-run with 5 bps round-trip slippage on Lighter. With $100
-        // notional, the slippage cost should be 5 * 100 / 10000 = $0.05.
-        let replay2 =
-            DualReplay::new(ext_path.to_str().unwrap(), lt_path.to_str().unwrap()).unwrap();
-        let mut cfg = make_cfg();
-        cfg.lighter_round_trip_slippage_bps = 5.0;
-        let with_slip = run_bt(&replay2, cfg).unwrap();
-        assert_eq!(with_slip.trades.len(), 1);
-        let slip_net = with_slip.trades[0].net_pnl_usd;
-        let diff = (baseline_net - slip_net).to_f64().unwrap_or(0.0);
+        let mut cfg = BtConfig::default();
+        cfg.signal.min_warmup_samples = 30;
+        cfg.signal.persistence_sec = 5;
+        cfg.signal.abs_threshold_bps = 5.0;
+        cfg.extended_taker_fee_bps = 0.0;
+        cfg.lighter_taker_fee_bps = 0.0;
+        cfg.trade_notional_usd = dec!(100);
+        let summary = run_bt(&replay, cfg).unwrap();
+        assert_eq!(summary.trades.len(), 1);
+        // Per leg: qty = $100 / mid ≈ 0.00128, half-spread × 2 sides:
+        //   Ext: 0.25 × 0.00128 × 2 ≈ $0.00064
+        //   Lt:  2.5  × 0.00128 × 2 ≈ $0.0064
+        // Total ≈ $0.007. With zero fees, fees_usd should equal
+        // approximately this slippage.
+        let trade = &summary.trades[0];
+        let fees = trade.fees_usd.to_f64().unwrap();
         assert!(
-            (diff - 0.05).abs() < 1e-6,
-            "expected 5 bps slippage to cost $0.05, baseline {} - slip {} = {}",
-            baseline_net,
-            slip_net,
-            diff
+            (0.005..=0.010).contains(&fees),
+            "expected book-aware slip ~$0.007, got fees_usd={}",
+            fees
         );
     }
 }
