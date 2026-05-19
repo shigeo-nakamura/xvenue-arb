@@ -57,6 +57,17 @@ pub struct BtConfig {
     /// post-only ~-10 (rebate). Default 5.0 mirrors taker-only baseline
     /// so live numbers don't surprise downward; tune per Lighter regime.
     pub lighter_round_trip_slippage_bps: f64,
+    /// bot-strategy#454 step 2b: when true, model the Lighter leg as a
+    /// post-only chase + taker fallback (matches the live YAML knob
+    /// `lighter_post_only: true`). Each entry/exit side independently
+    /// draws a Bernoulli outcome from the linear-decay-by-depth model
+    /// (mirror of `would_be_maker_fill_outcome` in live_pnl.rs): if
+    /// filled as maker, we earn the half-spread; on miss we fall back
+    /// to the same taker fill the legacy step-2a path computes.
+    ///
+    /// Defaults to `false` so the pre-#454-2b taker-only baseline is
+    /// preserved when this field is unset.
+    pub lighter_post_only: bool,
     /// Path to a Binance 1m kline JSONL (one row per minute with
     /// `ts_ms` / `high` / `low`) used as a stale-quote reference. When
     /// set together with `binance_ref_max_dev_bps > 0`, any venue mid
@@ -84,6 +95,7 @@ impl Default for BtConfig {
             lighter_taker_fee_bps: 0.0,
             extended_round_trip_slippage_bps: 0.0,
             lighter_round_trip_slippage_bps: 0.0,
+            lighter_post_only: false,
             binance_ref_path: None,
             binance_ref_max_dev_bps: 0.0,
             record_buckets: false,
@@ -575,13 +587,31 @@ fn entry_qty(notional_usd: Decimal, ext_mid: Decimal) -> Result<Decimal> {
     Ok(notional_usd / ext_mid)
 }
 
-/// bot-strategy#454 step 2a — per-leg slippage cost in USD.
+/// bot-strategy#454 step 2a/2b — per-leg slippage cost in USD, signed
+/// against the trader.
 ///
-/// When both entry and exit book snapshots are present, compute
-/// `|fill - mid| * qty` for each side (entry + exit), summed. Falls
-/// back to the legacy flat `fallback_round_trip_slippage_bps * notional`
-/// formula when either snapshot is missing, so pre-#454 tests and
-/// dry-run fixtures keep working.
+/// Sign convention: positive cost = we paid more (Buy) / received less
+/// (Sell) than we would at mid. Negative cost = favorable fill (maker
+/// rest filled by an aggressor on the OPPOSITE side of the touch =
+/// earns the half-spread instead of paying it).
+///
+/// Each side independently picks taker (cross the touch) or maker
+/// (post-only chase with taker fallback) based on `post_only_with_fallback`:
+///
+/// - `false`: every side fills as taker, charging `|touch - mid| * qty`
+///   per side. This is the step-2a baseline.
+/// - `true`:  draw a Bernoulli outcome from the linear-decay-by-depth
+///   model (mirror of `would_be_maker_fill_outcome` in
+///   `src/xvenue/live_pnl.rs`). If `sampled_fill`, our resting order
+///   gets crossed by an aggressor — we fill at OUR rest side
+///   (opposite of taker), so the half-spread becomes revenue (negative
+///   cost). On miss, the chase exhausts and we cross the touch as
+///   taker (same as step 2a). Step 2c will add the chase-time penalty
+///   for misses; for now step 2b only accounts for the price difference.
+///
+/// Falls back to the legacy flat `fallback_round_trip_slippage_bps *
+/// notional` formula when either snapshot is missing — preserves the
+/// pre-#454 single-knob baseline for dry-run fixtures.
 #[allow(clippy::too_many_arguments)]
 fn compute_leg_slippage_cost(
     entry_book: Option<BookSnapshot>,
@@ -593,16 +623,27 @@ fn compute_leg_slippage_cost(
     exit_side: IocSide,
     fallback_round_trip_slippage_bps: f64,
     notional_usd: Decimal,
+    post_only_with_fallback: bool,
+    entry_seed: u64,
+    exit_seed: u64,
 ) -> Decimal {
     let bps_div = Decimal::from(10_000);
-    let book_side_cost = |book: Option<BookSnapshot>, mid: Decimal, side: IocSide| -> Option<Decimal> {
-        let book = book?;
-        let fill = book.ioc_fill_price(side, qty)?;
-        let adverse = (fill - mid).abs();
-        Some(adverse * qty)
-    };
-    let entry_cost = book_side_cost(entry_book, entry_mid, entry_side);
-    let exit_cost = book_side_cost(exit_book, exit_mid, exit_side);
+    let entry_cost = side_signed_cost(
+        entry_book,
+        entry_mid,
+        qty,
+        entry_side,
+        post_only_with_fallback,
+        entry_seed,
+    );
+    let exit_cost = side_signed_cost(
+        exit_book,
+        exit_mid,
+        qty,
+        exit_side,
+        post_only_with_fallback,
+        exit_seed,
+    );
     match (entry_cost, exit_cost) {
         (Some(e), Some(x)) => e + x,
         _ => {
@@ -613,6 +654,94 @@ fn compute_leg_slippage_cost(
                 / bps_div
         }
     }
+}
+
+/// Compute signed slippage for a single side (entry OR exit) of a
+/// single venue leg. Returns `None` when the book isn't tradable so
+/// the caller can fall back to the flat knob.
+///
+/// `post_only=true` runs a Bernoulli draw against the linear-decay-by-
+/// depth fill-probability model. The seed makes the outcome
+/// deterministic per BT run (test reproducibility) and per side
+/// (independent draws on entry vs exit).
+fn side_signed_cost(
+    book: Option<BookSnapshot>,
+    mid: Decimal,
+    qty: Decimal,
+    side: IocSide,
+    post_only: bool,
+    seed: u64,
+) -> Option<Decimal> {
+    let book = book?;
+    if post_only {
+        let outcome = would_be_maker_outcome(&book, side, qty, seed)?;
+        if outcome.sampled_fill {
+            // Filled as maker — our rest order at our side got crossed.
+            // For a Buy our rest is at the bid; for a Sell at the ask.
+            // So fill_price is the OPPOSITE touch from a taker cross.
+            let maker_fill = match side {
+                IocSide::Buy => book.bid_price,
+                IocSide::Sell => book.ask_price,
+            };
+            return Some(signed_side_cost(maker_fill, mid, side, qty));
+        }
+        // Miss → taker fallback (cross the touch, same as step 2a).
+    }
+    let taker_fill = book.ioc_fill_price(side, qty)?;
+    Some(signed_side_cost(taker_fill, mid, side, qty))
+}
+
+/// Signed per-side cost in USD: positive when adverse, negative when
+/// favorable. Encodes "we'd want to fill at mid" as the reference.
+fn signed_side_cost(fill: Decimal, mid: Decimal, side: IocSide, qty: Decimal) -> Decimal {
+    let per_unit = match side {
+        // Buy: we paid `fill` for one unit. Adverse if fill > mid.
+        IocSide::Buy => fill - mid,
+        // Sell: we received `fill` for one unit. Adverse if mid > fill.
+        IocSide::Sell => mid - fill,
+    };
+    per_unit * qty
+}
+
+/// Outcome of a single post-only Bernoulli draw — mirrors
+/// `live_pnl::would_be_maker_fill_outcome` but operates on the
+/// BT-local `BookSnapshot` type. The model is intentionally identical
+/// so a BT result calibrated against live can replay the same
+/// (sampled_fill, fill_p) sequence given the same seeds.
+fn would_be_maker_outcome(
+    book: &BookSnapshot,
+    side: IocSide,
+    qty: Decimal,
+    seed: u64,
+) -> Option<MakerOutcome> {
+    if !book.tradable() {
+        return None;
+    }
+    let our_size = qty.to_f64().filter(|s| s.is_finite() && *s > 0.0)?;
+    // Maker depth: the queue we'd join at our rest side. A Buy maker
+    // rests at the bid (joins bid queue, fills when a seller crosses
+    // down), so the depth that matters is `bid_size` (orders ahead of
+    // us). A Sell maker rests at the ask.
+    let depth = match side {
+        IocSide::Buy => book.bid_size,
+        IocSide::Sell => book.ask_size,
+    };
+    let depth_f = depth.to_f64().filter(|d| d.is_finite() && *d > 0.0)?;
+    let raw = 1.0 - (our_size / depth_f);
+    let fill_p = raw.clamp(0.0, 1.0);
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let draw: f64 = rng.gen();
+    Some(MakerOutcome {
+        fill_p,
+        sampled_fill: draw < fill_p,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MakerOutcome {
+    fill_p: f64,
+    sampled_fill: bool,
 }
 
 fn settle_trade(
@@ -653,6 +782,12 @@ fn settle_trade(
     // so existing tests stay green.
     let (ext_entry_side, lt_entry_side) = entry_sides(leg.direction);
     let (ext_exit_side, lt_exit_side) = exit_sides(leg.direction);
+    // bot-strategy#454 step 2b: derive deterministic per-side seeds
+    // from entry/exit timestamps. Independent draws per side per leg
+    // (the `^ 1` / `^ 2` mixes mirror the live runner's own seed
+    // disambiguation in entry/exit dispatch).
+    let lt_entry_seed = leg.entry_ts_ms ^ 0xA1;
+    let lt_exit_seed = exit_ts_ms ^ 0xA2;
     let ext_slip = compute_leg_slippage_cost(
         leg.entry_ext_book,
         exit_ext_book,
@@ -663,6 +798,13 @@ fn settle_trade(
         ext_exit_side,
         cfg.extended_round_trip_slippage_bps,
         cfg.trade_notional_usd,
+        // Extended remains taker at xvenue-arb today; future
+        // `extended_post_only: true` re-trial would flip this from a
+        // bool to whatever YAML knob is added.
+        false,
+        // Extended seeds intentionally unused while post_only=false.
+        0,
+        0,
     );
     let lt_slip = compute_leg_slippage_cost(
         leg.entry_lt_book,
@@ -674,6 +816,9 @@ fn settle_trade(
         lt_exit_side,
         cfg.lighter_round_trip_slippage_bps,
         cfg.trade_notional_usd,
+        cfg.lighter_post_only,
+        lt_entry_seed,
+        lt_exit_seed,
     );
 
     // Fees: round-trip on each leg = 2 * fee_bps * notional / 10_000.
@@ -1126,6 +1271,9 @@ mod tests {
             IocSide::Sell,
             5.0, // bps
             dec!(50),
+            false, // post_only — irrelevant for missing-book path
+            0,
+            0,
         );
         // 5 bps × $50 / 10_000 = $0.025
         assert_eq!(cost, dec!(0.025));
@@ -1156,6 +1304,9 @@ mod tests {
             IocSide::Sell,
             999.0, // intentionally absurd flat knob — must be ignored
             dec!(50),
+            false, // taker path
+            0,
+            0,
         );
         assert_eq!(cost, dec!(0.025));
     }
@@ -1211,6 +1362,88 @@ mod tests {
             ask_size: dec!(10),
         };
         assert!(book.ioc_fill_price(IocSide::Buy, dec!(0.025)).is_none());
+    }
+
+    /// bot-strategy#454 step 2b — post-only with infinite-depth book
+    /// fills as maker every time (fill_p = 1, sampled_fill always true).
+    /// The signed cost flips to NEGATIVE (we earn the half-spread).
+    #[test]
+    fn post_only_maker_earns_half_spread_when_depth_is_infinite() {
+        // Tiny qty vs huge depth → fill_p ≈ 1.0 → always fills as maker.
+        let book = BookSnapshot {
+            mid: dec!(2000.0),
+            bid_price: dec!(1999.5),
+            ask_price: dec!(2000.5),
+            bid_size: dec!(1_000_000),
+            ask_size: dec!(1_000_000),
+        };
+        let cost = compute_leg_slippage_cost(
+            Some(book),
+            Some(book),
+            dec!(2000.0),
+            dec!(2000.0),
+            dec!(0.025),
+            IocSide::Buy,
+            IocSide::Sell,
+            0.0, // no flat knob
+            dec!(50),
+            true, // post_only
+            42,
+            43,
+        );
+        // Per side, maker fill = our rest side (opposite of taker touch):
+        //   Buy maker → fill at bid = 1999.5 → cost = 1999.5 - 2000 = -0.5
+        //   Sell maker → fill at ask = 2000.5 → cost = 2000 - 2000.5 = -0.5
+        // × qty 0.025 each = -0.0125 per side, -0.025 for entry+exit.
+        assert_eq!(cost, dec!(-0.025));
+    }
+
+    /// bot-strategy#454 step 2b — post-only when our_size > depth: p = 0,
+    /// sampled_fill = false → taker fallback fires.
+    #[test]
+    fn post_only_falls_back_to_taker_when_depth_too_thin() {
+        // qty equal to depth → fill_p = 0 → never fills as maker.
+        let book = BookSnapshot {
+            mid: dec!(2000.0),
+            bid_price: dec!(1999.5),
+            ask_price: dec!(2000.5),
+            bid_size: dec!(0.025),
+            ask_size: dec!(0.025),
+        };
+        let cost = compute_leg_slippage_cost(
+            Some(book),
+            Some(book),
+            dec!(2000.0),
+            dec!(2000.0),
+            dec!(0.025),
+            IocSide::Buy,
+            IocSide::Sell,
+            0.0,
+            dec!(50),
+            true, // post_only — but p=0
+            7,
+            8,
+        );
+        // Same as taker path: +0.025 per round-trip.
+        assert_eq!(cost, dec!(0.025));
+    }
+
+    /// bot-strategy#454 step 2b — deterministic Bernoulli: same seed +
+    /// same book + same qty → same `sampled_fill` outcome.
+    #[test]
+    fn post_only_bernoulli_outcome_is_seed_deterministic() {
+        let book = BookSnapshot {
+            mid: dec!(2000.0),
+            bid_price: dec!(1999.5),
+            ask_price: dec!(2000.5),
+            bid_size: dec!(0.05),
+            ask_size: dec!(0.05),
+        };
+        // p = 1 - 0.025/0.05 = 0.5 — mid-range, outcome depends on seed.
+        let outcome_a = would_be_maker_outcome(&book, IocSide::Buy, dec!(0.025), 123).unwrap();
+        let outcome_b = would_be_maker_outcome(&book, IocSide::Buy, dec!(0.025), 123).unwrap();
+        assert_eq!(outcome_a, outcome_b);
+        assert!((outcome_a.fill_p - 0.5).abs() < 1e-9);
     }
 
     /// bot-strategy#454 step 2a — end-to-end: a one-cycle BT with an
