@@ -23,6 +23,7 @@ use super::live_pnl::{
 use super::signal::{ExitReason, SpreadDirection};
 use super::state::{EmergencyReason, Event, PositionMachine};
 use super::status::StatusReporter;
+use crate::prom;
 use crate::risk::manager::RiskManager;
 use crate::trade::execution::extended_maker::ExtendedEntryRequest;
 use crate::trade::execution::lighter_fill::LighterFillRequest;
@@ -76,6 +77,7 @@ pub(super) async fn handle_decision_exit(
         let position_dir = machine.position().map(|p| p.direction);
         let qty = open_qty.take().unwrap_or(Decimal::ZERO);
         machine.apply(now_ts_ms, Event::ExitSignal { reason })?;
+        prom::record_close(&cfg.agent_name, reason.as_close_reason_str());
         if qty > Decimal::ZERO {
             machine.apply(now_ts_ms, Event::ExtendedExitFilled { qty })?;
             machine.apply(now_ts_ms, Event::LighterExitFilled { qty })?;
@@ -210,6 +212,7 @@ pub(super) async fn handle_decision_exit(
     // longer reads it post-S5-2.
     let _ = open_qty.take();
     machine.apply(now_ts_ms, Event::ExitSignal { reason })?;
+    prom::record_close(&cfg.agent_name, reason.as_close_reason_str());
     summary.last_decision_ts_ms = Some(now_ts_ms);
     summary.decisions_exit += 1;
     let (ext_exit_side, lt_exit_side) = match position_dir {
@@ -402,6 +405,10 @@ pub(super) async fn handle_decision_exit(
                             reason: EmergencyReason::LegMismatchTimeout,
                         },
                     )?;
+                    prom::record_close(
+                        &cfg.agent_name,
+                        EmergencyReason::LegMismatchTimeout.as_close_reason_str(),
+                    );
                     summary.live_exits_failed_legs += 1;
                     log::error!(
                         "[XVENUE] LIVE EXIT failed legs \
@@ -432,6 +439,10 @@ pub(super) async fn handle_decision_exit(
                     reason: EmergencyReason::LegMismatchTimeout,
                 },
             )?;
+            prom::record_close(
+                &cfg.agent_name,
+                EmergencyReason::LegMismatchTimeout.as_close_reason_str(),
+            );
             summary.live_exits_leg_mismatch += 1;
             log::error!(
                 "[XVENUE] LIVE EXIT leg-mismatch ext={:?} lt={:?} → \

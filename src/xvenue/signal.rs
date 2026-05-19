@@ -135,6 +135,19 @@ pub enum ExitReason {
     ForceClose,
 }
 
+impl ExitReason {
+    /// Stable label used by `prom::POSITION_CLOSES_TOTAL` and
+    /// `prom::LAST_CLOSE_REASON_INFO`. Must stay in sync with
+    /// `prom::KNOWN_CLOSE_REASONS`.
+    pub fn as_close_reason_str(self) -> &'static str {
+        match self {
+            ExitReason::MeanCross => "mean_cross",
+            ExitReason::MaxHold => "max_hold",
+            ExitReason::ForceClose => "force_close",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
     Hold,

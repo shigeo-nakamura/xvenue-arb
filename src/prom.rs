@@ -22,7 +22,7 @@
 
 use anyhow::Result;
 use once_cell::sync::Lazy;
-use prometheus::{Encoder, GaugeVec, IntGaugeVec, Opts, Registry, TextEncoder};
+use prometheus::{Encoder, GaugeVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder};
 use std::env;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -50,6 +50,15 @@ fn register_int_gauge(name: &str, help: &str, labels: &[&str]) -> IntGaugeVec {
         .register(Box::new(g.clone()))
         .expect("prometheus registry rejected duplicate metric");
     g
+}
+
+fn register_int_counter(name: &str, help: &str, labels: &[&str]) -> IntCounterVec {
+    let c = IntCounterVec::new(Opts::new(name, help), labels)
+        .expect("prometheus IntCounterVec construction never fails for static names");
+    REGISTRY
+        .register(Box::new(c.clone()))
+        .expect("prometheus registry rejected duplicate metric");
+    c
 }
 
 // === Signal / spread ===
@@ -127,6 +136,128 @@ pub static PHASE_STATE: Lazy<IntGaugeVec> = Lazy::new(|| {
         &["agent"],
     )
 });
+
+pub static POSITION_DIRECTION: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge(
+        "xvenue_arb_position_direction",
+        "Current position direction: +1=Long the spread (buy Extended, sell \
+         Lighter), -1=Short the spread, 0=Flat.",
+        &["agent"],
+    )
+});
+
+pub static POSITION_TARGET_NOTIONAL_USD: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "xvenue_arb_position_target_notional_usd",
+        "Per-leg target notional (USD) for the currently open position, as \
+         captured at entry signal time. 0 when Flat.",
+        &["agent"],
+    )
+});
+
+pub static POSITION_OPEN_QTY: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "xvenue_arb_position_open_qty",
+        "Net open quantity (base units) per venue for the current position. \
+         `venue` ∈ {extended, lighter}. Divergence between the two legs \
+         exposes leg-sync gaps; both stay >= 0 by construction.",
+        &["agent", "venue"],
+    )
+});
+
+pub static POSITION_ENTRY_SIGNAL_TS_SECONDS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge(
+        "xvenue_arb_position_entry_signal_ts_seconds",
+        "Unix timestamp (seconds) of the entry signal for the currently open \
+         position. 0 when Flat.",
+        &["agent"],
+    )
+});
+
+pub static POSITION_FULLY_FILLED_TS_SECONDS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge(
+        "xvenue_arb_position_fully_filled_ts_seconds",
+        "Unix timestamp (seconds) at which both legs were confirmed filled \
+         (machine entered `Held`). 0 while still entering or flat. Subtract \
+         from entry_signal_ts_seconds for entry latency.",
+        &["agent"],
+    )
+});
+
+// === Close reasons ===
+//
+// `xvenue_arb_position_closes_total` is the canonical per-reason counter,
+// incremented at each ExitSignal / Emergency creation site (mirrors
+// `pairtrade_close_reason_total`). `xvenue_arb_last_close_reason_info`
+// is an info-gauge: 1 for the reason of the most-recent close, 0 for
+// all other known reasons.
+
+pub static POSITION_CLOSES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter(
+        "xvenue_arb_position_closes_total",
+        "Cumulative count of position closes, bucketed by reason. ExitReason \
+         (mean_cross / max_hold / force_close) and EmergencyReason (prefixed \
+         `emergency:`) are unified under a single label.",
+        &["agent", "reason"],
+    )
+});
+
+pub static LAST_CLOSE_REASON_INFO: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge(
+        "xvenue_arb_last_close_reason_info",
+        "Info-gauge: 1 for the reason of the most recent close, 0 for every \
+         other known reason. Read together with `position_closes_total` for \
+         rate panels and stat displays.",
+        &["agent", "reason"],
+    )
+});
+
+/// Every close-reason string that `record_close` may emit. Kept in sync
+/// with `ExitReason` + `EmergencyReason`. Used by [`init_close_reason_series`]
+/// to materialize each `(agent, reason)` series at value 0 so PromQL
+/// `increase()` sees a baseline before the first close fires (mirrors
+/// `pairtrade::init_close_reason_series`).
+pub const KNOWN_CLOSE_REASONS: &[&str] = &[
+    "mean_cross",
+    "max_hold",
+    "force_close",
+    "emergency:ws_stale",
+    "emergency:leg_mismatch_timeout",
+    "emergency:skew_breach",
+    "emergency:kill_switch",
+    "emergency:reference_deviation",
+    "emergency:extended_entry_failed",
+    "emergency:lighter_entry_failed",
+    "emergency:session_dd_halted",
+];
+
+/// Materialize every `(agent, reason)` series for the close-reason
+/// metrics at zero, so `increase()` / `delta()` produce a usable
+/// baseline before the first close fires. Idempotent; call once at boot.
+pub fn init_close_reason_series(agent: &str) {
+    for reason in KNOWN_CLOSE_REASONS {
+        POSITION_CLOSES_TOTAL
+            .with_label_values(&[agent, reason])
+            .inc_by(0);
+        LAST_CLOSE_REASON_INFO
+            .with_label_values(&[agent, reason])
+            .set(0);
+    }
+}
+
+/// Record a single position close: bump the cumulative counter and set
+/// `last_close_reason_info` so the dashboard sees the latest reason on
+/// the next scrape. `reason` should be one of [`KNOWN_CLOSE_REASONS`].
+pub fn record_close(agent: &str, reason: &str) {
+    POSITION_CLOSES_TOTAL
+        .with_label_values(&[agent, reason])
+        .inc();
+    for known in KNOWN_CLOSE_REASONS {
+        LAST_CLOSE_REASON_INFO
+            .with_label_values(&[agent, known])
+            .set(if *known == reason { 1 } else { 0 });
+    }
+}
 
 // === Decisions / blocks (mirrored from LivePaperSummary) ===
 

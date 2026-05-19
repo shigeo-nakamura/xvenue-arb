@@ -171,6 +171,7 @@ async fn run() -> anyhow::Result<()> {
     // tick lands.
     prom::maybe_start_exporter();
     prom::record_process_info(&cfg.agent_name, chrono::Utc::now().timestamp(), cfg.dry_run);
+    prom::init_close_reason_series(&cfg.agent_name);
 
     #[cfg(not(all(feature = "lighter-sdk", feature = "extended-sdk")))]
     {

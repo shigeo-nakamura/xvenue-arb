@@ -321,6 +321,340 @@
       ]
     },
     {
+      "id": 20,
+      "type": "row",
+      "title": "Position",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 22
+      },
+      "collapsed": false
+    },
+    {
+      "id": 21,
+      "type": "stat",
+      "title": "Phase",
+      "description": "Position machine state. 0=Flat, 1=Entering Extended, 2=Entering Lighter, 3=Held (both legs filled), 4=Exiting, 5=Emergency flattening.",
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 0,
+        "y": 23
+      },
+      "targets": [
+        {
+          "expr": "xvenue_arb_phase_state",
+          "legendFormat": "{{agent}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Flat",
+                  "color": "green"
+                },
+                "1": {
+                  "text": "Entering Ext",
+                  "color": "yellow"
+                },
+                "2": {
+                  "text": "Entering Lt",
+                  "color": "yellow"
+                },
+                "3": {
+                  "text": "Held",
+                  "color": "blue"
+                },
+                "4": {
+                  "text": "Exiting",
+                  "color": "orange"
+                },
+                "5": {
+                  "text": "Emergency",
+                  "color": "red"
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "thresholds"
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "textMode": "value",
+        "colorMode": "background"
+      }
+    },
+    {
+      "id": 22,
+      "type": "stat",
+      "title": "Direction",
+      "description": "Spread direction of the open position: Long = bought Extended / sold Lighter (dev < -threshold at entry); Short = sold Extended / bought Lighter; Flat = no position.",
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 5,
+        "y": 23
+      },
+      "targets": [
+        {
+          "expr": "xvenue_arb_position_direction",
+          "legendFormat": "{{agent}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "-1": {
+                  "text": "Short spread",
+                  "color": "red"
+                },
+                "0": {
+                  "text": "Flat",
+                  "color": "green"
+                },
+                "1": {
+                  "text": "Long spread",
+                  "color": "blue"
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "thresholds"
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "textMode": "value",
+        "colorMode": "background"
+      }
+    },
+    {
+      "id": 23,
+      "type": "stat",
+      "title": "Position age",
+      "description": "Seconds since the position machine entered its current phase. Stuck phases (Entering* > a few seconds, Held longer than max_hold) are the most useful read off this panel.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 10,
+        "y": 23
+      },
+      "targets": [
+        {
+          "expr": "xvenue_arb_position_age_seconds",
+          "legendFormat": "{{agent}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "textMode": "value",
+        "colorMode": "value"
+      }
+    },
+    {
+      "id": 24,
+      "type": "stat",
+      "title": "Target notional",
+      "description": "Per-leg target notional captured at entry signal time. Zero when Flat.",
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 14,
+        "y": 23
+      },
+      "targets": [
+        {
+          "expr": "xvenue_arb_position_target_notional_usd",
+          "legendFormat": "{{agent}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD"
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "textMode": "value",
+        "colorMode": "value"
+      }
+    },
+    {
+      "id": 26,
+      "type": "stat",
+      "title": "Last close reason",
+      "description": "Classifier of the most recent position close. Joins reasons across natural exits (mean_cross / max_hold / force_close) and forced flattens (emergency:* — ws_stale, leg_mismatch_timeout, skew_breach, session_dd_halted, lighter_entry_failed).",
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 19,
+        "y": 23
+      },
+      "targets": [
+        {
+          "expr": "topk(1, xvenue_arb_last_close_reason_info == 1)",
+          "legendFormat": "{{reason}}",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          },
+          "noValue": "—"
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "textMode": "name",
+        "colorMode": "background"
+      }
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Open qty per venue",
+      "description": "Net open quantity per leg on the currently held position. Divergence between Extended and Lighter exposes leg-sync gaps (a #418-style under-report or a partial exit in flight).",
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 27
+      },
+      "targets": [
+        {
+          "expr": "xvenue_arb_position_open_qty",
+          "legendFormat": "{{agent}} {{venue}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "spanNulls": true
+          }
+        }
+      }
+    },
+    {
+      "id": 28,
+      "type": "bargauge",
+      "title": "Closes by reason — last 6h",
+      "description": "Count of position closes over the dashboard's 6h window, bucketed by reason. delta() over xvenue_arb_position_closes_total. mean_cross / max_hold / force_close are the strategy-natural exits; emergency:* are forced flattens.",
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 27
+      },
+      "targets": [
+        {
+          "expr": "sum by (reason) (delta(xvenue_arb_position_closes_total[6h]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "orange",
+                "value": 5
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "emergency:.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "valueMode": "color",
+        "showUnfilled": true
+      }
+    },
+    {
       "id": 25,
       "type": "row",
       "title": "Equity / drawdown",
@@ -328,7 +662,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 22
+        "y": 33
       },
       "collapsed": false
     },
@@ -341,7 +675,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 23
+        "y": 34
       },
       "targets": [
         {
@@ -375,7 +709,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 23
+        "y": 34
       },
       "targets": [
         {
@@ -442,7 +776,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 31
+        "y": 42
       },
       "collapsed": false
     },
@@ -455,7 +789,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 32
+        "y": 43
       },
       "targets": [
         {
@@ -483,7 +817,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 32
+        "y": 43
       },
       "targets": [
         {
@@ -522,7 +856,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 40
+        "y": 51
       },
       "targets": [
         {
@@ -616,7 +950,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 40
+        "y": 51
       },
       "targets": [
         {
@@ -643,7 +977,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 47
+        "y": 58
       },
       "collapsed": false
     },
@@ -656,7 +990,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 48
+        "y": 59
       },
       "targets": [
         {
@@ -680,7 +1014,7 @@
         "h": 5,
         "w": 6,
         "x": 12,
-        "y": 48
+        "y": 59
       },
       "targets": [
         {
@@ -730,7 +1064,7 @@
         "h": 7,
         "w": 6,
         "x": 18,
-        "y": 48
+        "y": 59
       },
       "targets": [
         {
@@ -758,7 +1092,7 @@
         "h": 6,
         "w": 12,
         "x": 12,
-        "y": 53
+        "y": 64
       },
       "targets": [
         {
