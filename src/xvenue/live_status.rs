@@ -8,12 +8,14 @@
 //! body of [`report_status_tick`] so the dashboard sees the same field
 //! order it always has.
 
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
 use super::config::XvenueConfig;
 use super::live::{
     kill_switch_active, now_unix_secs, wall_clock_ms, LivePaperSummary, Venue, VenueHub,
 };
+use super::signal::SpreadDirection;
 use super::state::{Phase, PositionMachine};
 use super::status::{equity_decimal_to_f64, StatusReporter};
 use crate::prom;
@@ -314,6 +316,46 @@ fn publish_prom(
     prom::POSITION_AGE_SECONDS
         .with_label_values(&[agent])
         .set(age_secs);
+
+    // Position detail: direction / notional / per-venue qty / entry
+    // timestamps. All fields zero when Flat so the dashboard's stat
+    // panels render "Flat" cleanly without `last()`-stale carry-over.
+    let (direction_int, target_notional, ext_qty, lt_qty, entry_signal_ts_s, fully_filled_ts_s) =
+        match machine.position() {
+            Some(p) => {
+                let dir = match p.direction {
+                    SpreadDirection::Long => 1_i64,
+                    SpreadDirection::Short => -1_i64,
+                };
+                (
+                    dir,
+                    p.target_notional_usd.to_f64().unwrap_or(0.0),
+                    p.extended_open_qty.to_f64().unwrap_or(0.0),
+                    p.lighter_open_qty.to_f64().unwrap_or(0.0),
+                    (p.entry_signal_ts_ms / 1000) as i64,
+                    p.fully_filled_ts_ms.map(|t| (t / 1000) as i64).unwrap_or(0),
+                )
+            }
+            None => (0_i64, 0.0, 0.0, 0.0, 0_i64, 0_i64),
+        };
+    prom::POSITION_DIRECTION
+        .with_label_values(&[agent])
+        .set(direction_int);
+    prom::POSITION_TARGET_NOTIONAL_USD
+        .with_label_values(&[agent])
+        .set(target_notional);
+    prom::POSITION_OPEN_QTY
+        .with_label_values(&[agent, "extended"])
+        .set(ext_qty);
+    prom::POSITION_OPEN_QTY
+        .with_label_values(&[agent, "lighter"])
+        .set(lt_qty);
+    prom::POSITION_ENTRY_SIGNAL_TS_SECONDS
+        .with_label_values(&[agent])
+        .set(entry_signal_ts_s);
+    prom::POSITION_FULLY_FILLED_TS_SECONDS
+        .with_label_values(&[agent])
+        .set(fully_filled_ts_s);
 
     // Decisions + blocks (mirror u64 counters into gauges; use delta()).
     prom::DECISIONS_TOTAL

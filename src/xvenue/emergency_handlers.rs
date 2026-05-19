@@ -31,6 +31,7 @@ use super::live::{kill_switch_active, now_unix_secs, LivePaperSummary, MidSnapsh
 use super::live_exec::LiveExecution;
 use super::signal::{Decision, PositionSummary, SpreadDirection};
 use super::state::{EmergencyReason, Event, PositionMachine};
+use crate::prom;
 use crate::risk::kill_switch::StuckTripwire;
 use crate::risk::manager::{BlockReason, RiskManager};
 use crate::risk::reference_guard::{RefCheckOutcome, ReferenceGuard};
@@ -81,6 +82,10 @@ pub(super) fn handle_ws_stale_emergency(
     };
     match machine.apply(now_wall_ms, event) {
         Ok(()) => {
+            prom::record_close(
+                &cfg.agent_name,
+                EmergencyReason::WsStale.as_close_reason_str(),
+            );
             log::error!(
                 "[XVENUE] WS staleness emergency: venue={:?} threshold_ms={} \
                  → flattening",
@@ -299,6 +304,10 @@ pub(super) fn force_flatten_on_session_dd_halt(
     };
     match machine.apply(now_ts_ms, event) {
         Ok(()) => {
+            prom::record_close(
+                &cfg.agent_name,
+                EmergencyReason::SessionDdHalted.as_close_reason_str(),
+            );
             summary.live_session_dd_forced_flattens += 1;
             // Refresh the cached `position` snapshot — signal.decide()
             // further down would otherwise see the pre-Emergency
@@ -399,6 +408,10 @@ pub(super) fn handle_skew_breach_emergency(
     };
     match machine.apply(now_ts_ms, event) {
         Ok(()) => {
+            prom::record_close(
+                &cfg.agent_name,
+                EmergencyReason::SkewBreach.as_close_reason_str(),
+            );
             log::error!(
                 "[XVENUE] inventory skew breach: skew_usd={:.2} \
                  threshold_usd={:.2} → flattening",

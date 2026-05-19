@@ -17,8 +17,9 @@ use super::live_exec::LiveExecution;
 use super::live_pnl::{paper_qty, would_be_maker_fill_outcome};
 use super::signal::SpreadDirection;
 use super::sizing::{compute_notional_usd, notional_to_qty, SizeOutcome};
-use super::state::{Event, PositionMachine};
+use super::state::{EmergencyReason, Event, PositionMachine};
 use super::status::StatusReporter;
+use crate::prom;
 use crate::risk::kill_switch::StuckTripwire;
 use crate::trade::execution::extended_maker::{ExtendedEntryRequest, ExtendedMakerLoop};
 use crate::trade::execution::lighter_fill::{LighterFillLoop, LighterFillRequest};
@@ -322,6 +323,10 @@ pub(super) async fn handle_decision_enter<H: VenueHub + ?Sized>(
                         qty,
                     );
                     machine.apply(now_ts_ms, Event::LighterFailed)?;
+                    prom::record_close(
+                        &cfg.agent_name,
+                        EmergencyReason::LighterEntryFailed.as_close_reason_str(),
+                    );
                     summary.live_entries_lighter_failed_after_extended += 1;
                     // open_qty intentionally stays None at this layer;
                     // the open Extended leg will be flattened by the

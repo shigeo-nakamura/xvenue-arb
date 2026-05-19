@@ -90,6 +90,24 @@ pub enum EmergencyReason {
     SessionDdHalted,
 }
 
+impl EmergencyReason {
+    /// Stable label used by `prom::POSITION_CLOSES_TOTAL` and
+    /// `prom::LAST_CLOSE_REASON_INFO`. Must stay in sync with
+    /// `prom::KNOWN_CLOSE_REASONS`.
+    pub fn as_close_reason_str(self) -> &'static str {
+        match self {
+            EmergencyReason::WsStale => "emergency:ws_stale",
+            EmergencyReason::LegMismatchTimeout => "emergency:leg_mismatch_timeout",
+            EmergencyReason::SkewBreach => "emergency:skew_breach",
+            EmergencyReason::KillSwitch => "emergency:kill_switch",
+            EmergencyReason::ReferenceDeviation => "emergency:reference_deviation",
+            EmergencyReason::ExtendedEntryFailed => "emergency:extended_entry_failed",
+            EmergencyReason::LighterEntryFailed => "emergency:lighter_entry_failed",
+            EmergencyReason::SessionDdHalted => "emergency:session_dd_halted",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Event {
     EntrySignal {
