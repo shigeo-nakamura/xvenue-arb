@@ -11,7 +11,7 @@
 # /opt/debot/scripts/debot-xvenue-arb.env (see env.example).
 
 agent_name: debot-xvenue-arb-eth
-dry_run: false                # 2026-05-16 re-LIVE per bot-strategy#330 DRY_RUN soak verdict (T+10d, 360 RTs, paper_net_bps_avg +5.81 cum / +11.00 marg on wider regime, wb_fill_rate 95.83% / wb_exit_fill_rate 97.22%, zero halts/emergencies). Exit-side LighterMakerLoop landed (87a5a1e + telemetry 0c2fda7 + projected PnL 57bdb2e). 24h LIVE window re-evaluates #328 acceptance (real maker share by qty ≥ 30%). Notional and chase budget unchanged. Operator-paused 2026-05-06 → re-LIVE-flipped 2026-05-16.
+dry_run: true                 # 2026-05-19 18:00 UTC: paused LIVE → DRY_RUN after a multi-event day (Phase 1 LIVE flip + revert, threshold raise 5→6, #434/#455 deploys, 3× CB reset, -$0.65 realised). 3-day baseline #7 shows mean +0.04 bps/RT — break-even with high variance, not a structural edge worth bleeding $0.5-2/day during the Phase A calibration phase. The #455 own-dump writer captures market data in dry_run too, so the ≥3-day capture window for the #454 step 3 calibration is unaffected. Re-LIVE gated on: (a) #454 step 3 BT-vs-paper-mode calibration ≤ ±2 bps/RT residual, AND (b) own-dump-replayed BT shows mean ≥ break-even with the current threshold=6 config. Prior re-LIVE history below for context. // 2026-05-16 re-LIVE per bot-strategy#330 DRY_RUN soak verdict (T+10d, 360 RTs, paper_net_bps_avg +5.81 cum / +11.00 marg on wider regime, wb_fill_rate 95.83% / wb_exit_fill_rate 97.22%, zero halts/emergencies).
 
 # ---- Symbol pair (one symbol per process) ----
 symbol_ext: ETH-USD
