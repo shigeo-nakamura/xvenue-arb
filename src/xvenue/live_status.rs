@@ -166,6 +166,28 @@ pub(super) async fn report_status_tick<H: VenueHub + ?Sized>(
     } else {
         0.0
     };
+    // bot-strategy#431 Phase 0(c).
+    let wb_ext_fill_rate = if summary.would_be_ext_maker_attempts > 0 {
+        summary.would_be_ext_maker_fills as f64 / summary.would_be_ext_maker_attempts as f64
+    } else {
+        0.0
+    };
+    let wb_ext_p_avg = if summary.would_be_ext_maker_attempts > 0 {
+        summary.would_be_ext_maker_p_sum / summary.would_be_ext_maker_attempts as f64
+    } else {
+        0.0
+    };
+    let wb_ext_exit_fill_rate = if summary.would_be_ext_maker_exit_attempts > 0 {
+        summary.would_be_ext_maker_exit_fills as f64
+            / summary.would_be_ext_maker_exit_attempts as f64
+    } else {
+        0.0
+    };
+    let wb_ext_exit_p_avg = if summary.would_be_ext_maker_exit_attempts > 0 {
+        summary.would_be_ext_maker_exit_p_sum / summary.would_be_ext_maker_exit_attempts as f64
+    } else {
+        0.0
+    };
     let paper_gross_avg_bps = if summary.paper_net_attempts > 0 {
         summary.paper_gross_bps_sum / summary.paper_net_attempts as f64
     } else {
@@ -187,6 +209,8 @@ pub(super) async fn report_status_tick<H: VenueHub + ?Sized>(
          ext_inside={:?} lt_inside={:?} lt_bid_sz={:?} lt_ask_sz={:?} \
          wb_attempts={} wb_fills={} wb_fill_rate={:.4} wb_p_avg={:.4} \
          wb_exit_attempts={} wb_exit_fills={} wb_exit_fill_rate={:.4} wb_exit_p_avg={:.4} \
+         wb_ext_attempts={} wb_ext_fills={} wb_ext_fill_rate={:.4} wb_ext_p_avg={:.4} \
+         wb_ext_exit_attempts={} wb_ext_exit_fills={} wb_ext_exit_fill_rate={:.4} wb_ext_exit_p_avg={:.4} \
          paper_n={} paper_gross_bps_avg={:.2} paper_net_bps_avg={:.2}",
         summary.ticks,
         summary.samples_committed,
@@ -226,6 +250,14 @@ pub(super) async fn report_status_tick<H: VenueHub + ?Sized>(
         summary.would_be_maker_exit_fills,
         wb_exit_fill_rate,
         wb_exit_p_avg,
+        summary.would_be_ext_maker_attempts,
+        summary.would_be_ext_maker_fills,
+        wb_ext_fill_rate,
+        wb_ext_p_avg,
+        summary.would_be_ext_maker_exit_attempts,
+        summary.would_be_ext_maker_exit_fills,
+        wb_ext_exit_fill_rate,
+        wb_ext_exit_p_avg,
         summary.paper_net_attempts,
         paper_gross_avg_bps,
         paper_net_avg_bps,

@@ -44,6 +44,27 @@ pub struct TopOfBook {
     pub best_ask: Decimal,
 }
 
+/// One filled order entry returned by [`VenueOps::list_filled_orders`].
+/// Used by the emergency-flatten handler to capture pre/post-emergency
+/// snapshots of every fill on the symbol — `close_all_positions` does
+/// not surface order ids, so the handler trade_id-diffs the two
+/// snapshots to identify the emergency fills and compute realised PnL
+/// from their volume-weighted price. bot-strategy#434.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FillRecord {
+    pub order_id: String,
+    pub trade_id: String,
+    pub side: OrderSide,
+    pub filled_size: Decimal,
+    /// `fill_price * filled_size`. `None` when the venue layer has not
+    /// (yet) populated it — caller falls back to mid-priced exit when
+    /// aggregating across a venue.
+    pub filled_value: Option<Decimal>,
+    /// Exchange-reported fill time. `None` on venues that don't
+    /// surface a reliable timestamp (Lighter today).
+    pub filled_ts_ms: Option<i64>,
+}
+
 /// Filled aggregator output for one specific `order_id`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OrderFillStatus {
@@ -149,6 +170,22 @@ pub trait VenueOps: Send + Sync {
     async fn current_position_size(&self, _symbol: &str) -> Result<Decimal> {
         Ok(Decimal::ZERO)
     }
+
+    /// All non-rejected filled orders for the symbol that the venue's
+    /// fill cache currently holds. Used by the emergency-flatten
+    /// handler to attribute realised PnL on the recovery path:
+    /// `close_all_positions` issues IOC orders but does not return
+    /// their ids, so the handler captures one snapshot before the
+    /// emergency starts + one at EmergencyComplete and diffs by
+    /// `trade_id` to identify the emergency-produced fills.
+    /// bot-strategy#434.
+    ///
+    /// Default returns an empty Vec so impls that don't drive emergency
+    /// recovery (scripted mocks for unrelated tests) stay opt-out — the
+    /// handler then falls back to the pre-#434 0.0 placeholder.
+    async fn list_filled_orders(&self, _symbol: &str) -> Result<Vec<FillRecord>> {
+        Ok(Vec::new())
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -187,6 +224,10 @@ pub struct ScriptedVenueOpsState {
     pub cancel: VecDeque<ScriptedResponse>,
     pub poll_fill: VecDeque<ScriptedResponse>,
     pub close_all: VecDeque<ScriptedResponse>,
+    /// bot-strategy#434: stateful list of filled orders the mock surfaces
+    /// to [`VenueOps::list_filled_orders`]. Tests mutate this through
+    /// `with_state` to simulate pre/post-emergency fill diffs.
+    pub list_filled_orders: Vec<FillRecord>,
 
     /// Per-symbol mock position size returned by
     /// [`VenueOps::current_position_size`]. Defaults to empty (= 0 for
@@ -374,6 +415,11 @@ impl VenueOps for ScriptedVenueOps {
             .get(symbol)
             .copied()
             .unwrap_or(Decimal::ZERO))
+    }
+
+    async fn list_filled_orders(&self, _symbol: &str) -> Result<Vec<FillRecord>> {
+        let g = self.inner.lock().unwrap();
+        Ok(g.list_filled_orders.clone())
     }
 }
 
