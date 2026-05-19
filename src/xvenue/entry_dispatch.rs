@@ -122,6 +122,31 @@ pub(super) async fn handle_decision_enter<H: VenueHub + ?Sized>(
             );
         }
 
+        // bot-strategy#431 Phase 0(c): parallel Extended-side telemetry
+        // so the Phase 0 24h soak can read off Extended's touch-fill
+        // behavior. Same model as the Lighter draw but against ext_snap;
+        // the `^ 2` seed mix keeps the Ext draw independent of the LT
+        // draw on the same tick. Sized at `qty` (the Ext leg target —
+        // both legs use the same notional sizing today).
+        summary.would_be_ext_maker_attempts += 1;
+        let ext_maker_entry_outcome =
+            would_be_maker_fill_outcome(dir, qty, ext_snap, now_ts_ms ^ 2);
+        if let Some(out) = ext_maker_entry_outcome {
+            summary.would_be_ext_maker_p_sum += out.fill_p;
+            if out.sampled_fill {
+                summary.would_be_ext_maker_fills += 1;
+            }
+            log::info!(
+                "[XVENUE] WOULD-BE EXT MAKER dir={:?} our_size_eth={:.6} \
+                 depth_eth={:.6} fill_p={:.4} sampled_fill={}",
+                dir,
+                out.our_size_eth,
+                out.depth_eth,
+                out.fill_p,
+                out.sampled_fill,
+            );
+        }
+
         // bot-strategy#330 follow-up: capture the touch-level entry
         // state so the matching exit can emit a calibrated projected
         // PnL line. The mid-to-mid `dev_bps` already in the PAPER ENTER
@@ -333,6 +358,24 @@ pub(super) async fn handle_decision_enter<H: VenueHub + ?Sized>(
                     // emergency_loop wiring (Sprint 4 step 3/3). State
                     // machine has already routed to
                     // EmergencyFlattening.
+                    //
+                    // bot-strategy#434: still capture a partial entry
+                    // ctx (lt_qty = 0) so the emergency-flatten handler
+                    // can attribute Extended's round-trip cost to
+                    // `daily_pnl`. Without this, the Lighter-failed-
+                    // after-Extended emergency would still record a 0.0
+                    // placeholder, leaving the gate blind to the
+                    // Extended IOC + reduce-only cost the recovery
+                    // actually pays.
+                    *live_entry_ctx = Some(LiveEntryCtx {
+                        direction: dir,
+                        ext_entry_mid: ext_snap.mid,
+                        lt_entry_mid: lt_snap.mid,
+                        ext_entry_avg_fill_price,
+                        lt_entry_avg_fill_price: None,
+                        ext_entry_qty: qty,
+                        lt_entry_qty: Decimal::ZERO,
+                    });
                 }
             }
         }

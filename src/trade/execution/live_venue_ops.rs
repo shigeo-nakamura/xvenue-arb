@@ -59,7 +59,7 @@ use async_trait::async_trait;
 use dex_connector::{DexConnector, OrderSide};
 use rust_decimal::Decimal;
 
-use super::venue_ops::{OrderFillStatus, PlacedOrder, TopOfBook, VenueOps};
+use super::venue_ops::{FillRecord, OrderFillStatus, PlacedOrder, TopOfBook, VenueOps};
 
 /// Sentinel value Extended interprets as the post-only flag on
 /// `create_order`'s `spread` parameter
@@ -272,6 +272,31 @@ impl VenueOps for LiveVenueOps {
             .find(|p| p.symbol == symbol)
             .map(|p| p.size)
             .unwrap_or(Decimal::ZERO))
+    }
+
+    async fn list_filled_orders(&self, symbol: &str) -> Result<Vec<FillRecord>> {
+        let resp = self
+            .conn
+            .get_filled_orders(symbol)
+            .await
+            .map_err(|e| anyhow!("get_filled_orders {}: {}", symbol, e))?;
+        Ok(resp
+            .orders
+            .into_iter()
+            .filter(|o| !o.is_rejected)
+            .filter_map(|o| {
+                let filled_size = o.filled_size?;
+                let side = o.filled_side?;
+                Some(FillRecord {
+                    order_id: o.order_id,
+                    trade_id: o.trade_id,
+                    side,
+                    filled_size,
+                    filled_value: o.filled_value,
+                    filled_ts_ms: o.filled_ts_ms,
+                })
+            })
+            .collect())
     }
 }
 

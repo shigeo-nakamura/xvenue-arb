@@ -20,16 +20,20 @@
 //! The decision *logic* (signal + state transitions) is identical to BT;
 //! the execution side stays no-op until Phase 3 binds it to real venues.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use dex_connector::OrderSide as DcOrderSide;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use tokio::sync::oneshot;
 
 use super::config::XvenueConfig;
 use super::live_exec::LiveExecution;
+use super::live_pnl::compute_realised_pnl;
 use super::signal::{SignalEngine, SpreadDirection};
 use super::spread::SpreadEngine;
 use super::state::{Event, PositionMachine};
@@ -39,6 +43,8 @@ use crate::risk::manager::RiskManager;
 use crate::risk::reference_guard::ReferenceGuard;
 use crate::risk::skew_monitor::SkewMonitor;
 use crate::risk::ws_health::WsHealthMonitor;
+use crate::trade::execution::types::avg_price_from_value_qty;
+use crate::trade::execution::venue_ops::FillRecord;
 
 /// Which venue an operation targets. Avoids leaking the underlying
 /// DexConnector type into the runner core so the mock in
@@ -205,6 +211,20 @@ pub struct LivePaperSummary {
     pub would_be_maker_exit_attempts: u64,
     pub would_be_maker_exit_fills: u64,
     pub would_be_maker_exit_p_sum: f64,
+    /// bot-strategy#431 Phase 0(c): would-be Extended-side maker fill
+    /// telemetry. Paper-mode counterparts to `would_be_maker_*` above
+    /// but evaluated against the Extended book (ext_snap.bid_size /
+    /// ask_size) so the Phase 0 24h soak can compare Extended's
+    /// touch-fill behavior against Lighter's. Same seed-mixed
+    /// linear-decay-by-depth model — Phase 1 implementation may
+    /// supersede with a venue-specific fit if Extended's aggressor
+    /// population invalidates the linear approximation.
+    pub would_be_ext_maker_attempts: u64,
+    pub would_be_ext_maker_fills: u64,
+    pub would_be_ext_maker_p_sum: f64,
+    pub would_be_ext_maker_exit_attempts: u64,
+    pub would_be_ext_maker_exit_fills: u64,
+    pub would_be_ext_maker_exit_p_sum: f64,
     /// bot-strategy#330 follow-up: per-RT touch-to-touch projected PnL
     /// for paper mode. The mid-to-mid `dev_bps` in `[XVENUE] PAPER ENTER`
     /// / `PAPER EXIT` overstates capturable edge because it ignores
@@ -494,6 +514,16 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
     // post-fill grace window so a stale-zero read seconds after a
     // confirmed fill doesn't trip a false EmergencyComplete.
     let mut first_emergency_zero_ms: Option<u64> = None;
+    // bot-strategy#434: per-venue snapshots of {trade_id} captured on
+    // the first tick after the phase transitions into
+    // EmergencyFlattening. At EmergencyComplete the handler lists
+    // fills again, diffs against these baselines, and aggregates the
+    // new entries (filtered to the reduce-only side per the round
+    // trip's direction) into a volume-weighted average exit price
+    // that feeds `compute_realised_pnl`. Reset to None whenever the
+    // handler's reset branch runs (phase no longer EmergencyFlattening).
+    let mut emergency_ext_pre_fills: Option<HashSet<String>> = None;
+    let mut emergency_lt_pre_fills: Option<HashSet<String>> = None;
     // Entry-time mids + qtys captured at Decision::Enter happy
     // landing for the realised-PnL helper at Decision::Exit (#268
     // S5-1). Cleared whenever the position machine returns to Flat
@@ -565,6 +595,7 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                 // every tick is fine.
                 handle_emergency_flatten_tick(
                     &cfg,
+                    &*hub,
                     live_exec.as_deref(),
                     &mut machine,
                     &mut open_qty,
@@ -573,6 +604,9 @@ pub async fn run_paper_loop<H: VenueHub + ?Sized>(
                     &mut last_emergency_attempt_ms,
                     &mut emergency_attempts,
                     &mut first_emergency_zero_ms,
+                    &mut emergency_ext_pre_fills,
+                    &mut emergency_lt_pre_fills,
+                    &mut live_entry_ctx,
                     reporter.as_mut(),
                     &mut risk_manager,
                 )
@@ -632,15 +666,26 @@ pub(super) fn kill_switch_active(path: &str) -> bool {
 }
 
 /// Live-mode emergency-flatten round driver invoked from the tick arm
-/// of `run_paper_loop`. Behaviour-preserving wrapper around
-/// `drive_emergency_flatten_round` that also (a) resets the throttle
-/// state when the position machine is *not* in EmergencyFlattening, and
-/// (b) fires the bot-strategy#288 Action B/C `record_close` placeholder
-/// when an EmergencyComplete just landed. Skips entirely when
-/// `live_exec` is None (paper-mode loops have no orders to flatten).
+/// of `run_paper_loop`. Wrapper around `drive_emergency_flatten_round`
+/// that also (a) resets the throttle state when the position machine
+/// is *not* in EmergencyFlattening, and (b) on the tick the round
+/// emits `EmergencyComplete` computes a real realised-PnL figure from
+/// the venue fill diff (bot-strategy#434, replaces the pre-#434 0.0
+/// placeholder). Skips entirely when `live_exec` is None (paper-mode
+/// loops have no orders to flatten).
+///
+/// The pre/post-emergency fill snapshots are captured per-venue and
+/// diffed by `trade_id`: `close_all_positions` does not surface the
+/// IOC order ids it issues, so the trade_id diff is the cheapest way
+/// to attribute fills that landed only because of the recovery. The
+/// diff is filtered to the reduce-only side per the round trip's
+/// direction so any unrelated fills on the venue (vanishingly rare on
+/// xvenue-arb's single-symbol bot but defensible) do not pollute the
+/// figure.
 #[allow(clippy::too_many_arguments)]
-async fn handle_emergency_flatten_tick(
+async fn handle_emergency_flatten_tick<H: VenueHub + ?Sized>(
     cfg: &XvenueConfig,
+    hub: &H,
     live_exec: Option<&LiveExecution>,
     machine: &mut PositionMachine,
     open_qty: &mut Option<Decimal>,
@@ -649,6 +694,9 @@ async fn handle_emergency_flatten_tick(
     last_emergency_attempt_ms: &mut Option<u64>,
     emergency_attempts: &mut u32,
     first_emergency_zero_ms: &mut Option<u64>,
+    emergency_ext_pre_fills: &mut Option<HashSet<String>>,
+    emergency_lt_pre_fills: &mut Option<HashSet<String>>,
+    live_entry_ctx: &mut Option<LiveEntryCtx>,
     reporter: Option<&mut StatusReporter>,
     risk_manager: &mut RiskManager,
 ) {
@@ -661,7 +709,54 @@ async fn handle_emergency_flatten_tick(
         *last_emergency_attempt_ms = None;
         *emergency_attempts = 0;
         *first_emergency_zero_ms = None;
+        // bot-strategy#434: drop the pre-emergency snapshot too — the
+        // next entry's pre-snapshot must reflect the post-EmergencyComplete
+        // fill state, not the previous emergency's.
+        *emergency_ext_pre_fills = None;
+        *emergency_lt_pre_fills = None;
         return;
+    }
+
+    // bot-strategy#434: capture the pre-emergency fill baseline on the
+    // first tick the handler runs inside `EmergencyFlattening`. The
+    // close_all does not happen until `drive_emergency_flatten_round`
+    // below, so this snapshot is guaranteed to predate any emergency-
+    // produced fills (the entry-side fills that put us here are
+    // already present and will be filtered out by the post-EmergencyComplete
+    // diff).
+    if emergency_ext_pre_fills.is_none() {
+        match live.ext_ops.list_filled_orders(&live.ext_symbol).await {
+            Ok(fills) => {
+                *emergency_ext_pre_fills =
+                    Some(fills.into_iter().map(|f| f.trade_id).collect());
+            }
+            Err(e) => {
+                log::warn!(
+                    "[XVENUE/emerg] pre-snapshot ext list_filled_orders err={:?} \
+                     — emergency PnL will fall back to 0.0 placeholder for this cycle",
+                    e
+                );
+                // Mark as Some(empty) so we don't keep retrying every
+                // tick — if the post-EmergencyComplete diff sees no
+                // baseline it would over-count.
+                *emergency_ext_pre_fills = Some(HashSet::new());
+            }
+        }
+    }
+    if emergency_lt_pre_fills.is_none() {
+        match live.lt_ops.list_filled_orders(&live.lt_symbol).await {
+            Ok(fills) => {
+                *emergency_lt_pre_fills = Some(fills.into_iter().map(|f| f.trade_id).collect());
+            }
+            Err(e) => {
+                log::warn!(
+                    "[XVENUE/emerg] pre-snapshot lt list_filled_orders err={:?} \
+                     — emergency PnL will fall back to 0.0 placeholder for this cycle",
+                    e
+                );
+                *emergency_lt_pre_fills = Some(HashSet::new());
+            }
+        }
     }
 
     let prev_emergency_completes = summary.emergency_completes;
@@ -680,23 +775,191 @@ async fn handle_emergency_flatten_tick(
     {
         log::warn!("[XVENUE] emergency-flatten round error: {:?}", e);
     }
-    // bot-strategy#288 Action B/C: when EmergencyComplete just fired we
-    // owe the round-trip a record_close so daily_risk.daily_pnl and
-    // trade_stats reflect it. Sprint 5's happy-path record_close lives
-    // in the Decision::Exit Both{Filled,Filled} consume which never
-    // runs on the emergency-recovered route. Use 0.0 as placeholder PnL
-    // — the real cost shows up in the equity-based pnl_today; an exact
-    // figure here would need entry-mid + exit-fill prices from the
-    // venue side.
     if summary.emergency_completes > prev_emergency_completes {
+        // bot-strategy#434: compute realised PnL from the venue fill
+        // diff instead of the pre-#434 0.0 placeholder. The take()
+        // consumes both the entry ctx and the pre-snapshots so a
+        // subsequent EmergencyComplete (different round-trip) starts
+        // fresh.
+        let pre_ext = emergency_ext_pre_fills.take().unwrap_or_default();
+        let pre_lt = emergency_lt_pre_fills.take().unwrap_or_default();
+        let entry_ctx = live_entry_ctx.take();
+        let pnl_usd = compute_emergency_realised_pnl(
+            cfg, live, hub, entry_ctx, pre_ext, pre_lt,
+        )
+        .await;
         if let Some(r) = reporter {
-            r.record_close(0.0);
+            r.record_close(pnl_usd);
         }
-        risk_manager.record_close(0.0, now_unix_secs());
+        risk_manager.record_close(pnl_usd, now_unix_secs());
+        summary.last_realised_pnl_usd = Some(pnl_usd);
         log::info!(
-            "[XVENUE/emerg] record_close fired with placeholder pnl=0.0 (real cost via equity-based pnl_today)"
+            "[XVENUE/emerg] record_close fired with realised pnl_usd={:.4} (bot-strategy#434)",
+            pnl_usd
         );
     }
+}
+
+/// bot-strategy#434 helper — derive the realised PnL of one emergency
+/// recovery from:
+///
+/// * `entry_ctx` — captured at the original `Decision::Enter` when both
+///   legs filled. Provides direction + per-venue entry qty + entry
+///   avg fill price (real, from the executor terminal). `None` when the
+///   round trip went into emergency without ever producing a balanced
+///   position (Lighter failed after Extended on entry), in which case
+///   the helper falls back to 0.0 and logs a warning — the
+///   asymmetric-entry case is rare enough on xvenue-arb's current state
+///   that the additional plumbing is deferred.
+/// * `pre_ext_trade_ids` / `pre_lt_trade_ids` — baseline `{trade_id}`
+///   snapshots captured on the first emergency tick. `list_filled_orders`
+///   returns the full fill history the venue's WS cache holds; anything
+///   NOT in the baseline must have landed during the recovery.
+///
+/// Exit prices fall back to current mid (read from `hub.read_mid`) per
+/// leg when the venue layer did not surface a `filled_value` on the
+/// reduce-only fills. The mid fallback under-reports IOC slippage on
+/// `close_all` but is materially better than the pre-#434 0.0
+/// placeholder; the cleanest case (Extended-side fills with
+/// `filled_value` populated) yields a fill-accurate figure.
+async fn compute_emergency_realised_pnl<H: VenueHub + ?Sized>(
+    cfg: &XvenueConfig,
+    live: &LiveExecution,
+    hub: &H,
+    entry_ctx: Option<LiveEntryCtx>,
+    pre_ext_trade_ids: HashSet<String>,
+    pre_lt_trade_ids: HashSet<String>,
+) -> f64 {
+    let Some(ctx) = entry_ctx else {
+        log::warn!(
+            "[XVENUE/emerg] entry ctx unavailable — recording placeholder pnl=0.0 \
+             (likely asymmetric-entry emergency where no balanced position landed)"
+        );
+        return 0.0;
+    };
+
+    let ext_post = match live.ext_ops.list_filled_orders(&live.ext_symbol).await {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!(
+                "[XVENUE/emerg] post-snapshot ext list_filled_orders err={:?} \
+                 — recording placeholder pnl=0.0",
+                e
+            );
+            return 0.0;
+        }
+    };
+    let lt_post = match live.lt_ops.list_filled_orders(&live.lt_symbol).await {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!(
+                "[XVENUE/emerg] post-snapshot lt list_filled_orders err={:?} \
+                 — recording placeholder pnl=0.0",
+                e
+            );
+            return 0.0;
+        }
+    };
+
+    // The reduce-only side per venue is the opposite of the entry side.
+    let (ext_close_side, lt_close_side) = match ctx.direction {
+        SpreadDirection::Long => (DcOrderSide::Short, DcOrderSide::Long),
+        SpreadDirection::Short => (DcOrderSide::Long, DcOrderSide::Short),
+    };
+
+    let (ext_exit_qty, ext_exit_value) =
+        aggregate_emergency_fills(&ext_post, &pre_ext_trade_ids, ext_close_side);
+    let (lt_exit_qty, lt_exit_value) =
+        aggregate_emergency_fills(&lt_post, &pre_lt_trade_ids, lt_close_side);
+
+    let ext_exit_avg = avg_price_from_value_qty(ext_exit_value, ext_exit_qty);
+    let lt_exit_avg = avg_price_from_value_qty(lt_exit_value, lt_exit_qty);
+
+    // Fallback exit mids — read fresh so the avg_price_from_value_qty
+    // miss (no filled_value) doesn't fall back to the entry mid. If
+    // either read fails we fall back to the entry mid (best available).
+    let ext_exit_mid = hub
+        .read_mid(Venue::Extended)
+        .await
+        .ok()
+        .map(|s| s.mid)
+        .filter(|m| *m > Decimal::ZERO)
+        .unwrap_or(ctx.ext_entry_mid);
+    let lt_exit_mid = hub
+        .read_mid(Venue::Lighter)
+        .await
+        .ok()
+        .map(|s| s.mid)
+        .filter(|m| *m > Decimal::ZERO)
+        .unwrap_or(ctx.lt_entry_mid);
+
+    let pnl = compute_realised_pnl(
+        ctx.direction,
+        ctx.ext_entry_mid,
+        ctx.lt_entry_mid,
+        ext_exit_mid,
+        lt_exit_mid,
+        ctx.ext_entry_avg_fill_price,
+        ctx.lt_entry_avg_fill_price,
+        ext_exit_avg,
+        lt_exit_avg,
+        ctx.ext_entry_qty,
+        ctx.lt_entry_qty,
+        ext_exit_qty,
+        lt_exit_qty,
+        cfg.extended_fee_bps,
+        cfg.lighter_fee_bps,
+    );
+    log::info!(
+        "[XVENUE/emerg] realised pnl breakdown: dir={:?} \
+         ext_entry_qty={} lt_entry_qty={} ext_exit_qty={} lt_exit_qty={} \
+         ext_entry_avg={:?} lt_entry_avg={:?} ext_exit_avg={:?} lt_exit_avg={:?} \
+         ext_exit_mid={} lt_exit_mid={} pnl_usd={}",
+        ctx.direction,
+        ctx.ext_entry_qty,
+        ctx.lt_entry_qty,
+        ext_exit_qty,
+        lt_exit_qty,
+        ctx.ext_entry_avg_fill_price,
+        ctx.lt_entry_avg_fill_price,
+        ext_exit_avg,
+        lt_exit_avg,
+        ext_exit_mid,
+        lt_exit_mid,
+        pnl,
+    );
+    pnl.to_f64().unwrap_or(0.0)
+}
+
+/// Sum `(filled_size, filled_value)` across the post-snapshot fills
+/// whose `trade_id` is not in the pre-snapshot baseline AND whose side
+/// matches the reduce-only direction for the leg. Returns
+/// `(qty=0, value=None)` when no matching fills exist; the caller's
+/// `avg_price_from_value_qty` handles that case (returns None →
+/// `compute_realised_pnl` falls back to mid for the leg).
+fn aggregate_emergency_fills(
+    post: &[FillRecord],
+    pre_trade_ids: &HashSet<String>,
+    close_side: DcOrderSide,
+) -> (Decimal, Option<Decimal>) {
+    let mut qty = Decimal::ZERO;
+    let mut value_sum = Decimal::ZERO;
+    let mut any_value = false;
+    for f in post {
+        if pre_trade_ids.contains(&f.trade_id) {
+            continue;
+        }
+        if f.side != close_side {
+            continue;
+        }
+        qty += f.filled_size;
+        if let Some(v) = f.filled_value {
+            value_sum += v;
+            any_value = true;
+        }
+    }
+    let value = if any_value { Some(value_sum) } else { None };
+    (qty, value)
 }
 
 /// Run one emergency-flatten round (#244 Sprint 4 step 3/3).
@@ -3286,6 +3549,97 @@ leg_mismatch_timeout_ms: 100
             "dry_run must not dispatch real orders even on exit"
         );
         assert!(lt_vops.snapshot_takers().is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // bot-strategy#434 — emergency-flatten realised PnL helpers
+    // ---------------------------------------------------------------
+
+    fn fr(trade_id: &str, side: DcOrderSide, size: Decimal, value: Option<Decimal>) -> FillRecord {
+        FillRecord {
+            order_id: format!("o-{}", trade_id),
+            trade_id: trade_id.into(),
+            side,
+            filled_size: size,
+            filled_value: value,
+            filled_ts_ms: None,
+        }
+    }
+
+    #[test]
+    fn aggregate_emergency_fills_keeps_only_new_trade_ids_on_close_side() {
+        // Long position: ext close side is Short, lt close side is Long.
+        // Pre-snapshot contains the entry trade ids; only post-snapshot
+        // entries NOT in that set (and on the matching close side) count.
+        let post = vec![
+            // Entry (pre-snapshot ext): Long, ignored by trade-id diff.
+            fr("ext-entry", DcOrderSide::Long, dec!(0.02), Some(dec!(60))),
+            // Two emergency exit fills on Short — these are the targets.
+            fr(
+                "ext-emerg-1",
+                DcOrderSide::Short,
+                dec!(0.012),
+                Some(dec!(36.06)),
+            ),
+            fr(
+                "ext-emerg-2",
+                DcOrderSide::Short,
+                dec!(0.008),
+                Some(dec!(23.92)),
+            ),
+            // Unrelated subsequent Long fill (e.g. next round-trip): wrong side, ignored.
+            fr(
+                "ext-other-long",
+                DcOrderSide::Long,
+                dec!(0.02),
+                Some(dec!(60)),
+            ),
+        ];
+        let pre: HashSet<String> = ["ext-entry".to_string()].into_iter().collect();
+        let (qty, value) = aggregate_emergency_fills(&post, &pre, DcOrderSide::Short);
+        assert_eq!(qty, dec!(0.020));
+        assert_eq!(value, Some(dec!(59.98)));
+    }
+
+    #[test]
+    fn aggregate_emergency_fills_returns_none_value_when_no_partial_has_filled_value() {
+        // Lighter case: filled_value is None on every partial, so the
+        // aggregate must surface None so the caller falls back to the
+        // mid price for the leg (Lighter's WS fill stream surfaces qty
+        // but not notional today).
+        let post = vec![
+            fr("lt-entry", DcOrderSide::Short, dec!(0.02), None),
+            fr("lt-emerg-1", DcOrderSide::Long, dec!(0.014), None),
+            fr("lt-emerg-2", DcOrderSide::Long, dec!(0.006), None),
+        ];
+        let pre: HashSet<String> = ["lt-entry".to_string()].into_iter().collect();
+        let (qty, value) = aggregate_emergency_fills(&post, &pre, DcOrderSide::Long);
+        assert_eq!(qty, dec!(0.020));
+        assert_eq!(value, None);
+    }
+
+    #[test]
+    fn aggregate_emergency_fills_short_position_picks_long_close_on_ext() {
+        // Short position: ext close side is Long. Pre-snapshot has the
+        // Short entry — must be ignored.
+        let post = vec![
+            fr(
+                "ext-short-entry",
+                DcOrderSide::Short,
+                dec!(0.015),
+                Some(dec!(45.0)),
+            ),
+            fr(
+                "ext-emerg",
+                DcOrderSide::Long,
+                dec!(0.015),
+                Some(dec!(45.15)),
+            ),
+        ];
+        let pre: HashSet<String> = ["ext-short-entry".to_string()].into_iter().collect();
+        let (qty, value) = aggregate_emergency_fills(&post, &pre, DcOrderSide::Long);
+        assert_eq!(qty, dec!(0.015));
+        assert_eq!(value, Some(dec!(45.15)));
     }
 
     // ---------------------------------------------------------------

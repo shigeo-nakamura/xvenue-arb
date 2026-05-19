@@ -134,6 +134,30 @@ pub(super) async fn handle_decision_exit(
                     );
                     maker_exit_outcome = Some(out);
                 }
+
+                // bot-strategy#431 Phase 0(c): parallel Extended-side
+                // exit telemetry. Same exit_dir convention (Long position
+                // → Short close → depth = bid_size). Seed mixes `^ 3`
+                // for independence from the LT exit and entry draws on
+                // the same tick.
+                summary.would_be_ext_maker_exit_attempts += 1;
+                if let Some(out) =
+                    would_be_maker_fill_outcome(exit_dir, qty, ext_snap, now_ts_ms ^ 3)
+                {
+                    summary.would_be_ext_maker_exit_p_sum += out.fill_p;
+                    if out.sampled_fill {
+                        summary.would_be_ext_maker_exit_fills += 1;
+                    }
+                    log::info!(
+                        "[XVENUE] WOULD-BE EXT MAKER EXIT pos_dir={:?} our_size_eth={:.6} \
+                         depth_eth={:.6} fill_p={:.4} sampled_fill={}",
+                        dir,
+                        out.our_size_eth,
+                        out.depth_eth,
+                        out.fill_p,
+                        out.sampled_fill,
+                    );
+                }
             }
         }
 
@@ -391,14 +415,24 @@ pub(super) async fn handle_decision_exit(
                     );
                 }
                 (ext_filled, lt_filled) => {
-                    // Failure: at least one leg returned Failed. Drop
-                    // the entry ctx (no PnL computation for partial
-                    // trades — out of scope per #268 S5-1) and route
+                    // Failure: at least one leg returned Failed. Route
                     // to EmergencyFlattening. No dedicated
                     // `ExitFailed` reason in EmergencyReason —
                     // `LegMismatchTimeout` is the closest semantic
                     // fit.
-                    let _ = live_entry_ctx.take();
+                    //
+                    // bot-strategy#434: do NOT drop `live_entry_ctx`
+                    // here — the emergency-flatten handler consumes it
+                    // on EmergencyComplete to compute the realised cost
+                    // of the recovery using the entry side from this
+                    // ctx + the venue-fill diff captured around the
+                    // emergency. If we discard the ctx, the
+                    // emergency-recovery PnL silently falls back to the
+                    // 0.0 placeholder and `daily_pnl` under-reports the
+                    // round-trip cost. The Flat-transition sweep in
+                    // `run_paper_loop` still clears any ctx the
+                    // emergency handler could not consume (e.g.
+                    // operator-driven Reset before close_all finishes).
                     machine.apply(
                         now_ts_ms,
                         Event::Emergency {
@@ -432,7 +466,10 @@ pub(super) async fn handle_decision_exit(
             if let Some(LighterTerminal::Filled { qty: q, .. }) = lt {
                 machine.apply(now_ts_ms, Event::LighterExitFilled { qty: q })?;
             }
-            let _ = live_entry_ctx.take();
+            // bot-strategy#434: leave `live_entry_ctx` alive so the
+            // emergency-flatten handler can compute realised PnL on
+            // EmergencyComplete. See companion comment in the
+            // Both/Failed branch above.
             machine.apply(
                 now_ts_ms,
                 Event::Emergency {
