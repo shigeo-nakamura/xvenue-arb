@@ -96,6 +96,17 @@ pub struct BtConfig {
     /// 2026-05-19 live data is ≈40 bps × \$50 ≈ \$0.40 per event
     /// (per #437). Defaults to 0; calibrate per-period.
     pub emergency_event_cost_bps: f64,
+    /// bot-strategy#454 step 2e: per-side adverse-drift cost charged
+    /// for the WS fill propagation lag between `read_mid` and the
+    /// actual venue commit. Live observed median ~250-500 ms; during
+    /// that window the inside spread drifts on average in the
+    /// adverse direction (toxic-flow / momentum) by a small bps amount.
+    ///
+    /// Applied to ALL four sides (ext_entry + lt_entry + ext_exit +
+    /// lt_exit) regardless of maker / taker outcome. 0 disables.
+    /// Calibratable; tune to match the live BT-vs-LIVE residual after
+    /// the other Phase A components land.
+    pub ws_lag_drift_bps_per_side: f64,
     /// Path to a Binance 1m kline JSONL (one row per minute with
     /// `ts_ms` / `high` / `low`) used as a stale-quote reference. When
     /// set together with `binance_ref_max_dev_bps > 0`, any venue mid
@@ -128,6 +139,7 @@ impl Default for BtConfig {
             extended_chase_miss_penalty_bps: 0.0,
             emergency_event_rate: 0.0,
             emergency_event_cost_bps: 0.0,
+            ws_lag_drift_bps_per_side: 0.0,
             binance_ref_path: None,
             binance_ref_max_dev_bps: 0.0,
             record_buckets: false,
@@ -925,7 +937,14 @@ fn settle_trade(
         cfg.trade_notional_usd,
         leg.entry_ts_ms ^ 0xE1,
     );
-    let fees = ext_fee + lt_fee + ext_slip + lt_slip + emergency_cost;
+    // bot-strategy#454 step 2e: WS fill propagation lag — symmetric
+    // per-side adverse drift, applied 4× (ext_entry + lt_entry +
+    // ext_exit + lt_exit).
+    let ws_lag_cost = decimal_from_f64(cfg.ws_lag_drift_bps_per_side).unwrap_or(Decimal::ZERO)
+        * cfg.trade_notional_usd
+        * Decimal::from(4)
+        / Decimal::from(10_000);
+    let fees = ext_fee + lt_fee + ext_slip + lt_slip + emergency_cost + ws_lag_cost;
     let net = gross - fees;
 
     let net_bps = (net.to_f64().unwrap_or(0.0)
@@ -1624,6 +1643,52 @@ mod tests {
     fn emergency_event_cost_zero_at_rate_zero() {
         let cost = sample_emergency_event_cost(0.0, 40.0, dec!(50), 12345);
         assert_eq!(cost, Decimal::ZERO);
+    }
+
+    /// bot-strategy#454 step 2e — WS-lag drift cost: when set, charged
+    /// once per side × 4 sides = 4 × bps × notional / 10_000.
+    /// 1 bp × 4 sides × \$50 = \$0.02 per trade.
+    #[test]
+    fn ws_lag_drift_charges_per_side() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ext_lines = Vec::new();
+        let mut lt_lines = Vec::new();
+        for i in 0..200i64 {
+            let ts_ms = 1_776_000_000_000 + i * 1_000;
+            let lt_mid = 78_000.0_f64;
+            let ext_mid = if (60..130).contains(&i) {
+                lt_mid * 1.002
+            } else {
+                lt_mid
+            };
+            ext_lines.push(dump_line(ts_ms, "BTC", ext_mid));
+            lt_lines.push(dump_line(ts_ms, "BTC", lt_mid));
+        }
+        let ext_path = write_dump(dir.path(), "ext.jsonl", &ext_lines);
+        let lt_path = write_dump(dir.path(), "lt.jsonl", &lt_lines);
+        let replay =
+            DualReplay::new(ext_path.to_str().unwrap(), lt_path.to_str().unwrap()).unwrap();
+
+        let mut cfg = BtConfig::default();
+        cfg.signal.min_warmup_samples = 30;
+        cfg.signal.persistence_sec = 5;
+        cfg.signal.abs_threshold_bps = 5.0;
+        cfg.extended_taker_fee_bps = 0.0;
+        cfg.lighter_taker_fee_bps = 0.0;
+        cfg.trade_notional_usd = dec!(100);
+        cfg.ws_lag_drift_bps_per_side = 1.0;
+
+        let summary = run_bt(&replay, cfg).unwrap();
+        assert_eq!(summary.trades.len(), 1);
+        // 1 bp × 4 sides × $100 / 10_000 = $0.04 (other fees / slip are 0
+        // on this dump_line fixture).
+        let trade = &summary.trades[0];
+        let fees = trade.fees_usd.to_f64().unwrap();
+        assert!(
+            (fees - 0.04).abs() < 1e-6,
+            "expected ws-lag fees=$0.04, got {}",
+            fees
+        );
     }
 
     /// bot-strategy#454 step 2d — deterministic seed: same seed gives

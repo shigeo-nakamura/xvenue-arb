@@ -163,6 +163,8 @@ fn build_base(args: &Args, symbol: &str) -> Result<BtConfig> {
     // + expected adverse cost.
     cfg.emergency_event_rate = args.opt::<f64>("emergency-event-rate", 0.0)?;
     cfg.emergency_event_cost_bps = args.opt::<f64>("emergency-event-cost-bps", 0.0)?;
+    // bot-strategy#454 step 2e: per-side WS-lag adverse drift.
+    cfg.ws_lag_drift_bps_per_side = args.opt::<f64>("ws-lag-drift-bps-per-side", 0.0)?;
     cfg.signal.min_warmup_samples = args.opt::<usize>("warmup-samples", 60)?;
     cfg.spread.bucket_ms = args.opt::<u64>("bucket-ms", 1_000)?;
     // Phase 0 v2 parity diagnostic. When set, Enter fires at the bar
