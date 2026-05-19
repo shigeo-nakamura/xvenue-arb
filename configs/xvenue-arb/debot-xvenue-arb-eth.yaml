@@ -72,7 +72,7 @@ max_notional_usd: 50
 # shrinks the WS-lag exposure window that triggers #298 EXIT-side ext Timeout.
 # Re-evaluate (i.e. revisit Direction 3 / chase_ticks-for-real) once we have a
 # data-backed reason to expect maker fills at higher notional or BTC.
-extended_post_only: true   # bot-strategy#431 Phase 1 LIVE flip 2026-05-19. ExtendedMakerLoop chase + taker fallback. Phase 0 paper-mode soak skipped per #437 (fee-wall edge erosion confirmed: 7-loss streak pre-restart + 2/2 losses post-restart). Risk-bounded: chase exhaustion falls back to existing taker path (extended_taker_fallback=true), so worst case is current behavior, best case is half-spread savings on the maker fills.
+extended_post_only: false   # bot-strategy#431 Phase 1 reverted 2026-05-19 13:53 UTC. Live data (PR #9, 12:45-13:49 UTC) showed 0/6 maker fill rate at $50 notional: post-only at touch never gets crossed within the 2s chase timeout because we sit at the back of the Extended queue. Each chase exhausted + fell back to taker, adding 4-6 s of dead chase per leg while paying the same taker fees as before. The Phase 0 paper-mode soak (which Phase 1 LIVE deliberately skipped per #437) would have caught this. Next iteration: redesign the maker params (longer timeout, more aggressive price, or larger notional) before re-flipping; see #431 Phase 1 follow-up comment.
 extended_chase_ticks: 1
 extended_chase_retries: 3
 extended_chase_timeout_ms: 2000   # poll_until_terminal_or_deadline reuses this for the taker poll budget; left at 2000 ms which the 2026-05-02 #244 live probe established as enough for Extended fill ack.
