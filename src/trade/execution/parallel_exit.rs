@@ -375,6 +375,7 @@ mod tests {
             };
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.01),
                     terminal: true,
                     cancelled: false,
@@ -383,6 +384,7 @@ mod tests {
         lt_ops.with_state(|s| {
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.01),
                     terminal: true,
                     cancelled: false,
@@ -397,8 +399,20 @@ mod tests {
         let outcome = lp.run(ext_req(dec!(0.01)), lt_req(dec!(0.01))).await;
         match outcome {
             ParallelExitOutcome::Both { ext, lt } => {
-                assert_eq!(ext, ExtendedTerminal::Filled { qty: dec!(0.01) });
-                assert_eq!(lt, LighterTerminal::Filled { qty: dec!(0.01) });
+                assert_eq!(
+                    ext,
+                    ExtendedTerminal::Filled {
+                        qty: dec!(0.01),
+                        avg_fill_price: None
+                    }
+                );
+                assert_eq!(
+                    lt,
+                    LighterTerminal::Filled {
+                        qty: dec!(0.01),
+                        avg_fill_price: None
+                    }
+                );
             }
             other => panic!("expected Both, got {:?}", other),
         }
@@ -426,6 +440,7 @@ mod tests {
         lt_ops.with_state(|s| {
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.01),
                     terminal: true,
                     cancelled: false,
@@ -457,7 +472,13 @@ mod tests {
         match outcome {
             ParallelExitOutcome::LegMismatchTimeout { ext, lt } => {
                 assert!(ext.is_none(), "Extended must still be in flight");
-                assert_eq!(lt, Some(LighterTerminal::Filled { qty: dec!(0.01) }));
+                assert_eq!(
+                    lt,
+                    Some(LighterTerminal::Filled {
+                        qty: dec!(0.01),
+                        avg_fill_price: None
+                    })
+                );
             }
             other => panic!("expected LegMismatchTimeout, got {:?}", other),
         }
@@ -476,6 +497,7 @@ mod tests {
             };
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.01),
                     terminal: true,
                     cancelled: false,
@@ -508,7 +530,13 @@ mod tests {
         let outcome = lp.run(ext_req(dec!(0.01)), lt_req(dec!(0.01))).await;
         match outcome {
             ParallelExitOutcome::LegMismatchTimeout { ext, lt } => {
-                assert_eq!(ext, Some(ExtendedTerminal::Filled { qty: dec!(0.01) }));
+                assert_eq!(
+                    ext,
+                    Some(ExtendedTerminal::Filled {
+                        qty: dec!(0.01),
+                        avg_fill_price: None
+                    })
+                );
                 assert!(lt.is_none(), "Lighter must still be in flight");
             }
             other => panic!("expected LegMismatchTimeout, got {:?}", other),
@@ -537,6 +565,7 @@ mod tests {
             for _ in 0..7 {
                 s.poll_fill
                     .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                        filled_value: None,
                         filled_qty: Decimal::ZERO,
                         terminal: false,
                         cancelled: false,
@@ -544,6 +573,7 @@ mod tests {
             }
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.01),
                     terminal: true,
                     cancelled: false,
@@ -553,6 +583,7 @@ mod tests {
             // Lighter terminal on the first poll (~10 ms).
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.01),
                     terminal: true,
                     cancelled: false,
@@ -586,8 +617,20 @@ mod tests {
         let outcome = lp.run(ext_req(dec!(0.01)), lt_req(dec!(0.01))).await;
         match outcome {
             ParallelExitOutcome::Both { ext, lt } => {
-                assert_eq!(ext, ExtendedTerminal::Filled { qty: dec!(0.01) });
-                assert_eq!(lt, LighterTerminal::Filled { qty: dec!(0.01) });
+                assert_eq!(
+                    ext,
+                    ExtendedTerminal::Filled {
+                        qty: dec!(0.01),
+                        avg_fill_price: None
+                    }
+                );
+                assert_eq!(
+                    lt,
+                    LighterTerminal::Filled {
+                        qty: dec!(0.01),
+                        avg_fill_price: None
+                    }
+                );
             }
             other => panic!("expected Both, got {:?}", other),
         }
@@ -607,6 +650,7 @@ mod tests {
             };
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.01),
                     terminal: true,
                     cancelled: false,
@@ -615,6 +659,7 @@ mod tests {
         lt_ops.with_state(|s| {
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.01),
                     terminal: true,
                     cancelled: false,
@@ -664,6 +709,7 @@ mod tests {
             };
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.01),
                     terminal: true,
                     cancelled: false,
@@ -682,7 +728,13 @@ mod tests {
         let outcome = lp.run(ext_req(dec!(0.01)), lt_req(dec!(0.01))).await;
         match outcome {
             ParallelExitOutcome::Both { ext, lt } => {
-                assert_eq!(ext, ExtendedTerminal::Filled { qty: dec!(0.01) });
+                assert_eq!(
+                    ext,
+                    ExtendedTerminal::Filled {
+                        qty: dec!(0.01),
+                        avg_fill_price: None
+                    }
+                );
                 assert!(matches!(
                     lt,
                     LighterTerminal::Failed {
@@ -712,6 +764,7 @@ mod tests {
             };
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.01),
                     terminal: true,
                     cancelled: false,
@@ -727,6 +780,7 @@ mod tests {
             };
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.5),
                     terminal: true,
                     cancelled: false,
@@ -751,8 +805,20 @@ mod tests {
         let outcome = lp.run(ext_req(dec!(0.01)), lt_request).await;
         match outcome {
             ParallelExitOutcome::Both { ext, lt } => {
-                assert_eq!(ext, ExtendedTerminal::Filled { qty: dec!(0.01) });
-                assert_eq!(lt, LighterTerminal::Filled { qty: dec!(0.5) });
+                assert_eq!(
+                    ext,
+                    ExtendedTerminal::Filled {
+                        qty: dec!(0.01),
+                        avg_fill_price: None
+                    }
+                );
+                assert_eq!(
+                    lt,
+                    LighterTerminal::Filled {
+                        qty: dec!(0.5),
+                        avg_fill_price: None
+                    }
+                );
             }
             other => panic!("expected Both, got {:?}", other),
         }

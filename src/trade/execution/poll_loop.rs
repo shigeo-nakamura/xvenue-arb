@@ -45,6 +45,12 @@ pub trait Executor {
 #[derive(Debug, Clone, Copy)]
 pub struct PollOutcome {
     pub filled_this_round: Decimal,
+    /// Sum of `fill_price * fill_qty` across the partial fills this
+    /// round, when the underlying venue layer surfaced it via
+    /// `OrderFillStatus.filled_value`. `None` when the venue layer
+    /// hasn't (yet) populated it — caller should fall back to the
+    /// mid-based approximation. bot-strategy#435.
+    pub filled_value_this_round: Option<Decimal>,
     pub terminal_cancelled: bool,
 }
 
@@ -65,17 +71,31 @@ pub async fn poll_until_terminal_or_deadline<V: VenueOps + ?Sized>(
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let poll_dur = Duration::from_millis(poll_interval_ms);
     let mut filled_this_round = Decimal::ZERO;
+    // Track the most-recent populated filled_value alongside qty. The
+    // venue layer reports aggregates per-order (not per-poll), so
+    // taking the max value alongside max qty is consistent.
+    let mut filled_value_this_round: Option<Decimal> = None;
     loop {
         match ops.poll_fill_status(symbol, order_id).await {
             Ok(OrderFillStatus {
                 filled_qty,
+                filled_value,
                 terminal,
                 cancelled,
             }) => {
-                filled_this_round = filled_qty.max(filled_this_round);
+                if filled_qty > filled_this_round {
+                    filled_this_round = filled_qty;
+                    filled_value_this_round = filled_value;
+                } else if filled_value.is_some() && filled_value_this_round.is_none() {
+                    // qty didn't grow, but venue reported value for the
+                    // first time (e.g. WS lag finally surfaced fill
+                    // metadata). Capture it.
+                    filled_value_this_round = filled_value;
+                }
                 if terminal {
                     return PollOutcome {
                         filled_this_round,
+                        filled_value_this_round,
                         terminal_cancelled: cancelled,
                     };
                 }
@@ -92,6 +112,7 @@ pub async fn poll_until_terminal_or_deadline<V: VenueOps + ?Sized>(
         if Instant::now() >= deadline {
             return PollOutcome {
                 filled_this_round,
+                filled_value_this_round,
                 terminal_cancelled: false,
             };
         }

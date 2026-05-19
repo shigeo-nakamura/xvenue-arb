@@ -37,43 +37,76 @@ pub enum ExecutionFailure {
 /// chase rounds + the taker fallback (if any). It can be less than
 /// the originally requested qty when chase exhausted but partial
 /// fills landed (catalogue case 6).
+///
+/// `avg_fill_price` is the volume-weighted average fill price
+/// (`sum(price * qty) / sum(qty)`) derived from the venue's
+/// per-partial-fill metadata. `None` means the venue layer did not
+/// surface fill values for at least one contributing round —
+/// downstream PnL accounting must fall back to mid-based
+/// approximation in that case. bot-strategy#435.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ExtendedTerminal {
-    Filled { qty: Decimal },
-    Failed { reason: ExecutionFailure },
+    Filled {
+        qty: Decimal,
+        avg_fill_price: Option<Decimal>,
+    },
+    Failed {
+        reason: ExecutionFailure,
+    },
 }
 
 impl ExtendedTerminal {
     pub fn filled_qty(&self) -> Decimal {
         match self {
-            ExtendedTerminal::Filled { qty } => *qty,
+            ExtendedTerminal::Filled { qty, .. } => *qty,
             ExtendedTerminal::Failed { .. } => Decimal::ZERO,
         }
     }
 
     pub fn is_filled(&self) -> bool {
-        matches!(self, ExtendedTerminal::Filled { qty } if *qty > Decimal::ZERO)
+        matches!(self, ExtendedTerminal::Filled { qty, .. } if *qty > Decimal::ZERO)
     }
 }
 
-/// Terminal outcome of a single Lighter entry / exit cycle.
+/// Terminal outcome of a single Lighter entry / exit cycle. See
+/// `ExtendedTerminal` for the `avg_fill_price` contract.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LighterTerminal {
-    Filled { qty: Decimal },
-    Failed { reason: ExecutionFailure },
+    Filled {
+        qty: Decimal,
+        avg_fill_price: Option<Decimal>,
+    },
+    Failed {
+        reason: ExecutionFailure,
+    },
 }
 
 impl LighterTerminal {
     pub fn filled_qty(&self) -> Decimal {
         match self {
-            LighterTerminal::Filled { qty } => *qty,
+            LighterTerminal::Filled { qty, .. } => *qty,
             LighterTerminal::Failed { .. } => Decimal::ZERO,
         }
     }
 
     pub fn is_filled(&self) -> bool {
-        matches!(self, LighterTerminal::Filled { qty } if *qty > Decimal::ZERO)
+        matches!(self, LighterTerminal::Filled { qty, .. } if *qty > Decimal::ZERO)
     }
+}
+
+/// Derive volume-weighted average fill price from `total_filled_value`
+/// and `total_filled_qty`. Returns `None` when value is `None`, qty
+/// is zero, or the division would not be finite. Used by every
+/// executor's `MakerLoopOutcome → Terminal` mapping.
+/// bot-strategy#435.
+pub(crate) fn avg_price_from_value_qty(
+    total_filled_value: Option<Decimal>,
+    total_filled_qty: Decimal,
+) -> Option<Decimal> {
+    if total_filled_qty.is_zero() {
+        return None;
+    }
+    total_filled_value.map(|v| v / total_filled_qty)
 }
 
 /// Knobs that show up on every per-venue executor — split out so
@@ -296,7 +329,10 @@ mod tests {
 
     #[test]
     fn extended_terminal_filled_returns_qty() {
-        let t = ExtendedTerminal::Filled { qty: dec!(0.5) };
+        let t = ExtendedTerminal::Filled {
+            qty: dec!(0.5),
+            avg_fill_price: None,
+        };
         assert_eq!(t.filled_qty(), dec!(0.5));
         assert!(t.is_filled());
     }
@@ -306,7 +342,10 @@ mod tests {
         // Defensive: a Filled{0} should never appear from the
         // maker (it would emit Failed instead) but we want
         // `is_filled` to be safe.
-        let t = ExtendedTerminal::Filled { qty: Decimal::ZERO };
+        let t = ExtendedTerminal::Filled {
+            qty: Decimal::ZERO,
+            avg_fill_price: None,
+        };
         assert!(!t.is_filled());
     }
 

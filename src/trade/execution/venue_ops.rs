@@ -50,6 +50,16 @@ pub struct OrderFillStatus {
     /// Total qty filled against this order so far. Sum of all
     /// partial fills the venue has reported.
     pub filled_qty: Decimal,
+    /// Total notional value filled against this order so far —
+    /// `sum(fill_price_i * fill_qty_i)` across the partial fills.
+    /// Always non-negative. `None` when the underlying venue layer
+    /// does not (yet) populate it; the consumer should fall back to
+    /// the mid-based PnL approximation in that case. Populated for
+    /// Extended via `FilledOrder.filled_value` (dex-connector) and
+    /// for Lighter the same way (bot-strategy#435). Used by
+    /// `compute_realised_pnl` to replace `*_entry_mid` /
+    /// `*_exit_mid` with the volume-weighted average fill price.
+    pub filled_value: Option<Decimal>,
     /// True when the venue has reported the order as terminal —
     /// either fully filled or cancelled. The executor uses this to
     /// stop polling without waiting for the full timeout.
@@ -371,6 +381,7 @@ impl Default for OrderFillStatus {
     fn default() -> Self {
         Self {
             filled_qty: Decimal::ZERO,
+            filled_value: None,
             terminal: false,
             cancelled: false,
         }
@@ -412,6 +423,7 @@ mod tests {
         let ops = ScriptedVenueOps::new();
         ops.with_state(|s| {
             s.default_fill = OrderFillStatus {
+                filled_value: None,
                 filled_qty: dec!(0.05),
                 terminal: false,
                 cancelled: false,

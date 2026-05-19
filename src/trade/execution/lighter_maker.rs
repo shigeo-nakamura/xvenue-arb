@@ -142,6 +142,10 @@ impl<'a, V: VenueOps + ?Sized> LighterMakerLoop<'a, V> {
         if outcome.total_filled > Decimal::ZERO {
             LighterTerminal::Filled {
                 qty: outcome.total_filled,
+                avg_fill_price: super::types::avg_price_from_value_qty(
+                    outcome.total_filled_value,
+                    outcome.total_filled,
+                ),
             }
         } else {
             LighterTerminal::Failed {
@@ -233,6 +237,7 @@ mod tests {
         ops.with_state(|s| {
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.5),
                     terminal: true,
                     cancelled: false,
@@ -241,7 +246,13 @@ mod tests {
         let cfg = cfg_with_taker_fallback();
         let lp = LighterMakerLoop::new(&ops, &cfg).with_poll_interval(10);
         let res = lp.run(req_long(dec!(0.5))).await;
-        assert_eq!(res, LighterTerminal::Filled { qty: dec!(0.5) });
+        assert_eq!(
+            res,
+            LighterTerminal::Filled {
+                qty: dec!(0.5),
+                avg_fill_price: None
+            }
+        );
         let posts = ops.snapshot_posts();
         assert_eq!(posts.len(), 1, "exactly one post_only place");
         assert!(ops.snapshot_takers().is_empty(), "no taker fallback");
@@ -257,12 +268,14 @@ mod tests {
         ops.with_state(|s| {
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.4),
                     terminal: true,
                     cancelled: false,
                 }));
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.1),
                     terminal: true,
                     cancelled: false,
@@ -275,7 +288,13 @@ mod tests {
         };
         let lp = LighterMakerLoop::new(&ops, &cfg).with_poll_interval(10);
         let res = lp.run(req_long(dec!(0.5))).await;
-        assert_eq!(res, LighterTerminal::Filled { qty: dec!(0.5) });
+        assert_eq!(
+            res,
+            LighterTerminal::Filled {
+                qty: dec!(0.5),
+                avg_fill_price: None
+            }
+        );
         assert_eq!(ops.snapshot_posts().len(), 1, "one post_only round");
         assert_eq!(ops.snapshot_takers().len(), 1, "taker fallback fired");
     }
@@ -299,6 +318,7 @@ mod tests {
         ops.with_state(|s| {
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.5),
                     terminal: true,
                     cancelled: false,
@@ -310,7 +330,13 @@ mod tests {
         };
         let lp = LighterMakerLoop::new(&ops, &cfg).with_poll_interval(10);
         let res = lp.run(req_long(dec!(0.5))).await;
-        assert_eq!(res, LighterTerminal::Filled { qty: dec!(0.5) });
+        assert_eq!(
+            res,
+            LighterTerminal::Filled {
+                qty: dec!(0.5),
+                avg_fill_price: None
+            }
+        );
         assert!(ops.snapshot_posts().is_empty(), "no post_only placed");
         assert_eq!(ops.snapshot_takers().len(), 1);
     }
@@ -339,6 +365,7 @@ mod tests {
         ops.with_state(|s| {
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.5),
                     terminal: true,
                     cancelled: false,
@@ -362,6 +389,7 @@ mod tests {
         ops.with_state(|s| {
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.5),
                     terminal: true,
                     cancelled: false,
@@ -394,6 +422,7 @@ mod tests {
         ops.with_state(|s| {
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.5),
                     terminal: true,
                     cancelled: false,
@@ -425,6 +454,7 @@ mod tests {
         ops.with_state(|s| {
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.5),
                     terminal: true,
                     cancelled: false,
@@ -449,6 +479,7 @@ mod tests {
         ops.with_state(|s| {
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.5),
                     terminal: true,
                     cancelled: false,
@@ -479,6 +510,7 @@ mod tests {
         for _ in 0..n {
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: Decimal::ZERO,
                     terminal: false,
                     cancelled: false,
@@ -507,6 +539,7 @@ mod tests {
             push_non_terminal_polls(s, 3);
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.5),
                     terminal: true,
                     cancelled: false,
@@ -523,7 +556,10 @@ mod tests {
         let res = lp.run(req_long(dec!(0.5))).await;
         assert_eq!(
             res,
-            LighterTerminal::Filled { qty: dec!(0.5) },
+            LighterTerminal::Filled {
+                qty: dec!(0.5),
+                avg_fill_price: None
+            },
             "grace re-poll must surface the late fill (taker_fallback=false \
              so any other path returns Failed)"
         );
@@ -544,6 +580,7 @@ mod tests {
             push_non_terminal_polls(s, 6);
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.5),
                     terminal: true,
                     cancelled: false,
@@ -560,7 +597,10 @@ mod tests {
         let res = lp.run(req_long(dec!(0.5))).await;
         assert_eq!(
             res,
-            LighterTerminal::Filled { qty: dec!(0.5) },
+            LighterTerminal::Filled {
+                qty: dec!(0.5),
+                avg_fill_price: None
+            },
             "taker grace re-poll must surface the late fill"
         );
         assert_eq!(ops.snapshot_takers().len(), 1, "exactly one taker round");
@@ -618,6 +658,7 @@ mod tests {
             // size_decimals=4 lot truncation).
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.0209),
                     terminal: true,
                     cancelled: false,
@@ -641,7 +682,10 @@ mod tests {
         let res = lp.run(req).await;
         assert_eq!(
             res,
-            LighterTerminal::Filled { qty: dec!(0.0209) },
+            LighterTerminal::Filled {
+                qty: dec!(0.0209),
+                avg_fill_price: None
+            },
             "sub-min residual must be treated as fully filled"
         );
         assert_eq!(
@@ -675,6 +719,7 @@ mod tests {
             // Round 0: same partial fill as the guarded test.
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: dec!(0.0209),
                     terminal: true,
                     cancelled: false,
@@ -682,6 +727,7 @@ mod tests {
             // Round 1: terminal cancelled → loop exits chase.
             s.poll_fill
                 .push_back(ScriptedResponse::FillStatus(OrderFillStatus {
+                    filled_value: None,
                     filled_qty: Decimal::ZERO,
                     terminal: true,
                     cancelled: true,

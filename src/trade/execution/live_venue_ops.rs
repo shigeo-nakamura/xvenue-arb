@@ -180,12 +180,26 @@ impl VenueOps for LiveVenueOps {
         )
         .map_err(|e| anyhow!("poll_fill_status {} {}: {}", symbol, order_id, e))?;
 
-        let filled_qty: Decimal = filled
+        let matching_fills: Vec<&_> = filled
             .orders
             .iter()
             .filter(|o| o.order_id == order_id && !o.is_rejected)
-            .filter_map(|o| o.filled_size)
-            .sum();
+            .collect();
+        let filled_qty: Decimal = matching_fills.iter().filter_map(|o| o.filled_size).sum();
+        // bot-strategy#435: surface filled_value (sum of fill_price *
+        // fill_qty across partials) so the caller can derive the
+        // volume-weighted average fill price and feed
+        // `compute_realised_pnl` with truth instead of mids. `None`
+        // when no partial has reported a `filled_value` yet — caller
+        // must fall back to the mid-based PnL approximation.
+        let filled_value_total: Decimal =
+            matching_fills.iter().filter_map(|o| o.filled_value).sum();
+        let any_filled_value = matching_fills.iter().any(|o| o.filled_value.is_some());
+        let filled_value = if any_filled_value {
+            Some(filled_value_total)
+        } else {
+            None
+        };
 
         let cancelled = canceled.orders.iter().any(|o| o.order_id == order_id);
         let still_open = open.orders.iter().any(|o| o.order_id == order_id);
@@ -226,6 +240,7 @@ impl VenueOps for LiveVenueOps {
 
         Ok(OrderFillStatus {
             filled_qty,
+            filled_value,
             terminal,
             cancelled: cancelled || pure_rejection,
         })
