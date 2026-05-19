@@ -80,6 +80,22 @@ pub struct BtConfig {
     /// for the Extended side. Only meaningful when a future re-flip
     /// turns `extended_post_only` on; harmless when false.
     pub extended_chase_miss_penalty_bps: f64,
+    /// bot-strategy#454 step 2d: probability per trade that the
+    /// round-trip lands in `EmergencyFlattening` (one leg fills, the
+    /// other doesn't within `leg_mismatch_timeout_ms`; the runner then
+    /// `close_all`s the orphan leg at a wide IOC). Modelled as a single
+    /// Bernoulli per trade — independent of the maker/taker mix because
+    /// emergencies fire on cross-venue desync, not on per-side
+    /// outcomes. 0 disables; calibrate against the live `EmergencyComplete`
+    /// rate observed in the journal.
+    pub emergency_event_rate: f64,
+    /// bot-strategy#454 step 2d: expected adverse cost per emergency
+    /// event, in bps × notional. The live `close_all` IOC has a 50 bp
+    /// slippage budget (per `extended_taker_slippage_bps` in YAML), so
+    /// 50 bps is the worst-case headline figure. Real average from
+    /// 2026-05-19 live data is ≈40 bps × \$50 ≈ \$0.40 per event
+    /// (per #437). Defaults to 0; calibrate per-period.
+    pub emergency_event_cost_bps: f64,
     /// Path to a Binance 1m kline JSONL (one row per minute with
     /// `ts_ms` / `high` / `low`) used as a stale-quote reference. When
     /// set together with `binance_ref_max_dev_bps > 0`, any venue mid
@@ -110,6 +126,8 @@ impl Default for BtConfig {
             lighter_post_only: false,
             lighter_chase_miss_penalty_bps: 0.0,
             extended_chase_miss_penalty_bps: 0.0,
+            emergency_event_rate: 0.0,
+            emergency_event_cost_bps: 0.0,
             binance_ref_path: None,
             binance_ref_max_dev_bps: 0.0,
             record_buckets: false,
@@ -779,6 +797,33 @@ struct MakerOutcome {
     sampled_fill: bool,
 }
 
+/// bot-strategy#454 step 2d: draw one Bernoulli per trade against the
+/// configured `emergency_event_rate`. When the draw hits, the trade
+/// incurs an adverse `emergency_event_cost_bps × notional / 10_000`
+/// USD cost on top of the legs' slippage. Models the cross-venue
+/// leg-mismatch path that fires `EmergencyFlattening` in live.
+///
+/// Returns a USD cost (always ≥ 0). Reads `seed` for reproducibility.
+fn sample_emergency_event_cost(
+    rate: f64,
+    cost_bps: f64,
+    notional_usd: Decimal,
+    seed: u64,
+) -> Decimal {
+    if !(rate > 0.0) || !(cost_bps > 0.0) {
+        return Decimal::ZERO;
+    }
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let draw: f64 = rng.gen();
+    let p = rate.clamp(0.0, 1.0);
+    if draw >= p {
+        return Decimal::ZERO;
+    }
+    let cost_per_unit = decimal_from_f64(cost_bps).unwrap_or(Decimal::ZERO) / Decimal::from(10_000);
+    cost_per_unit * notional_usd
+}
+
 fn settle_trade(
     cfg: &BtConfig,
     leg: OpenLeg,
@@ -871,7 +916,16 @@ fn settle_trade(
         * cfg.trade_notional_usd
         * two
         / bps_div;
-    let fees = ext_fee + lt_fee + ext_slip + lt_slip;
+    // bot-strategy#454 step 2d: per-trade emergency-event draw.
+    // Independent seed from the per-side maker draws so a Lighter
+    // post-only outcome doesn't correlate with the emergency event.
+    let emergency_cost = sample_emergency_event_cost(
+        cfg.emergency_event_rate,
+        cfg.emergency_event_cost_bps,
+        cfg.trade_notional_usd,
+        leg.entry_ts_ms ^ 0xE1,
+    );
+    let fees = ext_fee + lt_fee + ext_slip + lt_slip + emergency_cost;
     let net = gross - fees;
 
     let net_bps = (net.to_f64().unwrap_or(0.0)
@@ -1553,6 +1607,36 @@ mod tests {
         let outcome_b = would_be_maker_outcome(&book, IocSide::Buy, dec!(0.025), 123).unwrap();
         assert_eq!(outcome_a, outcome_b);
         assert!((outcome_a.fill_p - 0.5).abs() < 1e-9);
+    }
+
+    /// bot-strategy#454 step 2d — emergency-event cost: when the
+    /// Bernoulli draw hits, we charge `cost_bps × notional / 10_000`.
+    /// rate=1 forces the hit (every trade).
+    #[test]
+    fn emergency_event_cost_applied_at_rate_one() {
+        let cost = sample_emergency_event_cost(1.0, 40.0, dec!(50), 12345);
+        // 40 bps × $50 / 10_000 = $0.20
+        assert_eq!(cost, dec!(0.20));
+    }
+
+    /// bot-strategy#454 step 2d — rate=0 disables the path entirely.
+    #[test]
+    fn emergency_event_cost_zero_at_rate_zero() {
+        let cost = sample_emergency_event_cost(0.0, 40.0, dec!(50), 12345);
+        assert_eq!(cost, Decimal::ZERO);
+    }
+
+    /// bot-strategy#454 step 2d — deterministic seed: same seed gives
+    /// the same draw result.
+    #[test]
+    fn emergency_event_cost_seed_deterministic() {
+        let a = sample_emergency_event_cost(0.3, 40.0, dec!(50), 9999);
+        let b = sample_emergency_event_cost(0.3, 40.0, dec!(50), 9999);
+        let c = sample_emergency_event_cost(0.3, 40.0, dec!(50), 9998);
+        assert_eq!(a, b);
+        // Different seed CAN give a different outcome (not strict
+        // requirement, but our chosen seeds happen to produce one).
+        let _ = c;
     }
 
     /// bot-strategy#454 step 2a — end-to-end: a one-cycle BT with an
