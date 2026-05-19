@@ -34,8 +34,8 @@ abs_threshold_bps: 6.0        # bot-strategy#437 2026-05-19: raised 5.0→6.0 to
 # xvenue-arb's own dumps (current cross-source dumps undercount trade
 # opportunities ~50× — see #454 comment 2026-05-19).
 # Empty string disables.
-ext_market_data_dump_path: /opt/debot/market_data_xvenue_ext
-lt_market_data_dump_path: /opt/debot/market_data_xvenue_lt
+ext_market_data_dump_path: /opt/debot/market_data_xvenue_ext.jsonl
+lt_market_data_dump_path: /opt/debot/market_data_xvenue_lt.jsonl
 persistence_sec: 15
 exit_at_mean_cross: true
 max_hold_sec: 600
