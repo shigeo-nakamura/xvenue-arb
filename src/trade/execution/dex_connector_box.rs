@@ -432,6 +432,10 @@ impl DexConnector for DexConnectorBox {
         self.inner.is_upcoming_maintenance(hours_ahead).await
     }
 
+    async fn maintenance_status(&self, hours_ahead: i64) -> Option<String> {
+        self.inner.maintenance_status(hours_ahead).await
+    }
+
     async fn sign_evm_65b(&self, message: &str) -> Result<String, DexError> {
         let result = self.inner.sign_evm_65b(message).await;
         if let Err(ref err) = result {

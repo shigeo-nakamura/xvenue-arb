@@ -159,6 +159,16 @@ pub trait VenueOps: Send + Sync {
         false
     }
 
+    /// Distinguishable maintenance/degraded tag for status.json. Default
+    /// preserves the legacy boolean contract for test doubles.
+    async fn maintenance_status(&self, hours_ahead: i64) -> Option<String> {
+        if self.is_upcoming_maintenance(hours_ahead).await {
+            Some("upcoming_or_active".to_string())
+        } else {
+            None
+        }
+    }
+
     /// Absolute size of the current open position for `symbol` (returns
     /// `0` when the venue holds no position). Exit dispatch consults
     /// this to reconcile the state machine's `*_open_qty` against the

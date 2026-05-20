@@ -257,6 +257,10 @@ impl VenueOps for LiveVenueOps {
         self.conn.is_upcoming_maintenance(hours_ahead).await
     }
 
+    async fn maintenance_status(&self, hours_ahead: i64) -> Option<String> {
+        self.conn.maintenance_status(hours_ahead).await
+    }
+
     async fn current_position_size(&self, symbol: &str) -> Result<Decimal> {
         let positions = self
             .conn
