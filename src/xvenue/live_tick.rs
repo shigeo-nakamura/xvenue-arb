@@ -338,6 +338,9 @@ pub(super) async fn run_one_tick<H: VenueHub + ?Sized>(
     if let Some(r) = reporter.as_deref_mut() {
         r.set_maintenance(maintenance_status.clone());
     }
+    crate::prom::MAINTENANCE_ACTIVE
+        .with_label_values(&[cfg.agent_name.as_str()])
+        .set(if maintenance_block_entries { 1 } else { 0 });
     crate::error_counter::set_counting_suppressed(maintenance_block_entries);
     if matches!(decision, Decision::Enter(_)) && maintenance_block_entries {
         log::warn!(

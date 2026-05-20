@@ -119,6 +119,16 @@ pub static HAS_POSITION: Lazy<IntGaugeVec> = Lazy::new(|| {
     )
 });
 
+pub static MAINTENANCE_ACTIVE: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge(
+        "xvenue_arb_maintenance_active",
+        "1 when the per-tick gate sees maintenance_status() != None on either \
+         Extended or Lighter (RSS-announced or observed-degraded). Combined \
+         across both venues — see logs for the breakdown. (#427)",
+        &["agent"],
+    )
+});
+
 pub static POSITION_AGE_SECONDS: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge(
         "xvenue_arb_position_age_seconds",
