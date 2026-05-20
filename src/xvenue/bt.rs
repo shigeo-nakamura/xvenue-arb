@@ -584,10 +584,7 @@ async fn run_bt_async(replay: &DualReplay, cfg: BtConfig) -> Result<BtSummary> {
 /// phantom spread that the Phase 0 v2 Python sim avoids by computing
 /// mid from bid/ask. This was the dominant source of the Rust-vs-Python
 /// BT divergence (bot-strategy#166).
-async fn read_snapshot(
-    c: &Arc<ReplayConnector>,
-    symbol: &str,
-) -> Result<(BookSnapshot, bool)> {
+async fn read_snapshot(c: &Arc<ReplayConnector>, symbol: &str) -> Result<(BookSnapshot, bool)> {
     use dex_connector::DexConnector;
     let ob = c
         .get_order_book(symbol, 1)
