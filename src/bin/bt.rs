@@ -155,8 +155,7 @@ fn build_base(args: &Args, symbol: &str) -> Result<BtConfig> {
     cfg.lighter_post_only = args.opt::<bool>("lighter-post-only", false)?;
     // bot-strategy#454 step 2c: per-side adverse-drift cost added to
     // a missed post-only side's taker-fallback cost.
-    cfg.lighter_chase_miss_penalty_bps =
-        args.opt::<f64>("lighter-chase-miss-penalty-bps", 0.0)?;
+    cfg.lighter_chase_miss_penalty_bps = args.opt::<f64>("lighter-chase-miss-penalty-bps", 0.0)?;
     cfg.extended_chase_miss_penalty_bps =
         args.opt::<f64>("extended-chase-miss-penalty-bps", 0.0)?;
     // bot-strategy#454 step 2d: per-trade emergency-event probability

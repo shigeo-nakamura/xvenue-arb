@@ -315,33 +315,34 @@ pub(super) async fn run_one_tick<H: VenueHub + ?Sized>(
         dev,
     );
 
-    // bot-strategy#317 / #321: Extended maintenance gate. Mirrors pairtrade's
-    // `is_upcoming_maintenance(1)` check at pairtrade/src/pairtrade/mod.rs.
+    // bot-strategy#317 / #321 / #427: venue maintenance/degraded gate.
     // Evaluated once per tick (not just on Enter) so the flag also drives
     // `status.maintenance` (gated by error-watch workflow, see
-    // bot-strategy#168/#199) and `error_counter::set_counting_suppressed`
-    // — without the latter, the `Maintenance mode` REST rejections, WS
-    // reconnect bursts, and stale-book WARNs that fire while the venue is
-    // rejecting requests inflate `error_summary` and trip the auto-error
-    // workflow even when the bot is correctly blocked. Lighter has no
-    // maintenance protocol so the default-`false` trait impl on its
-    // VenueOps means we only consult Extended.
-    let maintenance_block_entries = match live_exec {
-        Some(live) => live.ext_ops.is_upcoming_maintenance(1).await,
-        None => false,
+    // bot-strategy#168/#199) and `error_counter::set_counting_suppressed`.
+    // Extended contributes announced/protocol maintenance; Lighter now also
+    // contributes observed degraded mode from dex-connector.
+    let maintenance_status = match live_exec {
+        Some(live) => {
+            let ext = live.ext_ops.maintenance_status(1).await;
+            let lt = live.lt_ops.maintenance_status(1).await;
+            match (ext, lt) {
+                (Some(ext), Some(lt)) => Some(format!("extended:{},lighter:{}", ext, lt)),
+                (Some(ext), None) => Some(format!("extended:{}", ext)),
+                (None, Some(lt)) => Some(format!("lighter:{}", lt)),
+                (None, None) => None,
+            }
+        }
+        None => None,
     };
+    let maintenance_block_entries = maintenance_status.is_some();
     if let Some(r) = reporter.as_deref_mut() {
-        r.set_maintenance(if maintenance_block_entries {
-            Some("upcoming_or_active".to_string())
-        } else {
-            None
-        });
+        r.set_maintenance(maintenance_status.clone());
     }
     crate::error_counter::set_counting_suppressed(maintenance_block_entries);
     if matches!(decision, Decision::Enter(_)) && maintenance_block_entries {
         log::warn!(
-            "[XVENUE] Extended maintenance upcoming/active; blocking new entry. \
-             dev_bps={:?}",
+            "[XVENUE] venue maintenance/degraded detected ({:?}); blocking new entry. dev_bps={:?}",
+            maintenance_status,
             dev
         );
         summary.entries_blocked_by_maintenance += 1;

@@ -764,8 +764,7 @@ async fn handle_emergency_flatten_tick<H: VenueHub + ?Sized>(
     if emergency_ext_pre_fills.is_none() {
         match live.ext_ops.list_filled_orders(&live.ext_symbol).await {
             Ok(fills) => {
-                *emergency_ext_pre_fills =
-                    Some(fills.into_iter().map(|f| f.trade_id).collect());
+                *emergency_ext_pre_fills = Some(fills.into_iter().map(|f| f.trade_id).collect());
             }
             Err(e) => {
                 log::warn!(
@@ -821,10 +820,8 @@ async fn handle_emergency_flatten_tick<H: VenueHub + ?Sized>(
         let pre_ext = emergency_ext_pre_fills.take().unwrap_or_default();
         let pre_lt = emergency_lt_pre_fills.take().unwrap_or_default();
         let entry_ctx = live_entry_ctx.take();
-        let pnl_usd = compute_emergency_realised_pnl(
-            cfg, live, hub, entry_ctx, pre_ext, pre_lt,
-        )
-        .await;
+        let pnl_usd =
+            compute_emergency_realised_pnl(cfg, live, hub, entry_ctx, pre_ext, pre_lt).await;
         if let Some(r) = reporter {
             r.record_close(pnl_usd);
         }
